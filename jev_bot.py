@@ -133,6 +133,7 @@ async def post(session, state, questions):
             async with session.post(API_URL, json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status < 400:
                     return (await r.json()).get("answers", {})
+                log.warning(f"API {r.status} {attempt}: {(await r.text())[:300]}")
                 await asyncio.sleep(1 + 2 * attempt)
         except Exception as e:
             log.warning(f"API err {attempt}: {e}")
