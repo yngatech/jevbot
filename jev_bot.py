@@ -42,6 +42,9 @@ STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.45          # chatty one-liners ("lol", "i hate mondays") land ~0.5, real questions ~0.1-0.2
+# Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
+# instead of continuing it. Set back to "Next word?" to compare.
+NEXT_WORD = "Next word of {bot_name}'s reply?"
 
 STOPWORDS = set(
     "a an the and or but if of to in on at by for with from as is are was were be been "
@@ -161,18 +164,18 @@ def by_prob(ans):
     return sorted(ans.get("probabilities", {}).items(), key=lambda kv: -kv[1])
 
 
-def choice_q(words, instructions="Next word?"):
+def choice_q(words, instructions):
     return {"type": "choice", "instructions": instructions, "criteria": {w: "" for w in words}}
 
 
-async def next_word(session, state, vocab, rng):
+async def next_word(session, state, vocab, rng, instructions):
     shuffled = list(vocab)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
     groups = [buckets[i:i + QUESTIONS_PER_CALL] for i in range(0, len(buckets), QUESTIONS_PER_CALL)]
 
     results = await asyncio.gather(
-        *(post(session, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b)
+        *(post(session, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b, instructions)
                                 for i, b in enumerate(g)})
           for gi, g in enumerate(groups)),
         post(session, state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
@@ -188,7 +191,7 @@ async def next_word(session, state, vocab, rng):
     if END not in finalists:
         finalists.append(END)
 
-    runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES])})
+    runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES], instructions)})
     probs = runoff.get("final", {}).get("probabilities", {})
 
     return probs, complete_noul
@@ -240,13 +243,14 @@ async def generate_reply(message, author, bot_name, history=None):
     rng = random.Random()
     # Every word and name in the transcript, not just the message being replied to — lets jev say what it can see
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or []] + [f"{author} {message}"]))
+    instructions = NEXT_WORD.format(bot_name=bot_name)
     words = []
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for step in range(MAX_WORDS):
             state = transcript(message, author, bot_name, history, words)
 
-            probs, complete = await next_word(session, state, vocab, rng)
+            probs, complete = await next_word(session, state, vocab, rng, instructions)
             if not probs:
                 break
 
@@ -323,7 +327,7 @@ async def load_history(first):
 
 @bot.event
 async def on_ready():
-    log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)}")
+    log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
 
 @bot.event
 async def on_message(m):
