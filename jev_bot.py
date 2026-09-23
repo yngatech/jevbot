@@ -198,7 +198,8 @@ async def generate_reply(message, author, bot_name, history=None):
             if not probs:
                 break
 
-            stoppable = sum(1 for w in words if is_word(w)) >= MIN_WORDS
+            said = sum(1 for w in words if is_word(w))
+            stoppable = said >= MIN_WORDS
             if stoppable and complete >= STOP_THRESHOLD:
                 log.info(f"  noul={complete:.2f} stop")
                 break
@@ -208,6 +209,7 @@ async def generate_reply(message, author, bot_name, history=None):
                 if p <= 0: continue
                 if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
                 if w == END and not stoppable: continue
+                if w == NEWLINE and not said: continue  # leading newlines get stripped anyway — don't spend steps on them
                 scored[w] = p / penalty(words, w)
 
             if not scored: break
