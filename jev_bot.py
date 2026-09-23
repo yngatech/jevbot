@@ -130,6 +130,7 @@ ALL_WORDS = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() no
 # Punctuation is at the end of vocab.txt, so these are kept past the cutoff — without them jev spells out "period"
 # when it wants a full stop. Not quotes or brackets: jev scatters them unpaired ("I?' remember' her")
 PUNCTUATION = [".", ",", "!", "?", NEWLINE]
+SENTENCE_ENDS = {".", "!", "?"}  # count as votes to end — see loom()
 BASE_VOCAB = ALL_WORDS[:VOCAB_SIZE] + [w for w in PUNCTUATION if w not in ALL_WORDS[:VOCAB_SIZE]]
 log.info(f"Loaded {len(BASE_VOCAB)} vocab words")
 
@@ -388,17 +389,29 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
 
             ranked = sorted(scored.items(), key=lambda kv: -kv[1])
             word = ranked[0][0]
+            # ".", "!" and "?" are jev ending as much as <END> is. Apart, they split the vote to end and a word won
+            # instead: where master ended, jev picked <END> 31% of the time with them in the vocab and 78% without
+            # ("Dunno google" went on "for", "on", "type"). So they count together, and the reply ends with the
+            # mark if jev liked that best ("Dunno forgot?")
+            ending = {w: s for w, s in scored.items() if w == END or w in SENTENCE_ENDS} if stoppable else {}
+            ends = sum(ending.values()) > max((s for w, s in scored.items() if w not in ending), default=0)
+            if ends:
+                word = max(ending, key=ending.get)
 
             top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
-            log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}")
+            log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}"
+                     + ("  ends" if ends else ""))
             # Raw probabilities of the best-scoring candidates, so penalties' effect on the pick is visible
-            steps.append({"word": word, "done": round(complete, 3),
+            steps.append({"word": word, "done": round(complete, 3), "ends": ends,
                           "top": [[w, round(probs[w], 3)] for w, _ in ranked[:5]]})
 
             if word == END:
                 note(stop="<END>")
                 break
             words.append(word)
+            if ends:
+                note(stop=f"<END> as {word}")
+                break
 
     return words
 
