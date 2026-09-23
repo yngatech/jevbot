@@ -11,6 +11,7 @@ Jev is a non-autoregressive decision model. It answers questions with calibrated
 3. **Completeness judge**: A separate `noul` question asks "is the reply complete?" — jev stops when it thinks it's done
 4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops
 5. **User-only history**: Last 3 user messages included as context, each labelled with the sender's display name (which jev can also say), and jev's own turn labelled with the bot's server nickname; jev's own broken output is excluded (it poisons follow-ups)
+6. **Reactions**: Before replying, jev is asked whether to react with an emoji instead — chatty one-liners ("lol", "i just got a new job!!") get a 😂 or 🎉, real questions still get a reply
 
 ## Output examples
 
@@ -52,6 +53,8 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 `vocab.txt` is a 20K word list (from [bewinxed/jevgpt](https://github.com/bewinxed/jevgpt)) with slurs removed. Words can be added or removed freely — the vocab IS the content filter.
 
 Server-specific words and phrases go in `custom_vocab.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments). Multi-word phrases are chosen as a single unit, and entries already in `vocab.txt` are skipped. Restart the bot to pick up changes.
+
+Reactions come from `emoji.txt` (one unicode emoji per line) plus the server's own custom emoji, which jev sees by their `:name:`. Like the word vocab, edit the list to change what jev can react with. The bot needs the **Add Reactions** permission; without it jev replies instead.
 
 ## Credits
 

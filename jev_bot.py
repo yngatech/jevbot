@@ -39,6 +39,7 @@ CONTENT_PENALTY = 2.5
 CONTENT_PENALTY_CAP = 4
 STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
+REACT_THRESHOLD = 0.45          # chatty one-liners ("lol", "i hate mondays") land ~0.5, real questions ~0.1-0.2
 
 STOPWORDS = set(
     "a an the and or but if of to in on at by for with from as is are was were be been "
@@ -85,6 +86,17 @@ def load_custom_vocab():
 CUSTOM_VOCAB = load_custom_vocab()
 BASE_VOCAB += CUSTOM_VOCAB
 log.info(f"Loaded {len(CUSTOM_VOCAB)} custom vocab words")
+
+# Reactions: unicode emoji from emoji.txt, plus the server's own emoji by their :name:
+EMOJI_PATH = Path(__file__).parent / "emoji.txt"
+BASE_EMOJI = [e for e in EMOJI_PATH.read_text().split("\n") if e]
+log.info(f"Loaded {len(BASE_EMOJI)} reaction emoji")
+
+def emoji_vocabulary(guild):
+    emoji = {e: e for e in BASE_EMOJI}
+    if guild:
+        emoji |= {f":{e.name}:": e for e in guild.emojis if e.is_usable()}
+    return emoji
 
 
 def is_word(w):
@@ -141,8 +153,12 @@ async def post(session, state, questions):
     return {}
 
 
-def choice_q(words):
-    return {"type": "choice", "instructions": "Next word?", "criteria": {w: "" for w in words}}
+def by_prob(ans):
+    return sorted(ans.get("probabilities", {}).items(), key=lambda kv: -kv[1])
+
+
+def choice_q(words, instructions="Next word?"):
+    return {"type": "choice", "instructions": instructions, "criteria": {w: "" for w in words}}
 
 
 async def next_word(session, state, vocab, rng):
@@ -163,10 +179,7 @@ async def next_word(session, state, vocab, rng):
     finalists = []
     for group_answers in results[:-1]:
         for ans in group_answers.values():
-            if "probabilities" not in ans:
-                continue
-            ranked = sorted(ans["probabilities"].items(), key=lambda kv: -kv[1])
-            finalists += [w for w, p in ranked[:TOP_PER_BUCKET] if p > 0]
+            finalists += [w for w, p in by_prob(ans)[:TOP_PER_BUCKET] if p > 0]
 
     if END not in finalists:
         finalists.append(END)
@@ -177,23 +190,54 @@ async def next_word(session, state, vocab, rng):
     return probs, complete_noul
 
 
+def transcript(message, author, bot_name, history, words):
+    turns = []
+    if history:
+        for h in history:
+            name = bot_name if h["role"] == "assistant" else h["name"]
+            turns.append(f"{name}: {unrender(h['content'])}")
+    turns.append(f"{author}: {unrender(message)}")
+    turns.append(f"{bot_name}: {unrender(render(words))}")
+    return "\n".join(turns)
+
+
+HEADERS = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
+
+
+# The emoji jev reacts with instead of replying, or None to reply
+async def choose_reaction(message, author, bot_name, emoji, history=None):
+    rng = random.Random()
+    state = transcript(message, author, bot_name, history, [])
+    shuffled = list(emoji)
+    rng.shuffle(shuffled)
+    buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
+    questions = {f"b{i}": choice_q(b, "Reaction?") for i, b in enumerate(buckets[:QUESTIONS_PER_CALL - 1])}
+    questions["react"] = {"type": "noul", "instructions": f"Should {bot_name} react with an emoji instead of replying?"}
+
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        answers = await post(session, state, questions)
+        react = answers.pop("react", {}).get("noul", 0)
+        if react < REACT_THRESHOLD:
+            log.info(f"  react={react:.2f} reply")
+            return None
+
+        finalists = [w for ans in answers.values() for w, p in by_prob(ans)[:TOP_PER_BUCKET] if p > 0]
+        if len(answers) > 1:
+            runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES], "Reaction?")})
+            finalists = [w for w, p in by_prob(runoff.get("final", {})) if p > 0]
+
+    log.info(f"  react={react:.2f} {' '.join(finalists[:3])}")
+    return finalists[0] if finalists else None
+
+
 async def generate_reply(message, author, bot_name, history=None):
     rng = random.Random()
     vocab = vocabulary(f"{author} {message}")  # lets jev say the author's name
     words = []
 
-    headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
-
-    async with aiohttp.ClientSession(headers=headers) as session:
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
         for step in range(MAX_WORDS):
-            turns = []
-            if history:
-                for h in history:
-                    name = bot_name if h["role"] == "assistant" else h["name"]
-                    turns.append(f"{name}: {unrender(h['content'])}")
-            turns.append(f"{author}: {unrender(message)}")
-            turns.append(f"{bot_name}: {unrender(render(words))}")
-            state = "\n".join(turns)
+            state = transcript(message, author, bot_name, history, words)
 
             probs, complete = await next_word(session, state, vocab, rng)
             if not probs:
@@ -268,6 +312,15 @@ async def on_message(m):
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     try:
+        # Decided before typing() — a reaction sends no message, so the typing indicator would linger
+        emoji = emoji_vocabulary(m.guild)
+        if reaction := await choose_reaction(c, m.author.display_name, bot_name, emoji, history=h):
+            try:
+                await m.add_reaction(emoji[reaction])
+                log.info(f"[REACT] {reaction}")
+                return
+            except discord.HTTPException as e:  # no Add Reactions permission, or an emoji Discord doesn't know
+                log.warning(f"React {reaction} failed, replying instead: {e}")
         async with m.channel.typing():
             async with gen_lock:
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h)
