@@ -37,8 +37,10 @@ OPENROUTER_API_KEY=your_openrouter_key
 Enable **Message Content Intent** in Discord developer portal.
 
 ```bash
-python jev_bot.py
+python3 run.py
 ```
+
+`run.py` runs the bot (`uv run --with-requirements requirements.txt jev_bot.py`; pass another command after `--`) and keeps it up to date: every minute it fetches, and when the branch's upstream has new commits that fast-forward onto a clean checkout it pulls and restarts the bot. Local edits or commits are left alone. If the bot exits on its own it's restarted, backing off if it keeps dying. Ctrl-C passes on to the bot; a third Ctrl-C kills it.
 
 ## Usage
 
