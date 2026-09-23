@@ -12,6 +12,7 @@ import time
 import asyncio
 import logging
 import random
+import signal
 import contextvars
 from pathlib import Path
 from collections import defaultdict
@@ -364,6 +365,13 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
+# Stopping: the first Ctrl-C (or SIGINT/SIGTERM) takes no new messages and lets the ones being answered finish —
+# catch_up() answers what came in meanwhile on the next start. Another Ctrl-C quits at once. A signal sent to the
+# whole process group (a service manager stopping it, say) reaches Python twice under `uv run` — directly and
+# forwarded by uv — so signals within a second of the first count as one. A terminal's Ctrl-C arrives once.
+stopping = asyncio.Event()
+handling: set[asyncio.Task] = set()
+
 # The role Discord creates for the bot (same name, e.g. "@rocky") — mentioning it counts as mentioning the bot
 def bot_role(m):
     return m.guild.self_role if m.guild else None
@@ -452,6 +460,8 @@ async def catch_up():
                 log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
                 missed.append(max(unanswered, key=lambda m: m.created_at))
     for m in sorted(missed, key=lambda m: m.created_at):
+        if stopping.is_set():
+            break
         await respond(m, caught_up=True)
 
 @bot.event
@@ -461,10 +471,20 @@ async def on_message(m):
         if HISTORY_CHATTER and (entry := history_entry(m)):
             add_history(m.channel.id, entry)
         return
+    if stopping.is_set():
+        return
     await respond(m)
 
 
 async def respond(m, **extra):
+    handling.add(task := asyncio.current_task())
+    try:
+        await respond_traced(m, **extra)
+    finally:
+        handling.discard(task)
+
+
+async def respond_traced(m, **extra):
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     # discord.py runs each event in its own task, so this trace only sees this message's requests
@@ -521,5 +541,30 @@ async def handle(m, c):
     finally:
         entry.pop("pending", None)
 
+async def main():
+    first_signal = None
+    def on_signal():
+        nonlocal first_signal
+        if first_signal is None:
+            first_signal = time.monotonic()
+            stopping.set()
+        elif time.monotonic() - first_signal > 1:
+            log.warning("[STOP] quitting now, without finishing")
+            os._exit(1)
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, on_signal)
+
+    async with bot:
+        running = asyncio.create_task(bot.start(TOKEN))
+        await asyncio.wait([running, asyncio.create_task(stopping.wait())], return_when=asyncio.FIRST_COMPLETED)
+        if running.done():
+            running.result()  # login failed or the connection gave up — raise it
+        if handling:
+            log.info(f"[STOP] finishing {len(handling)} message(s) in progress — Ctrl-C again to quit now")
+            await asyncio.gather(*handling, return_exceptions=True)
+        log.info("[STOP] done")
+
+
 if __name__ == "__main__":
-    bot.run(TOKEN, log_handler=None)
+    asyncio.run(main())
