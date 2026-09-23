@@ -197,13 +197,13 @@ async def next_word(session, state, vocab, rng, instructions):
     return probs, complete_noul
 
 
-def transcript(message, author, bot_name, history, words):
+def transcript(message, author, bot_name, history, words, reactions=True):
     turns = []
     if history:
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             turns.append(f"{name}: {unrender(h['content'])}")
-            if "reaction" in h:  # a single emoji, unlike jev's replies, doesn't poison follow-ups
+            if reactions and "reaction" in h:  # a single emoji, unlike jev's replies, doesn't poison follow-ups
                 turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {unrender(message)}")
     turns.append(f"{bot_name}: {unrender(render(words))}")
@@ -216,7 +216,8 @@ HEADERS = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "applica
 # The emoji jev reacts with instead of replying, or None to reply
 async def choose_reaction(message, author, bot_name, emoji, history=None):
     rng = random.Random()
-    state = transcript(message, author, bot_name, history, [])
+    # Without past reactions — a run of them reads as a habit to keep up, pushing real questions over REACT_THRESHOLD
+    state = transcript(message, author, bot_name, history, [], reactions=False)
     shuffled = list(emoji)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
