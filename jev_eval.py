@@ -57,7 +57,7 @@ def jazz(mins_ago):
 
 DAYS = 2 * 24 * 60
 
-# (id, author, message, history, expected: "reply"/"react")
+# (id, author, message, history, expected: "reply"/"react", or the emoji it should react with)
 REACT = [
     ("water", "mossy", "do you drink water?", None, "reply"),
     ("film", "mossy", "what's your favourite film?", None, "reply"),
@@ -75,6 +75,9 @@ REACT = [
     ("welp", "mossy", "welp", None, "react"),
     ("bad", "The Hedge Wizard", "bad rocky", None, "react"),
     ("morning-stale", "kettle", "good morning all", scones(DAYS), "react"),
+    # Borderline: a question, but poll-like with no "?" — live it got 🤔 instead of a reply
+    ("scone-order", "kettle", "jam or cream first on a scone", None, "reply"),
+    ("scone-poll", "kettle", "jam or cream first on a scone, ✅ for jam, ❌ for cream", None, {"✅", "❌"}),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -131,7 +134,10 @@ async def check_react(sem, sid, author, message, history, expected):
     asked = next((a["asked"].get("noul") for kind, _, _, a in captured.get(f"react:{sid}", [])
                   if kind == "post" and "asked" in a), None)
     got = "react" if emoji else "reply"
-    return sid, {"asked": asked, "got": got, "emoji": emoji, "expected": expected}
+    ok = emoji in expected if isinstance(expected, set) else got == expected
+    if isinstance(expected, set):
+        expected = "react " + "/".join(sorted(expected))
+    return sid, {"asked": asked, "got": got, "emoji": emoji, "expected": expected, "ok": ok}
 
 
 async def first_step(sem, sid, author, message, history, k):
@@ -183,9 +189,9 @@ def mean(xs):
 def summarise(res):
     react, first = res["react"].values(), [f for f in res["first"].values() if f]
     return {
-        "react correct": sum(r["got"] == r["expected"] for r in react),
+        "react correct": sum(r.get("ok", r["got"] == r["expected"]) for r in react),
         "react asked, questions (mean)": mean(r["asked"] for r in react if r["expected"] == "reply"),
-        "react asked, chatter (mean)": mean(r["asked"] for r in react if r["expected"] == "react"),
+        "react asked, chatter (mean)": mean(r["asked"] for r in react if r["expected"].startswith("react")),
         "first P(describing)": mean(f["describing"] for f in first),
         "first P(<END>)": mean(f["end"] for f in first),
         "first P(leak)": mean(f["leak"] for f in first),
@@ -202,7 +208,7 @@ def report(res, base=None):
     for sid, r in res["react"].items():
         was = base and base["react"].get(sid)
         delta = f"   was {fmt(was['asked'])} {was['got']}" if was else ""
-        flag = "" if r["got"] == r["expected"] else "   <- MISS"
+        flag = "" if r.get("ok", r["got"] == r["expected"]) else f"   <- MISS (want {r['expected']})"
         print(f"  {sid:15} asked={fmt(r['asked'])} {r['got']:5} {r['emoji'] or '':3}{delta}{flag}")
 
     print("\nfirst word")
