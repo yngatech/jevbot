@@ -44,6 +44,8 @@ python jev_bot.py
 
 Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
 
+Ctrl-C (or SIGTERM) lets replies in progress finish first: jev stops taking new messages (it catches up on them next start) and exits once it's done. Ctrl-C again quits without finishing.
+
 Messages sent while jev is offline (say, during a restart) never reach it, so on startup it looks back `CATCH_UP_WINDOW` (30) minutes in each channel and answers the latest message to it since it last replied or reacted there — one per channel. Needs **Read Message History**.
 
 ## Cost
