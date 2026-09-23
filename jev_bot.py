@@ -202,7 +202,13 @@ async def post(session, state, questions):
                     if (t := trace.get()) is not None:
                         t["cost"] += data.get("usage", {}).get("cost", 0)
                         t["requests"] += 1
+                    await set_credit(True)
                     return data.get("answers", {})
+                if r.status == 402:  # out of credit — retrying won't help
+                    log.warning(f"API 402: {(await r.text())[:300]}")
+                    note(error="out of credit")
+                    await set_credit(False)
+                    return {}
                 log.warning(f"API {r.status} {attempt}: {(await r.text())[:300]}")
                 await asyncio.sleep(1 + 2 * attempt)
         except Exception as e:
@@ -372,6 +378,64 @@ gen_lock = asyncio.Lock()
 stopping = asyncio.Event()
 handling: set[asyncio.Task] = set()
 
+# Out of OpenRouter credit, jev shows as idle with a status saying so — otherwise it just answers "..." and nobody
+# knows why. None until known; any request that goes through, or a check every CREDIT_CHECK_EVERY, puts it back.
+CREDIT_CHECK_EVERY = 300        # seconds
+# What jev answers with meanwhile. The .gif itself, not its klipy page — that unfurls as a "KLIPY: … View & Share" card.
+NO_MONEY = [
+    "https://static2.klipy.com/ii/2711dd8a75a85be822d136ec94899b3f/6c/19/i4pB3OVh.gif",             # wallet
+    "https://static2.klipy.com/ii/925f17378dd1893b674a723c07535afe/85/6c/wfANYRWk.gif",             # wallet penacony
+    "https://static2.klipy.com/ii/39f2394ae36df6e199be9eb7c9fa1012/b4/ac/scOGuksw.gif",             # donald duck
+    "https://static2.klipy.com/ii/d6b0ce929193df3c242ac34b5654d2ce/9e/c1/5zMKqCkz.gif",             # no money broke
+    "https://static2.klipy.com/ii/935d7ab9d8c6202580a668421940ec81/fd/f0/8IO0ioVm.gif",             # al bundy
+    "https://static2.klipy.com/ii/4493325008d34b7bf8cd6813cd5c1619/7c/91/P9M6TXIqsKJx.gif",         # we have no money
+]
+has_credit: bool | None = None
+credit_check: asyncio.Task | None = None
+
+async def set_credit(ok):
+    global has_credit, credit_check
+    if ok == has_credit:
+        return
+    has_credit = ok
+    log.info(f"[CREDIT] {'back' if ok else 'out of credit'}")
+    await show_credit()
+    if not ok and not (credit_check and not credit_check.done()):
+        credit_check = asyncio.create_task(wait_for_credit())
+
+async def show_credit():
+    if not bot.is_ready():
+        return  # on_ready shows it
+    try:
+        if has_credit is False:
+            await bot.change_presence(status=discord.Status.idle, activity=discord.CustomActivity("out of credit"))
+        else:
+            await bot.change_presence(status=discord.Status.online)
+    except Exception as e:
+        log.warning(f"Changing status failed: {e}")
+
+# What's left to spend: the account's credit, or the key's own limit if that's lower. None if the check failed.
+async def credit_left():
+    try:
+        async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.get("https://openrouter.ai/api/v1/credits") as r:
+                credits = (await r.json())["data"]
+            async with session.get("https://openrouter.ai/api/v1/key") as r:
+                key = (await r.json())["data"]
+    except Exception as e:
+        log.warning(f"Checking credit failed: {e}")
+        return None
+    left = credits["total_credits"] - credits["total_usage"]
+    if key.get("limit_remaining") is not None:
+        left = min(left, key["limit_remaining"])
+    return left
+
+async def wait_for_credit():
+    while has_credit is False:
+        await asyncio.sleep(CREDIT_CHECK_EVERY)
+        if (left := await credit_left()) is not None and left > 0:
+            await set_credit(True)
+
 # The role Discord creates for the bot (same name, e.g. "@rocky") — mentioning it counts as mentioning the bot
 def bot_role(m):
     return m.guild.self_role if m.guild else None
@@ -416,7 +480,7 @@ async def load_history(first):
     found, replies = [], {}
     try:
         async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
-            if m.author.id == bot.user.id and m.reference and m.content:
+            if m.author.id == bot.user.id and m.reference and m.content and m.content not in NO_MONEY:
                 replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
             elif m.id not in known and (entry := history_entry(m)):
                 found.append(entry)
@@ -431,6 +495,9 @@ async def load_history(first):
 @bot.event
 async def on_ready():
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
+    if has_credit is None and (left := await credit_left()) is not None:
+        await set_credit(left > 0)
+    await show_credit()  # a reconnect starts over as online
     await catch_up()
 
 # Messages sent while jev was offline (a restart, an outage) never reach on_message. On (re)connect, answer each
@@ -515,6 +582,13 @@ async def handle(m, c):
         h.append({"role": "assistant", "name": bot_name, "content": r.content})
     note(bot_name=bot_name, history=h)
     try:
+        # Kept out of history: jev would see the link in its transcript and start talking about it
+        if has_credit is False:
+            gif = random.choice(NO_MONEY)
+            note(reply=gif)
+            log.info(f"[OUT] out of credit: {gif}")
+            await m.reply(gif, mention_author=False)
+            return
         # Decided before typing() — a reaction sends no message, so the typing indicator would linger
         emoji = emoji_vocabulary(m.guild)
         if reaction := await choose_reaction(c, m.author.display_name, bot_name, emoji, history=h):
@@ -529,10 +603,13 @@ async def handle(m, c):
         async with m.channel.typing():
             async with gen_lock:
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h)
+        if has_credit is False and r == "...":  # ran out before the first word
+            r = random.choice(NO_MONEY)
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
         sent = await m.reply(r, mention_author=False)
-        entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
+        if r not in NO_MONEY:
+            entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         note(error=repr(e))
