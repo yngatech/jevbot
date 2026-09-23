@@ -44,7 +44,7 @@ python3 run.py
 
 ## Usage
 
-Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
+Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it. DMs are ignored entirely.
 
 Ctrl-C (or SIGTERM) lets replies in progress finish first: jev stops taking new messages (it catches up on them next start) and exits once it's done. Ctrl-C again quits without finishing.
 
