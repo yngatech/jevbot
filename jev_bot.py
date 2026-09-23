@@ -368,6 +368,7 @@ async def generate_reply(message, author, bot_name, history=None):
 # Discord
 intents = discord.Intents.default()
 intents.message_content = True
+intents.dm_messages = False  # no DMs — every reply costs credit, and nobody sees what's said in private
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
