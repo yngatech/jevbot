@@ -243,7 +243,11 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
             turns.append(f"{name}: {to if h['role'] == 'user' and h.get('to_bot', True) else ''}{text}")
-            if reactions and "reaction" in h:  # a single emoji, unlike jev's replies, doesn't poison follow-ups
+            # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
+            # to them or describes the silence ("crickets"). Past reactions stay out of the question check.
+            if "reply" in h:
+                turns.append(f"{bot_name}: {unrender(h['reply'])}")
+            elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {to}{unrender(message)}")
     turns.append(f"{bot_name}: {unrender(render(words))}")
@@ -386,13 +390,18 @@ def history_entry(m):
 async def load_history(first):
     ch = first.channel.id
     known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
-    found = []
+    found, replies = [], {}
     try:
         async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
-            if m.id not in known and (entry := history_entry(m)):
+            if m.author.id == bot.user.id and m.reference and m.content:
+                replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
+            elif m.id not in known and (entry := history_entry(m)):
                 found.append(entry)
     except Exception as e:  # no Read Message History permission — start empty, like before
         log.warning(f"Loading history for {ch} failed: {e}")
+    for entry in found:
+        if r := replies.get(entry["id"]):
+            entry["reply"], entry["reply_id"] = r.content, r.id
     channel_history[ch] = recent(sorted(channel_history[ch] + found, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
@@ -430,10 +439,9 @@ async def handle(m, c):
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
-    # Only user messages in history — jev's own broken output poisons follow-ups
-    h = [x for x in recent(channel_history[m.channel.id][:-1]) if x["role"] == "user"]
-    # ...except the reply someone is answering — without it jev contradicts what it just said
-    if (r := replied_to_bot(m)) and r.content:
+    h = recent(channel_history[m.channel.id][:-1])
+    # The reply of jev's someone is answering, if it isn't already shown under the message it answered
+    if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
         h.append({"role": "assistant", "name": bot_name, "content": r.content})
     note(bot_name=bot_name, history=h)
     try:
@@ -453,7 +461,8 @@ async def handle(m, c):
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h)
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
-        await m.reply(r, mention_author=False)
+        sent = await m.reply(r, mention_author=False)
+        entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         note(error=repr(e))

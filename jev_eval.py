@@ -17,7 +17,8 @@ Measured (cheap):
   react  — the "is this a question?" check: questions should get a reply, chatter a reaction
   first  — jev's first-word candidates: how much goes to words describing the reply ("silent",
            "crickets"), to <END>, to words only the transcript scaffolding contains (a format
-           leak), and to the obvious answer where there is one ("yes" to "do you drink water?")
+           leak), to words only earlier messages used (going back to an old topic), and to the
+           obvious answer where there is one ("yes" to "do you drink water?")
 Taste (--replies): full replies printed side by side, for a human to judge.
 """
 
@@ -40,10 +41,12 @@ DESCRIBING = {"empty", "silent", "silence", "crickets", "blank", "quiet", "unans
 NOW = datetime.now(timezone.utc)
 
 
-def said(name, text, mins_ago, reaction=None, to_bot=True):
+def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None):
     entry = {"role": "user", "name": name, "content": text, "at": NOW - timedelta(minutes=mins_ago), "to_bot": to_bot}
     if reaction:
         entry["reaction"] = reaction
+    if reply:
+        entry["reply"] = reply  # what jev answered
     return entry
 
 def chat(name, text, mins_ago):  # said in the channel, not to jev
@@ -75,6 +78,10 @@ CAT = [chat("kettle", "my cat biscuit just knocked my tea over", 4), chat("pip",
 # The answer was said to jev five messages ago
 COLOUR = [said("mossy", "my favourite colour is green", 6), said("pip", "do you like tea?", 5),
           said("kettle", "what's 2+2", 4), said("pip", "do you like jazz?", 3), said("kettle", "is it raining where you are?", 2)]
+# Two earlier questions, then a new topic — with jev's answers shown, and without (how it used to look)
+FLAN = [said("pip", "what's a flan", 3, reply="Dunno a custard dessert wobbly sweet"),
+        said("mossy", "you?", 2, reply="No not wobbly")]
+FLAN_UNANSWERED = [{k: v for k, v in h.items() if k != "reply"} for h in FLAN]
 # Chatter with nothing to do with the question
 NOISE = [chat("kettle", "anyone up for games tonight", 7), chat("pip", "can't, got work", 6), chat("mossy", "boo", 5),
          chat("kettle", "maybe tomorrow then", 4), chat("mossy", "what time", 3), chat("kettle", "8ish", 2)]
@@ -107,6 +114,8 @@ REACT = [
     ("cat", "kettle", "what's my cat called?", CAT, "reply"),
     ("water-noisy", "mossy", "do you drink water?", NOISE, "reply"),
     ("lol-noisy", "pip", "lol", NOISE, "react"),
+    ("moved-on", "kettle", "are landlords ethical", FLAN, "reply"),
+    ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -130,6 +139,11 @@ FIRST = [
     ("cat", "kettle", "what's my cat called?", CAT, {"biscuit"}),
     ("colour", "mossy", "what's my favourite colour?", COLOUR, {"green"}),
     ("water-noisy", "mossy", "do you drink water?", NOISE, YES),
+    # A new question after two answered ones: does jev go back to the flan?
+    ("moved-on", "kettle", "are landlords ethical", FLAN, None),
+    ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, None),
+    ("follow-up", "mossy", "you?", FLAN[:1], YES),
+    ("follow-up-unanswered", "mossy", "you?", FLAN_UNANSWERED[:1], YES),
 ]
 
 REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply")]
@@ -204,15 +218,20 @@ async def check_first(sem, sid, author, message, history, expected):
         for w, p in step_probs.items():
             probs[w] = probs.get(w, 0) + p / len(steps)
     # Words the transcript adds around the messages (labels, timestamps...) — jev picking these is a format leak
-    spoken = " ".join([BOT, author, message] + [f"{h['name']} {h['content']}" for h in visible(history) or []])
+    spoken = " ".join([BOT, author, message] + [f"{h['name']} {h['content']} {h.get('reply', '')}" for h in visible(history) or []])
     scaffold = words_in(state) - words_in(spoken)
     share = lambda ws: sum(p for w, p in probs.items() if w.lower() in ws)
+    # Words only earlier messages used — jev picking these is going back to an old topic
+    names = words_in(" ".join([BOT, author] + [h["name"] for h in visible(history) or []]))
+    earlier = words_in(" ".join(h["content"] for h in visible(history) or [] if h["role"] == "user"))
+    old_topic = earlier - words_in(message) - names - j.STOPWORDS - (expected or set())
     return sid, {
         "top": sorted(probs.items(), key=lambda kv: -kv[1])[:6],
         "describing": share(DESCRIBING),
         "end": probs.get(j.END, 0),
         "leak": share(scaffold),
         "leaked": sorted(w for w in probs if w.lower() in scaffold),
+        "old_topic": share(old_topic),
         "expected": share(expected) if expected else None,
     }
 
@@ -240,6 +259,7 @@ def summarise(res):
         "first P(describing)": mean(f["describing"] for f in first),
         "first P(<END>)": mean(f["end"] for f in first),
         "first P(leak)": mean(f["leak"] for f in first),
+        "first P(old topic)": mean(f.get("old_topic") for f in first),
         "first P(expected answer)": mean(f["expected"] for f in first),
     }
 
