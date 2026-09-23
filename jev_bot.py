@@ -39,6 +39,7 @@ CONTENT_PENALTY = 2.5
 CONTENT_PENALTY_CAP = 4
 STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
+VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.45          # chatty one-liners ("lol", "i hate mondays") land ~0.5, real questions ~0.1-0.2
 
 STOPWORDS = set(
@@ -69,7 +70,7 @@ def add_history(ch_id, role, name, content):
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
 CUSTOM_VOCAB_PATH = Path(__file__).parent / "custom_vocab.txt"
 BANNED = {"unanswered"}
-BASE_VOCAB = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED]
+BASE_VOCAB = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED][:VOCAB_SIZE]
 log.info(f"Loaded {len(BASE_VOCAB)} vocab words")
 
 # Server words/phrases: one per line, "#" comments, multi-word phrases are picked as a single unit

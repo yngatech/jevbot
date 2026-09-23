@@ -2,11 +2,11 @@
 
 Discord bot that makes [TypeSafe's Jev](https://openrouter.ai/~typesafe/jev-latest) talk — a decision model that "cannot generate text," loomed word-by-word into broken sentences.
 
-Jev is a non-autoregressive decision model. It answers questions with calibrated probabilities, not text. This bot gives it a 20K word vocabulary and asks "next word?" repeatedly via tournament sampling until it forms a reply.
+Jev is a non-autoregressive decision model. It answers questions with calibrated probabilities, not text. This bot gives it a 10K word vocabulary and asks "next word?" repeatedly via tournament sampling until it forms a reply.
 
 ## How it works
 
-1. **Tournament sampling**: 20K vocab shuffled into 255-word buckets, all scored in parallel
+1. **Tournament sampling**: 10K vocab shuffled into 255-word buckets, all scored in parallel
 2. **Runoff**: Top-2 from each bucket compete in a final round  
 3. **Completeness judge**: A separate `noul` question asks "is the reply complete?" — jev stops when it thinks it's done
 4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops
@@ -46,13 +46,13 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 
 ## Cost
 
-~$0.01-0.05 per reply via OpenRouter. Tournament sampling does ~6 API calls per word.
+Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042 per million input tokens (output is free), which comes to ~$0.003 per word with the 10K vocab, so ~$0.01-0.10 per reply depending on length.
 
 ## Vocab
 
-`vocab.txt` is a 20K word list (from [bewinxed/jevgpt](https://github.com/bewinxed/jevgpt)) with slurs removed. Words can be added or removed freely — the vocab IS the content filter.
+`vocab.txt` is a 20K word list (from [bewinxed/jevgpt](https://github.com/bewinxed/jevgpt)) with slurs removed, ordered from most to least common. Jev only uses the first `VOCAB_SIZE` (10K) words, since every word in the vocab is paid for on every step. Words can be added or removed freely — the vocab IS the content filter — but a word added past the cutoff is never used, so put new words in `custom_vocab.txt`. Words from the message jev is replying to are always added, so it can repeat a rarer word someone just used.
 
-Server-specific words and phrases go in `custom_vocab.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments). Multi-word phrases are chosen as a single unit, and entries already in `vocab.txt` are skipped. Restart the bot to pick up changes.
+Server-specific words and phrases go in `custom_vocab.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments). Multi-word phrases are chosen as a single unit, and entries already in the vocab are skipped. Restart the bot to pick up changes.
 
 Reactions come from `emoji.txt` (one unicode emoji per line) plus the server's own custom emoji, which jev sees by their `:name:`. Like the word vocab, edit the list to change what jev can react with. The bot needs the **Add Reactions** permission; without it jev replies instead.
 
