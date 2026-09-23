@@ -48,6 +48,12 @@ CONTENT_PENALTY = 2.5
 CONTENT_PENALTY_CAP = 4
 STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
+# Repeats across replies: jev copies itself — "Dunno" went 0.32 → 0.61 as its own "Dunno? Dunno?" replies filled
+# the transcript, and one "Private? Private?" made five. Each of its last ECHO_TURNS answers (replies or reactions)
+# that said a word divides it by ECHO_PENALTY. Replayed over a day's logs, 2.0 took replies opening with "dunno"
+# from 15 of 40 to 8 and kept the ones it clearly meant; 2.5 dropped "Dunno" for "Yes" at 0.12 vs 0.09 after one
+ECHO_TURNS = 3
+ECHO_PENALTY = 2.0
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
 STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each) — 0 to leave the status alone
@@ -210,8 +216,31 @@ SAME = {w: g.split()[0] for g in SIMILAR for w in g.split()}
 def same(word):
     return SAME.get(word.lower(), word)
 
+# Emoji that say the same as a word, so a run of "Dunno" replies counts against 🤷 and a run of 🤷 against "Dunno"
+EMOJI_SAYS = {"🤷": "dunno"}
 
-def penalty(reply, word):
+def said_as(token):
+    return EMOJI_SAYS.get(token) or same(token).lower()
+
+def said_in(text):
+    return {said_as(w) for w in re.findall(r"[a-z]+(?:'[a-z]+)*", text.lower())}
+
+# jev's last ECHO_TURNS answers in view — replies and reactions — each as the set of things it said
+def recent_answers(history):
+    answers = []
+    for h in history or []:
+        if h["role"] == "assistant":
+            answers.append(h["content"])
+        elif "reply" in h:
+            answers.append(h["reply"])
+        elif "reaction" in h:
+            answers.append(h["reaction"])
+    return [{said_as(a)} | said_in(a) for a in answers[-ECHO_TURNS:]]
+
+
+# recent: recent_answers() — a word jev said in them is a repeat too, apart from ones in `exempt`, said_in() the
+# message it's answering: repeating what someone just said is fair game
+def penalty(reply, word, recent=(), exempt=()):
     reply, word = [same(w) for w in reply], same(word)
     local = reply[-REPEAT_WINDOW:].count(word) + 2 * (reply[-1:] == [word])
     p = REPEAT_PENALTY ** local
@@ -219,6 +248,8 @@ def penalty(reply, word):
     alpha = word.replace(" ", "").isalpha()
     if alpha and word.lower() not in STOPWORDS:
         p *= CONTENT_PENALTY ** min(seen, CONTENT_PENALTY_CAP)
+        if said_as(word) not in exempt:
+            p *= ECHO_PENALTY ** sum(said_as(word) in a for a in recent)
     elif alpha:
         p *= STOP_PENALTY ** min(seen, STOP_PENALTY_CAP)
     return p
@@ -341,20 +372,29 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
             log.info(f"  asked={asked:.2f} reply")
             return None
 
-        finalists = [w for ans in answers.values() for w, p in by_prob(ans)[:TOP_PER_BUCKET] if p > 0]
         if len(answers) > 1:
+            finalists = [w for ans in answers.values() for w, p in by_prob(ans)[:TOP_PER_BUCKET] if p > 0]
             runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES], "Reaction?")})
-            finalists = [w for w, p in by_prob(runoff.get("final", {})) if p > 0]
+            probs = runoff.get("final", {}).get("probabilities", {})
+        else:
+            probs = next(iter(answers.values()), {}).get("probabilities", {})
 
-    log.info(f"  asked={asked:.2f} {' '.join(finalists[:3])}")
-    note(reaction_candidates=finalists[:3])
-    return finalists[0] if finalists else None
+    # Its own answers count against an emoji, as they do against words: jev's past reactions are hidden from it,
+    # but 🤷 still came first in a channel full of its "Dunno? Dunno?" replies
+    recent = recent_answers(history)
+    scored = {w: p / ECHO_PENALTY ** sum(said_as(w) in a for a in recent) for w, p in probs.items() if p > 0}
+    reaction = max(scored, key=scored.get, default=None)
+    log.info(f"  asked={asked:.2f} {reaction}")
+    # The likeliest before the penalty, with their raw probability and score — the reaction is the best score
+    likeliest = sorted(scored, key=probs.get, reverse=True)[:5]
+    note(reaction_candidates=[[w, round(probs[w], 3), round(scored[w], 3)] for w in likeliest])
+    return reaction
 
 
 # Words jev picks one at a time to continue state(words), until it stops, runs out, or has max_words (MAX_WORDS).
 # It can't stop before min_words (MIN_WORDS) real words. done_state(words), if given, is what the "is the reply
-# complete?" question sees instead of state(words).
-async def loom(state, vocab, instructions, max_words=None, min_words=None, done_state=None):
+# complete?" question sees instead of state(words). recent and exempt go to penalty().
+async def loom(state, vocab, instructions, max_words=None, min_words=None, done_state=None, recent=(), exempt=()):
     rng = random.Random()
     words = []
     steps = []
@@ -381,7 +421,7 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
                 if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
                 if w == END and not stoppable: continue
                 if w == NEWLINE and not said: continue  # leading newlines get stripped anyway — don't spend steps on them
-                scored[w] = p / penalty(words, w)
+                scored[w] = p / penalty(words, w, recent, exempt)
 
             if not scored:
                 note(stop="nothing left")
@@ -427,7 +467,8 @@ async def generate_reply(message, author, bot_name, history=None):
     words = await loom(lambda words: transcript(message, author, bot_name, history, words),
                        vocab, NEXT_WORD.format(bot_name=bot_name),
                        done_state=lambda words: transcript(message, author, bot_name, history, words,
-                                                            their_reactions=False))
+                                                            their_reactions=False),
+                       recent=recent_answers(history), exempt=said_in(message))
     return render(words).strip() or "..."
 
 

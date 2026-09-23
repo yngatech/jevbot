@@ -14,7 +14,7 @@ import os
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "test")
 
-from jev_bot import END, MIN_WORDS, is_word, penalty, render  # noqa: E402
+from jev_bot import END, MIN_WORDS, is_word, penalty, recent_answers, render, said_in  # noqa: E402
 
 # reply: [(word picked, [(candidate, raw probability), ...]), ...] — "top" from logs/*.jsonl
 REPLAYS = {
@@ -116,6 +116,46 @@ def test_funny_replies_unchanged():
     for reply in ["Google goo woo", "He 's annoying", "Yes no is no",
                   "Dunno a know is mean means knows skinny thin young gay"]:
         assert first_change(REPLAYS[reply]) is None, reply
+
+# Where jev copied itself from reply to reply: first-step candidates from the logs, with the answers it had in view
+ECHOES = {
+    "Dunno? Dunno?": (["Dunno? Dunno?", "Dunno yes", "Dunno? Dunno"],
+                      [("dunno", .3), ("?", .06), ("shrugging", .05), ("stop", .05), ("idk", .04)]),
+    "Private? Private?": (["Private? Private?", "Private? Private?"],
+                          [("private", .21), ("?", .12), ("my", .08), ("grok", .07), ("computer", .06)]),
+    # "Dunno google" goes too, but to "Google": crickets and 🤷 were in view as well
+    "Dunno google": (["Crickets chirping gay guy is twink", "🤷", "Dunno yeah kinda"],
+                     [("dunno", .2), ("crickets", .13), ("google", .07), ("silence", .06), ("penis", .04)]),
+    # Clearly meant: a dunno after one other, and "four" for 2+2 with dunno everywhere
+    "Dunno maybe positive": (["He 's annoying", "🤣", "No dunno ninja"],
+                             [("dunno", .3), ("no", .1), ("i", .07), ("yes", .05), ("nope", .05)]),
+    "Four dunno": (["Dunno? Dunno?", "Dunno? Dunno?", "Dunno gone"], [("four", .86), ("dunno", .08), ("idk", .03)]),
+}
+
+def first_word(reply, answers=None, message=""):
+    answers, top = ECHOES[reply] if answers is None else (answers, ECHOES[reply][1])
+    history = [{"role": "user", "name": "x", "content": "?", "reply": a} for a in answers]
+    exempt = said_in(message)
+    return max(top, key=lambda wp: wp[1] / penalty([], wp[0], recent_answers(history), exempt))[0]
+
+def test_echoes_across_replies():
+    assert penalty([], "idk", recent_answers([{"role": "assistant", "name": "jev", "content": "Dunno"}])) > 1
+    assert penalty([], "idk", recent_answers([{"role": "user", "name": "x", "content": "?", "reaction": "🤷"}])) > 1
+    assert penalty([], "google", recent_answers([{"role": "assistant", "name": "jev", "content": "Dunno"}])) == 1
+
+def test_echo_runs_break():
+    assert first_word("Dunno? Dunno?") == "?"
+    assert first_word("Private? Private?") == "?"
+    assert first_word("Dunno google") == "google"
+
+def test_meant_answers_kept():
+    assert first_word("Dunno maybe positive") == "dunno"
+    assert first_word("Four dunno") == "four"
+    assert first_word("Dunno? Dunno?", message="idk what to do") == "dunno"  # said to jev: fair game
+
+def test_only_last_answers_count():
+    old = ["Dunno", "Dunno", "Dunno"]
+    assert first_word("Dunno? Dunno?", old + ["Yes", "No", "Hi"]) == "dunno"
 
 
 if __name__ == "__main__":
