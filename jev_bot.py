@@ -15,6 +15,7 @@ import random
 import signal
 import contextvars
 from pathlib import Path
+from urllib.parse import urlsplit
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -446,6 +447,62 @@ def strip_mention(m):
         c = c.replace(role.mention, "")
     return c.strip()
 
+# Links, e.g. a GIF from Discord's picker (https://klipy.com/gifs/azumanga-daioh-sakai) — shown as a tag with the
+# embed's title (a tweet's has none, so its author and the start of its text), or the link's site and path words while there's no embed.
+# Raw, "https" went into the vocab, and jev picked it ("Yeah yes https https too is").
+LINK = re.compile(r"<?(https?://[^\s<>]+)>?")
+GIF_HOSTS = {"klipy.com", "tenor.com", "giphy.com"}
+SECOND_LEVEL = {"co", "com", "org", "net", "gov", "ac"}
+EMBED_WORDS = 20
+
+def slug_words(text):
+    return [w for w in re.split(r"[/\-_.+]", text) if w.isalpha()]
+
+# The start of a tweet's text: its first line, plain (the embed's is markdown), cut at EMBED_WORDS words
+def embed_text(description):
+    line = (description or "").strip().split("\n")[0]
+    line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)  # [@someone](https://x.com/someone) -> @someone
+    words = re.sub(r"\\(.)|\*\*", r"\1", line).split()
+    return " ".join(words[:EMBED_WORDS]) + (" ..." if len(words) > EMBED_WORDS else "")
+
+def link_tag(url, embed=None):
+    u = urlsplit(url)
+    host = (u.hostname or "").removeprefix("www.")
+    gif = ".".join(host.split(".")[-2:]) in GIF_HOSTS or (embed is not None and embed.type == "gifv")
+    if embed is not None and embed.title:
+        words = embed.title
+    elif embed is not None and (author := re.sub(r" \(@\S+\)$", "", embed.author.name or "")):
+        words = author + (f": {text}" if (text := embed_text(embed.description)) else "")
+    elif gif:  # just the slug: klipy/tenor/giphy's path boilerplate and IDs say nothing about the GIF
+        words = " ".join(w for w in slug_words(u.path.rsplit("/", 1)[-1]) if w.lower() != "gif")
+    else:
+        words = " ".join([h for h in host.split(".")[:-1] if h not in SECOND_LEVEL] + slug_words(u.path))
+    kind = "gif" if gif else "link"
+    return f"[{kind}: {words}]" if words else f"[{kind}]"
+
+# The embed Discord made for url — its URL can differ (x.com comes back as twitter.com), so matched by path,
+# or taken as is when there's one link and one embed (a YouTube short's embed is a watch?v= link)
+def embed_for(url, m, only):
+    embeds = [e for e in m.embeds if e.url]
+    path = urlsplit(url).path.rstrip("/")
+    return (next((e for e in embeds if urlsplit(e.url).path.rstrip("/") == path), None)
+            or (embeds[0] if only and len(embeds) == 1 else None))
+
+def attachment_tag(a):
+    if a.content_type == "image/gif":
+        return "[gif]"
+    kind = (a.content_type or "").split("/")[0]
+    return {"image": "[photo]", "video": "[video]", "audio": "[audio]"}.get(kind, "[file]")
+
+# m as jev sees it: without the mention if it's to jev, links as tags, and a tag for each attachment and sticker —
+# otherwise a photo on its own is an empty message, dropped or read as "hello"
+def message_text(m):
+    text = strip_mention(m) if should_respond(m) else m.content
+    only = len(LINK.findall(text)) == 1
+    text = LINK.sub(lambda l: link_tag(l[1], embed_for(l[1], m, only)), text)
+    tags = [attachment_tag(a) for a in m.attachments] + [f"[sticker: {s.name}]" for s in m.stickers]
+    return " ".join([text.strip(), *tags]).strip()
+
 # The message of jev's that m is a Discord reply to, if any
 def replied_to_bot(m):
     r = m.reference and m.reference.resolved
@@ -465,7 +522,7 @@ def history_entry(m):
     if m.author.bot:
         return None
     to_bot = should_respond(m)
-    content = (strip_mention(m) or "hello") if to_bot else m.content.strip()
+    content = message_text(m) or ("hello" if to_bot else "")
     if not content:
         return None
     entry = {"role": "user", "name": m.author.display_name, "content": content,
@@ -543,6 +600,14 @@ async def on_message(m):
     await respond(m)
 
 
+# Discord often adds a link's embed just after the message arrives, as an edit — and people fix typos
+@bot.event
+async def on_message_edit(before, after):
+    entry = next((e for e in channel_history.get(after.channel.id, []) if e.get("id") == after.id), None)
+    if entry and (content := message_text(after)):
+        entry["content"] = content
+
+
 async def respond(m, **extra):
     handling.add(task := asyncio.current_task())
     try:
@@ -552,7 +617,7 @@ async def respond(m, **extra):
 
 
 async def respond_traced(m, **extra):
-    c = strip_mention(m) or "hello"
+    c = message_text(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     # discord.py runs each event in its own task, so this trace only sees this message's requests
     t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "channel": getattr(m.channel, "name", None),
