@@ -180,10 +180,10 @@ async def post(session, state, questions):
     captured.setdefault(scenario.get(), []).append(("post", state, questions, dict(answers)))  # the bot pops from it
     return answers
 
-async def next_word(session, state, vocab, rng, instructions):
+async def next_word(session, state, vocab, rng, instructions, done_state=None):
     # Seeded per scenario, so before/after runs shuffle the vocab the same way and differ only by the change
     rng = shuffles.setdefault(scenario.get(), random.Random(seed.get()))
-    probs, complete = await real_next_word(session, state, vocab, rng, instructions)
+    probs, complete = await real_next_word(session, state, vocab, rng, instructions, done_state)
     captured.setdefault(scenario.get(), []).append(("step", state, probs, complete))
     return probs, complete
 

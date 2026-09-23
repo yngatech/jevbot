@@ -252,7 +252,8 @@ def choice_q(words, instructions):
     return {"type": "choice", "instructions": instructions, "criteria": {w: "" for w in words}}
 
 
-async def next_word(session, state, vocab, rng, instructions):
+# done_state: what the "is the reply complete?" question sees, if not state
+async def next_word(session, state, vocab, rng, instructions, done_state=None):
     shuffled = list(vocab)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
@@ -262,7 +263,7 @@ async def next_word(session, state, vocab, rng, instructions):
         *(post(session, state, {f"b{gi * QUESTIONS_PER_CALL + i}": choice_q(b, instructions)
                                 for i, b in enumerate(g)})
           for gi, g in enumerate(groups)),
-        post(session, state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
+        post(session, done_state or state, {"complete": {"type": "noul", "instructions": "Is the reply complete?"}}),
     )
 
     complete_noul = results[-1].get("complete", {}).get("noul", 0)
@@ -288,21 +289,23 @@ def reacted(counts):
 # marked: show messages to jev as "name: @jev ..." (the mention is stripped otherwise). Tested live: with channel
 # chatter in view it's what tells the question check which messages were for jev, but for picking words it made
 # jev describe more and stop sooner, so only the question check uses it.
-def transcript(message, author, bot_name, history, words, reactions=True, marked=False):
+# reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies
+def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None):
+    their_reactions = reactions if their_reactions is None else their_reactions
     to = f"@{bot_name} " if marked else ""
     turns = []
     if history:
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
-            if h["role"] == "assistant" and reactions:
+            if h["role"] == "assistant" and their_reactions:
                 text += reacted(h.get("reactions"))
             turns.append(f"{name}: {to if h['role'] == 'user' and h.get('to_bot', True) else ''}{text}")
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
             if "reply" in h:
-                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if reactions else ''}")
+                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if their_reactions else ''}")
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {to}{unrender(message)}")
@@ -344,8 +347,9 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
 
 
 # Words jev picks one at a time to continue state(words), until it stops, runs out, or has max_words (MAX_WORDS).
-# It can't stop before min_words (MIN_WORDS) real words.
-async def loom(state, vocab, instructions, max_words=None, min_words=None):
+# It can't stop before min_words (MIN_WORDS) real words. done_state(words), if given, is what the "is the reply
+# complete?" question sees instead of state(words).
+async def loom(state, vocab, instructions, max_words=None, min_words=None, done_state=None):
     rng = random.Random()
     words = []
     steps = []
@@ -353,7 +357,8 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None):
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for step in range(max_words or MAX_WORDS):
-            probs, complete = await next_word(session, state(words), vocab, rng, instructions)
+            probs, complete = await next_word(session, state(words), vocab, rng, instructions,
+                                              done_state and done_state(words))
             if not probs:
                 note(stop="no answer")
                 break
@@ -400,8 +405,12 @@ async def generate_reply(message, author, bot_name, history=None):
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
                                 + [f"{author} {message}"]))
     note(transcript=transcript(message, author, bot_name, history, []))
+    # People's reactions stay out of the "complete?" question: with 😂×4 on jev's last reply in view it read a
+    # two-word reply as done, and jev stopped at "Dunno forgot" where it had gone on to "Dunno forgot liar bitch"
     words = await loom(lambda words: transcript(message, author, bot_name, history, words),
-                       vocab, NEXT_WORD.format(bot_name=bot_name))
+                       vocab, NEXT_WORD.format(bot_name=bot_name),
+                       done_state=lambda words: transcript(message, author, bot_name, history, words,
+                                                            their_reactions=False))
     return render(words).strip() or "..."
 
 
