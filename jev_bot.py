@@ -243,8 +243,10 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
 
 async def generate_reply(message, author, bot_name, history=None):
     rng = random.Random()
-    # Every word and name in the transcript, not just the message being replied to — lets jev say what it can see
-    vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or []] + [f"{author} {message}"]))
+    # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
+    # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
+    vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
+                                + [f"{author} {message}"]))
     instructions = NEXT_WORD.format(bot_name=bot_name)
     words = []
 
@@ -300,14 +302,16 @@ def strip_mention(m):
         c = c.replace(role.mention, "")
     return c.strip()
 
+# The message of jev's that m is a Discord reply to, if any
+def replied_to_bot(m):
+    r = m.reference and m.reference.resolved
+    return r if isinstance(r, discord.Message) and r.author.id == bot.user.id else None
+
 def should_respond(m):
     if m.author.bot: return False
     if bot.user in m.mentions: return True
     if (role := bot_role(m)) and role in m.role_mentions: return True
-    if m.reference and m.reference.resolved:
-        r = m.reference.resolved
-        if isinstance(r, discord.Message) and r.author.id == bot.user.id: return True
-    return False
+    return replied_to_bot(m) is not None
 
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
@@ -341,11 +345,14 @@ async def on_message(m):
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
     await history_loaded[m.channel.id]
     entry = add_history(m.channel.id, "user", m.author.display_name, c)
+    # Server nickname, so the transcript uses the name people call the bot by
+    bot_name = (m.guild.me if m.guild else bot.user).display_name
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
     h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
-    # Server nickname, so the transcript uses the name people call the bot by
-    bot_name = (m.guild.me if m.guild else bot.user).display_name
+    # ...except the reply someone is answering — without it jev contradicts what it just said
+    if (r := replied_to_bot(m)) and r.content:
+        h.append({"role": "assistant", "name": bot_name, "content": r.content})
     try:
         # Decided before typing() — a reaction sends no message, so the typing indicator would linger
         emoji = emoji_vocabulary(m.guild)

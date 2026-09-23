@@ -52,6 +52,14 @@ def scones(mins_ago):
             said("The Hedge Wizard", "bad rocky", mins_ago + 1, "🤷"),
             said("mossy", "do you like tea?", mins_ago, "🤷")]
 
+def rocky_said(text, mins_ago):
+    return {"role": "assistant", "name": BOT, "content": text, "at": NOW - timedelta(minutes=mins_ago)}
+
+# Someone replying to one of jev's replies, with and without that reply in view
+GIRLFRIEND = [said("kettle", "are you seeing anyone?", 2), rocky_said("No straight happily guy with girlfriend", 1)]
+GARBLED = [said("pip", "do you like kelp and perhaps algae", 2),
+           rocky_said("Is? Is are are garbled? What? Huh pip you pip rocky ives unclear", 1)]
+
 def jazz(mins_ago):
     return [said("kettle", "i love jazz, been listening all day", mins_ago)]
 
@@ -78,6 +86,10 @@ REACT = [
     # Borderline: a question, but poll-like with no "?" — live it got 🤔 instead of a reply
     ("scone-order", "kettle", "jam or cream first on a scone", None, "reply"),
     ("scone-poll", "kettle", "jam or cream first on a scone, ✅ for jam, ❌ for cream", None, {"✅", "❌"}),
+    ("gf-reply", "kettle", "what's her name?", GIRLFRIEND, "reply"),
+    ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], "reply"),
+    ("garbled-reply", "pip", "what do you mean?", GARBLED, "reply"),
+    ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -92,9 +104,14 @@ FIRST = [
     ("unknowable", "pip", "what's the room temperature at kettle's house?", None, None),
     ("jazz-fresh", "mossy", "what about you?", jazz(1), None),
     ("jazz-stale", "mossy", "what about you?", jazz(DAYS), None),
+    # jev's earlier reply in view vs not (what the bot did before replies to it were in context)
+    ("gf-reply", "kettle", "what's her name?", GIRLFRIEND, None),
+    ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], None),
+    ("garbled-reply", "pip", "what do you mean?", GARBLED, None),
+    ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], None),
 ]
 
-REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh")]
+REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply")]
 
 
 # Wrap the bot's own functions so the checks exercise the real code paths
