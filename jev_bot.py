@@ -59,9 +59,11 @@ channel_history: dict[int, list[dict]] = defaultdict(list)
 
 def add_history(ch_id, role, name, content):
     h = channel_history[ch_id]
-    h.append({"role": role, "name": name, "content": content})
+    entry = {"role": role, "name": name, "content": content}
+    h.append(entry)
     if len(h) > MAX_HISTORY:
         channel_history[ch_id] = h[-MAX_HISTORY:]
+    return entry
 
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
@@ -196,6 +198,8 @@ def transcript(message, author, bot_name, history, words):
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             turns.append(f"{name}: {unrender(h['content'])}")
+            if "reaction" in h:  # a single emoji, unlike jev's replies, doesn't poison follow-ups
+                turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {unrender(message)}")
     turns.append(f"{bot_name}: {unrender(render(words))}")
     return "\n".join(turns)
@@ -305,7 +309,7 @@ async def on_message(m):
     if not should_respond(m): return
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
-    add_history(m.channel.id, "user", m.author.display_name, c)
+    entry = add_history(m.channel.id, "user", m.author.display_name, c)
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
     h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
@@ -317,6 +321,7 @@ async def on_message(m):
         if reaction := await choose_reaction(c, m.author.display_name, bot_name, emoji, history=h):
             try:
                 await m.add_reaction(emoji[reaction])
+                entry["reaction"] = reaction  # kept on its message, so it stays in order and doesn't use a history slot
                 log.info(f"[REACT] {reaction}")
                 return
             except discord.HTTPException as e:  # no Add Reactions permission, or an emoji Discord doesn't know
