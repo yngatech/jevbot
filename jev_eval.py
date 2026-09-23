@@ -82,6 +82,8 @@ COLOUR = [said("mossy", "my favourite colour is green", 6), said("pip", "do you 
 FLAN = [said("pip", "what's a flan", 3, reply="Dunno a custard dessert wobbly sweet"),
         said("mossy", "you?", 2, reply="No not wobbly")]
 FLAN_UNANSWERED = [{k: v for k, v in h.items() if k != "reply"} for h in FLAN]
+# Only the flan question missed (say, sent while jev was offline) — the bot leaves it out of the transcript
+FLAN_ONE_MISSED = [FLAN_UNANSWERED[0], FLAN[1]]
 # Chatter with nothing to do with the question
 NOISE = [chat("kettle", "anyone up for games tonight", 7), chat("pip", "can't, got work", 6), chat("mossy", "boo", 5),
          chat("kettle", "maybe tomorrow then", 4), chat("mossy", "what time", 3), chat("kettle", "8ish", 2)]
@@ -116,6 +118,7 @@ REACT = [
     ("lol-noisy", "pip", "lol", NOISE, "react"),
     ("moved-on", "kettle", "are landlords ethical", FLAN, "reply"),
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, "reply"),
+    ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -142,6 +145,7 @@ FIRST = [
     # A new question after two answered ones: does jev go back to the flan?
     ("moved-on", "kettle", "are landlords ethical", FLAN, None),
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, None),
+    ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, None),
     ("follow-up", "mossy", "you?", FLAN[:1], YES),
     ("follow-up-unanswered", "mossy", "you?", FLAN_UNANSWERED[:1], YES),
 ]
@@ -175,11 +179,11 @@ async def next_word(session, state, vocab, rng, instructions):
 j.post, j.next_word = post, next_word
 
 
-# What the bot would put in the transcript: jev_bot.recent() of people's messages, then a replied-to jev line
+# What the bot would put in the transcript: jev_bot.shown() of people's messages, then a replied-to jev line
 def visible(history):
     if not history:
         return history
-    return j.recent([h for h in history if h["role"] == "user"]) + [h for h in history if h["role"] == "assistant"]
+    return j.shown([h for h in history if h["role"] == "user"]) + [h for h in history if h["role"] == "assistant"]
 
 
 def words_in(text):
