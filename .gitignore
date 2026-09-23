@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 custom_vocab.txt
 logs/
+status.json

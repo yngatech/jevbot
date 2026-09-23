@@ -635,7 +635,7 @@ async def on_ready():
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
     if has_credit is None and (left := await credit_left()) is not None:
         await set_credit(left > 0)
-    await show_credit()  # a reconnect starts over as online, with no status
+    await show_credit()  # a reconnect starts over as online, with no status — put the latest back
     await catch_up()
     # on_ready runs again after a reconnect, so only start it the first time
     if STATUS_EVERY and not update_status.is_running():
@@ -644,9 +644,36 @@ async def on_ready():
 # A new custom status for jev, shown in every server and on its profile. The starts take turns, and every other
 # status has recent chat in view (and its words in the vocab) — so it can say what people said, anywhere jev is.
 # 3 starts, alternating chat: each start gets a turn with and without it.
+# The latest is kept in STATUS_PATH, so a restart shows it again instead of paying for a new one, and the next
+# comes when it's due — with the next start, not "I feel" every time.
+STATUS_PATH = Path(__file__).parent / "status.json"
+status_turn = 0      # which start and chat the next status gets
+status_at = None     # when the kept one was made
+
+def load_status():
+    global status, status_turn, status_at
+    try:
+        saved = json.loads(STATUS_PATH.read_text())
+        status = discord.CustomActivity(name=saved["status"])
+        status_turn, status_at = saved["turn"] + 1, datetime.fromisoformat(saved["at"])
+        log.info(f"[STATUS] kept from {saved['at']}: {saved['status']}")
+    except FileNotFoundError:
+        pass
+    except Exception as e:  # unreadable — make a new one
+        log.warning(f"Loading {STATUS_PATH.name} failed: {e}")
+
+def save_status(mood, turn, at):
+    try:
+        STATUS_PATH.write_text(json.dumps({"status": mood, "turn": turn, "at": at}, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning(f"Writing {STATUS_PATH.name} failed: {e}")
+
+if STATUS_EVERY:
+    load_status()
+
 @tasks.loop(minutes=STATUS_EVERY or 1)
 async def update_status():
-    global status
+    global status, status_turn
     if has_credit is False:  # showing "out of credit" — and every request would fail anyway
         return
     bot_name = bot.user.display_name
@@ -655,12 +682,13 @@ async def update_status():
     start = time.monotonic()
     try:
         async with gen_lock:  # after any reply in progress, not alongside it
-            n = update_status.current_loop
+            n, status_turn = status_turn, status_turn + 1
             chat = recent_chat() if n % 2 else ""
             mood = await generate_status(bot_name, STATUS_STARTS[n % len(STATUS_STARTS)], chat)
         if not mood:  # the API didn't answer — keep the old status rather than a bare "I feel"
             return
         status = discord.CustomActivity(name=mood)
+        save_status(mood, n, t["at"])
         await show_credit()
         t["status"] = mood
         log.info(f"[STATUS] {mood} (${t['cost']:.5f})")
@@ -670,6 +698,12 @@ async def update_status():
     finally:
         t["seconds"] = round(time.monotonic() - start, 1)
         write_trace(t)
+
+@update_status.before_loop
+async def wait_for_status():  # the kept status stays until it's due
+    if status_at and (due := status_at + timedelta(minutes=STATUS_EVERY)) > datetime.now(timezone.utc):
+        log.info(f"[STATUS] next at {due.isoformat(timespec='seconds')}")
+        await asyncio.sleep((due - datetime.now(timezone.utc)).total_seconds())
 
 # Messages sent while jev was offline (a restart, an outage) never reach on_message. On (re)connect, answer each
 # channel's latest message to jev from the last CATCH_UP_WINDOW minutes since jev last replied or reacted there —
