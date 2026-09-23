@@ -230,12 +230,20 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
-def strip_mention(c, bid):
-    return re.sub(rf"<@!?{bid}>", "", c).strip()
+# The role Discord creates for the bot (same name, e.g. "@rocky") — mentioning it counts as mentioning the bot
+def bot_role(m):
+    return m.guild.self_role if m.guild else None
+
+def strip_mention(m):
+    c = re.sub(rf"<@!?{bot.user.id}>", "", m.content)
+    if role := bot_role(m):
+        c = c.replace(role.mention, "")
+    return c.strip()
 
 def should_respond(m):
     if m.author.bot: return False
     if bot.user in m.mentions: return True
+    if (role := bot_role(m)) and role in m.role_mentions: return True
     if m.reference and m.reference.resolved:
         r = m.reference.resolved
         if isinstance(r, discord.Message) and r.author.id == bot.user.id: return True
@@ -248,7 +256,7 @@ async def on_ready():
 @bot.event
 async def on_message(m):
     if not should_respond(m): return
-    c = strip_mention(m.content, bot.user.id) or "hello"
+    c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     add_history(m.channel.id, "user", m.author.display_name, c)
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
