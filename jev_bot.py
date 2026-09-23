@@ -43,8 +43,8 @@ STOP_PENALTY_CAP = 6
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
 # Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
-# instead of continuing it. Set back to "Next word?" to compare.
-NEXT_WORD = "Next word of {bot_name}'s reply?"
+# instead of continuing it, but "Next word of {bot_name}'s reply?" didn't help live and made <END> far likelier
+NEXT_WORD = "Next word?"
 
 STOPWORDS = set(
     "a an the and or but if of to in on at by for with from as is are was were be been "
