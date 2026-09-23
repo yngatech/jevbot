@@ -51,6 +51,8 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 
 `vocab.txt` is a 20K word list (from [bewinxed/jevgpt](https://github.com/bewinxed/jevgpt)) with slurs removed. Words can be added or removed freely — the vocab IS the content filter.
 
+Server-specific words and phrases go in `custom_vocab.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments). Multi-word phrases are chosen as a single unit, and entries already in `vocab.txt` are skipped. Restart the bot to pick up changes.
+
 ## Credits
 
 - [TypeSafe AI](https://typesafe.ai) for Jev
