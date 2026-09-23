@@ -32,6 +32,7 @@ TOP_PER_BUCKET = 2
 MAX_WORDS = 30
 MIN_WORDS = 2
 MAX_HISTORY = 3
+HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
 STOP_THRESHOLD = 0.5            # let jev stop earlier — the good part is always the first half
 REPEAT_PENALTY = 1.5
 REPEAT_WINDOW = 8
@@ -300,6 +301,24 @@ def should_respond(m):
         if isinstance(r, discord.Message) and r.author.id == bot.user.id: return True
     return False
 
+# channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
+history_loaded: dict[int, asyncio.Task] = {}
+
+async def load_history(first):
+    found = []
+    try:
+        async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
+            if should_respond(m):
+                found.append(m)
+                if len(found) == MAX_HISTORY: break
+    except Exception as e:  # no Read Message History permission — start empty, like before
+        log.warning(f"Loading history for {first.channel.id} failed: {e}")
+    for m in reversed(found):
+        entry = add_history(first.channel.id, "user", m.author.display_name, strip_mention(m) or "hello")
+        if r := next((r for r in m.reactions if r.me), None):
+            entry["reaction"] = r.emoji if isinstance(r.emoji, str) else f":{r.emoji.name}:"
+    log.info(f"Loaded {len(found)} history entries for {first.channel.id}")
+
 @bot.event
 async def on_ready():
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)}")
@@ -309,6 +328,10 @@ async def on_message(m):
     if not should_respond(m): return
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
+    # Shared task, so messages arriving while it loads wait for it instead of loading twice
+    if m.channel.id not in history_loaded:
+        history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
+    await history_loaded[m.channel.id]
     entry = add_history(m.channel.id, "user", m.author.display_name, c)
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
