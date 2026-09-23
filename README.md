@@ -48,6 +48,10 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 
 Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042 per million input tokens (output is free), which comes to ~$0.003 per word with the 10K vocab, so ~$0.01-0.10 per reply depending on length.
 
+## Logs
+
+Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, the reaction or each word it picked (with its top candidates and the done score), and what the API calls actually cost. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
+
 ## Testing changes
 
 `jev_eval.py` runs a fixed set of conversations against the live Jev API and reports what's measurable: whether the question check sends questions to a reply and chatter to a reaction, and how jev's first-word candidates split between real answers, `<END>`, words that describe the reply ("silent", "crickets"), and words that only the transcript's formatting contains. Save a run on master, then compare your branch against it:

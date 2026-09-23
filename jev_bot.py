@@ -7,11 +7,15 @@ This is the version that produced "I depends on on situation of circumstances."
 
 import os
 import re
+import json
+import time
 import asyncio
 import logging
 import random
+import contextvars
 from pathlib import Path
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import aiohttp
 import discord
@@ -58,6 +62,23 @@ NEWLINE = "\\n"  # vocab.txt's line break token — jev sees it literally, Disco
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jev")
+
+# One JSON line per message jev handles: what it saw, what it considered, what it did and what it cost.
+# Holds what people said in the server, so it stays local (gitignored) — delete old days freely.
+LOG_DIR = Path(__file__).parent / "logs"
+trace: contextvars.ContextVar[dict | None] = contextvars.ContextVar("trace", default=None)
+
+def note(**fields):
+    if (t := trace.get()) is not None:
+        t.update(fields)
+
+def write_trace(t):
+    try:
+        LOG_DIR.mkdir(exist_ok=True)
+        with open(LOG_DIR / f"{t['at'][:10]}.jsonl", "a") as f:
+            f.write(json.dumps(t, ensure_ascii=False, default=str) + "\n")
+    except OSError as e:
+        log.warning(f"Writing {LOG_DIR} failed: {e}")
 
 # History
 channel_history: dict[int, list[dict]] = defaultdict(list)
@@ -151,7 +172,11 @@ async def post(session, state, questions):
         try:
             async with session.post(API_URL, json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
                 if r.status < 400:
-                    return (await r.json()).get("answers", {})
+                    data = await r.json()
+                    if (t := trace.get()) is not None:
+                        t["cost"] += data.get("usage", {}).get("cost", 0)
+                        t["requests"] += 1
+                    return data.get("answers", {})
                 log.warning(f"API {r.status} {attempt}: {(await r.text())[:300]}")
                 await asyncio.sleep(1 + 2 * attempt)
         except Exception as e:
@@ -228,6 +253,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         answers = await post(session, state, questions)
         asked = answers.pop("asked", {}).get("noul", 1)
+        note(asked=asked)
         if asked >= REACT_THRESHOLD:
             log.info(f"  asked={asked:.2f} reply")
             return None
@@ -238,6 +264,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
             finalists = [w for w, p in by_prob(runoff.get("final", {})) if p > 0]
 
     log.info(f"  asked={asked:.2f} {' '.join(finalists[:3])}")
+    note(reaction_candidates=finalists[:3])
     return finalists[0] if finalists else None
 
 
@@ -249,6 +276,8 @@ async def generate_reply(message, author, bot_name, history=None):
                                 + [f"{author} {message}"]))
     instructions = NEXT_WORD.format(bot_name=bot_name)
     words = []
+    steps = []
+    note(transcript=transcript(message, author, bot_name, history, []), steps=steps, stop="max words")
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for step in range(MAX_WORDS):
@@ -256,12 +285,14 @@ async def generate_reply(message, author, bot_name, history=None):
 
             probs, complete = await next_word(session, state, vocab, rng, instructions)
             if not probs:
+                note(stop="no answer")
                 break
 
             said = sum(1 for w in words if is_word(w))
             stoppable = said >= MIN_WORDS
             if stoppable and complete >= STOP_THRESHOLD:
                 log.info(f"  noul={complete:.2f} stop")
+                note(stop=f"done={complete:.2f}")
                 break
 
             scored = {}
@@ -272,15 +303,22 @@ async def generate_reply(message, author, bot_name, history=None):
                 if w == NEWLINE and not said: continue  # leading newlines get stripped anyway — don't spend steps on them
                 scored[w] = p / penalty(words, w)
 
-            if not scored: break
+            if not scored:
+                note(stop="nothing left")
+                break
 
             ranked = sorted(scored.items(), key=lambda kv: -kv[1])
             word = ranked[0][0]
 
             top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
             log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}")
+            # Raw probabilities of the best-scoring candidates, so penalties' effect on the pick is visible
+            steps.append({"word": word, "done": round(complete, 3),
+                          "top": [[w, round(probs[w], 3)] for w, _ in ranked[:5]]})
 
-            if word == END: break
+            if word == END:
+                note(stop="<END>")
+                break
             words.append(word)
 
     return render(words).strip() or "..."
@@ -340,6 +378,19 @@ async def on_message(m):
     if not should_respond(m): return
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
+    # discord.py runs each event in its own task, so this trace only sees this message's requests
+    t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "channel": getattr(m.channel, "name", None),
+         "channel_id": m.channel.id, "author": m.author.display_name, "message": c, "cost": 0.0, "requests": 0}
+    trace.set(t)
+    start = time.monotonic()
+    try:
+        await handle(m, c)
+    finally:
+        t["seconds"] = round(time.monotonic() - start, 1)
+        write_trace(t)
+
+
+async def handle(m, c):
     # Shared task, so messages arriving while it loads wait for it instead of loading twice
     if m.channel.id not in history_loaded:
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
@@ -353,6 +404,7 @@ async def on_message(m):
     # ...except the reply someone is answering — without it jev contradicts what it just said
     if (r := replied_to_bot(m)) and r.content:
         h.append({"role": "assistant", "name": bot_name, "content": r.content})
+    note(bot_name=bot_name, history=h)
     try:
         # Decided before typing() — a reaction sends no message, so the typing indicator would linger
         emoji = emoji_vocabulary(m.guild)
@@ -360,17 +412,20 @@ async def on_message(m):
             try:
                 await m.add_reaction(emoji[reaction])
                 entry["reaction"] = reaction  # kept on its message, so it stays in order and doesn't use a history slot
-                log.info(f"[REACT] {reaction}")
+                note(reaction=reaction)
+                log.info(f"[REACT] {reaction} (${trace.get()['cost']:.5f})")
                 return
             except discord.HTTPException as e:  # no Add Reactions permission, or an emoji Discord doesn't know
                 log.warning(f"React {reaction} failed, replying instead: {e}")
         async with m.channel.typing():
             async with gen_lock:
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h)
-        log.info(f"[OUT] {r}")
+        note(reply=r)
+        log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
         await m.reply(r, mention_author=False)
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
+        note(error=repr(e))
         try: await m.reply("...", mention_author=False)
         except: pass
 
