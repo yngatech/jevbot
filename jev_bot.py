@@ -236,7 +236,8 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
 
 async def generate_reply(message, author, bot_name, history=None):
     rng = random.Random()
-    vocab = vocabulary(f"{author} {message}")  # lets jev say the author's name
+    # Every word and name in the transcript, not just the message being replied to — lets jev say what it can see
+    vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or []] + [f"{author} {message}"]))
     words = []
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
