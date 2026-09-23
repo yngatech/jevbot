@@ -244,11 +244,12 @@ async def on_message(m):
     c = strip_mention(m.content, bot.user.id) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     add_history(m.channel.id, "user", c)
+    # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
+    # Only user messages in history — jev's own broken output poisons follow-ups
+    h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
     try:
         async with m.channel.typing():
             async with gen_lock:
-                # Only user messages in history — jev's own broken output poisons follow-ups
-                h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
                 r = await generate_reply(c, history=h)
         log.info(f"[OUT] {r}")
         await m.reply(r, mention_author=False)
