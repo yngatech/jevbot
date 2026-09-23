@@ -35,7 +35,8 @@ QUESTIONS_PER_CALL = 20
 TOP_PER_BUCKET = 2
 MAX_WORDS = 30
 MIN_WORDS = 2
-MAX_HISTORY = 3
+HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, replies) in the transcript
+HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
 STOP_THRESHOLD = 0.5            # let jev stop earlier — the good part is always the first half
 REPEAT_PENALTY = 1.5
@@ -80,15 +81,24 @@ def write_trace(t):
     except OSError as e:
         log.warning(f"Writing {LOG_DIR} failed: {e}")
 
-# History
+# History: recent messages per channel, oldest first. "to_bot" marks the ones that mentioned or replied to jev.
 channel_history: dict[int, list[dict]] = defaultdict(list)
 
-def add_history(ch_id, role, name, content):
+# The last `to_bot` messages to jev and the last `chatter` other messages, in order
+def recent(entries, to_bot=None, chatter=None):
+    limits = {True: HISTORY_TO_BOT if to_bot is None else to_bot, False: HISTORY_CHATTER if chatter is None else chatter}
+    keep = []
+    for e in reversed(entries):
+        kind = e.get("to_bot", True)
+        if limits[kind] > 0:
+            limits[kind] -= 1
+            keep.append(e)
+    return keep[::-1]
+
+def add_history(ch_id, entry):
     h = channel_history[ch_id]
-    entry = {"role": role, "name": name, "content": content}
     h.append(entry)
-    if len(h) > MAX_HISTORY:
-        channel_history[ch_id] = h[-MAX_HISTORY:]
+    channel_history[ch_id] = recent(h, HISTORY_TO_BOT + 1, HISTORY_CHATTER)  # +1: the message being answered
     return entry
 
 # Vocab
@@ -222,15 +232,20 @@ async def next_word(session, state, vocab, rng, instructions):
     return probs, complete_noul
 
 
-def transcript(message, author, bot_name, history, words, reactions=True):
+# marked: show messages to jev as "name: @jev ..." (the mention is stripped otherwise). Tested live: with channel
+# chatter in view it's what tells the question check which messages were for jev, but for picking words it made
+# jev describe more and stop sooner, so only the question check uses it.
+def transcript(message, author, bot_name, history, words, reactions=True, marked=False):
+    to = f"@{bot_name} " if marked else ""
     turns = []
     if history:
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
-            turns.append(f"{name}: {unrender(h['content'])}")
+            text = unrender(h["content"])
+            turns.append(f"{name}: {to if h['role'] == 'user' and h.get('to_bot', True) else ''}{text}")
             if reactions and "reaction" in h:  # a single emoji, unlike jev's replies, doesn't poison follow-ups
                 turns.append(f"{bot_name}: {h['reaction']}")
-    turns.append(f"{author}: {unrender(message)}")
+    turns.append(f"{author}: {to}{unrender(message)}")
     turns.append(f"{bot_name}: {unrender(render(words))}")
     return "\n".join(turns)
 
@@ -242,7 +257,7 @@ HEADERS = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "applica
 async def choose_reaction(message, author, bot_name, emoji, history=None):
     rng = random.Random()
     # Without past reactions — a run of them reads as a habit to keep up, and jev copies the last emoji
-    state = transcript(message, author, bot_name, history, [], reactions=False)
+    state = transcript(message, author, bot_name, history, [], reactions=False, marked=True)
     shuffled = list(emoji)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
@@ -354,20 +369,32 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
+# m as a history entry, or None for messages that never go in one (bots, including jev itself, and empty ones)
+def history_entry(m):
+    if m.author.bot:
+        return None
+    to_bot = should_respond(m)
+    content = (strip_mention(m) or "hello") if to_bot else m.content.strip()
+    if not content:
+        return None
+    entry = {"role": "user", "name": m.author.display_name, "content": content,
+             "at": m.created_at, "id": m.id, "to_bot": to_bot}
+    if to_bot and (r := next((r for r in m.reactions if r.me), None)):
+        entry["reaction"] = r.emoji if isinstance(r.emoji, str) else f":{r.emoji.name}:"
+    return entry
+
 async def load_history(first):
+    ch = first.channel.id
+    known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
     found = []
     try:
         async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
-            if should_respond(m):
-                found.append(m)
-                if len(found) == MAX_HISTORY: break
+            if m.id not in known and (entry := history_entry(m)):
+                found.append(entry)
     except Exception as e:  # no Read Message History permission — start empty, like before
-        log.warning(f"Loading history for {first.channel.id} failed: {e}")
-    for m in reversed(found):
-        entry = add_history(first.channel.id, "user", m.author.display_name, strip_mention(m) or "hello")
-        if r := next((r for r in m.reactions if r.me), None):
-            entry["reaction"] = r.emoji if isinstance(r.emoji, str) else f":{r.emoji.name}:"
-    log.info(f"Loaded {len(found)} history entries for {first.channel.id}")
+        log.warning(f"Loading history for {ch} failed: {e}")
+    channel_history[ch] = recent(sorted(channel_history[ch] + found, key=lambda e: e["at"]))
+    log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
 @bot.event
 async def on_ready():
@@ -375,7 +402,11 @@ async def on_ready():
 
 @bot.event
 async def on_message(m):
-    if not should_respond(m): return
+    if not should_respond(m):
+        # Not for jev, but part of the conversation it might be asked about
+        if HISTORY_CHATTER and (entry := history_entry(m)):
+            add_history(m.channel.id, entry)
+        return
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     # discord.py runs each event in its own task, so this trace only sees this message's requests
@@ -395,12 +426,12 @@ async def handle(m, c):
     if m.channel.id not in history_loaded:
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
     await history_loaded[m.channel.id]
-    entry = add_history(m.channel.id, "user", m.author.display_name, c)
+    entry = add_history(m.channel.id, history_entry(m))
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
-    h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
+    h = [x for x in recent(channel_history[m.channel.id][:-1]) if x["role"] == "user"]
     # ...except the reply someone is answering — without it jev contradicts what it just said
     if (r := replied_to_bot(m)) and r.content:
         h.append({"role": "assistant", "name": bot_name, "content": r.content})
