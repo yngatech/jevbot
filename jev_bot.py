@@ -151,6 +151,14 @@ EMOJI_PATH = Path(__file__).parent / "emoji.txt"
 BASE_EMOJI = [e for e in EMOJI_PATH.read_text().split("\n") if e]
 log.info(f"Loaded {len(BASE_EMOJI)} reaction emoji")
 
+# An emoji as jev sees it: unicode as itself, the server's own by :name:
+def emoji_text(e):
+    if isinstance(e, str):
+        return e
+    if isinstance(e, discord.PartialEmoji) and e.is_unicode_emoji():
+        return e.name
+    return f":{e.name}:"
+
 def emoji_vocabulary(guild):
     emoji = {e: e for e in BASE_EMOJI}
     if guild:
@@ -273,6 +281,10 @@ async def next_word(session, state, vocab, rng, instructions):
     return probs, complete_noul
 
 
+# People's reactions to one of jev's replies, as " (😂×3 💀)" — a laugh jev can see, and maybe chase
+def reacted(counts):
+    return " (" + " ".join(e if n == 1 else f"{e}×{n}" for e, n in counts.items()) + ")" if counts else ""
+
 # marked: show messages to jev as "name: @jev ..." (the mention is stripped otherwise). Tested live: with channel
 # chatter in view it's what tells the question check which messages were for jev, but for picking words it made
 # jev describe more and stop sooner, so only the question check uses it.
@@ -283,11 +295,14 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
+            if h["role"] == "assistant" and reactions:
+                text += reacted(h.get("reactions"))
             turns.append(f"{name}: {to if h['role'] == 'user' and h.get('to_bot', True) else ''}{text}")
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
-            # to them or describes the silence ("crickets"). Past reactions stay out of the question check.
+            # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
+            # stay out of the question check — jev copies emoji it sees there.
             if "reply" in h:
-                turns.append(f"{bot_name}: {unrender(h['reply'])}")
+                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if reactions else ''}")
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {to}{unrender(message)}")
@@ -579,8 +594,12 @@ def history_entry(m):
     entry = {"role": "user", "name": m.author.display_name, "content": content,
              "at": m.created_at, "id": m.id, "to_bot": to_bot}
     if to_bot and (r := next((r for r in m.reactions if r.me), None)):
-        entry["reaction"] = r.emoji if isinstance(r.emoji, str) else f":{r.emoji.name}:"
+        entry["reaction"] = emoji_text(r.emoji)
     return entry
+
+# People's reactions to a message of jev's, emoji to count — not jev's own
+def reactions_to(m):
+    return {emoji_text(r.emoji): n for r in m.reactions if (n := r.count - r.me)}
 
 async def load_history(first):
     ch = first.channel.id
@@ -597,6 +616,8 @@ async def load_history(first):
     for entry in found:
         if r := replies.get(entry["id"]):
             entry["reply"], entry["reply_id"] = r.content, r.id
+            if counts := reactions_to(r):
+                entry["reply_reactions"] = counts
     channel_history[ch] = recent(sorted(channel_history[ch] + found, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
@@ -728,7 +749,7 @@ async def handle(m, c):
     h = shown(channel_history[m.channel.id][:-1])
     # The reply of jev's someone is answering, if it isn't already shown under the message it answered
     if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
-        h.append({"role": "assistant", "name": bot_name, "content": r.content})
+        h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
@@ -766,6 +787,39 @@ async def handle(m, c):
         except: pass
     finally:
         entry.pop("pending", None)
+
+# Keeps people's reactions to jev's replies current in the history — a reply shown later carries them
+async def on_reaction_change(p, change):
+    if p.user_id == bot.user.id:
+        return
+    entry = next((e for e in channel_history.get(p.channel_id, []) if e.get("reply_id") == p.message_id), None)
+    if entry is None:
+        return
+    counts = entry.setdefault("reply_reactions", {})
+    e = emoji_text(p.emoji)
+    counts[e] = counts.get(e, 0) + change
+    if counts[e] <= 0:
+        del counts[e]
+
+@bot.event
+async def on_raw_reaction_add(p):
+    await on_reaction_change(p, 1)
+
+@bot.event
+async def on_raw_reaction_remove(p):
+    await on_reaction_change(p, -1)
+
+@bot.event
+async def on_raw_reaction_clear(p):
+    for e in channel_history.get(p.channel_id, []):
+        if e.get("reply_id") == p.message_id:
+            e.pop("reply_reactions", None)
+
+@bot.event
+async def on_raw_reaction_clear_emoji(p):
+    for e in channel_history.get(p.channel_id, []):
+        if e.get("reply_id") == p.message_id:
+            e.get("reply_reactions", {}).pop(emoji_text(p.emoji), None)
 
 async def main():
     first_signal = None
