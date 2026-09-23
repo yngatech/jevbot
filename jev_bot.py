@@ -63,9 +63,31 @@ def add_history(ch_id, role, content):
 
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
+CUSTOM_VOCAB_PATH = Path(__file__).parent / "custom_vocab.txt"
 BANNED = {"unanswered"}
 BASE_VOCAB = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED]
 log.info(f"Loaded {len(BASE_VOCAB)} vocab words")
+
+# Server words/phrases: one per line, "#" comments, multi-word phrases are picked as a single unit
+def load_custom_vocab():
+    if not CUSTOM_VOCAB_PATH.exists():
+        return []
+    seen = {w.lower() for w in BASE_VOCAB}
+    custom = []
+    for line in CUSTOM_VOCAB_PATH.read_text().split("\n"):
+        w = " ".join(line.split("#", 1)[0].split())
+        if w and w.lower() not in BANNED and w.lower() not in seen:
+            seen.add(w.lower())
+            custom.append(w)
+    return custom
+
+CUSTOM_VOCAB = load_custom_vocab()
+BASE_VOCAB += CUSTOM_VOCAB
+log.info(f"Loaded {len(CUSTOM_VOCAB)} custom vocab words")
+
+
+def is_word(w):
+    return w.replace(" ", "").isalnum()
 
 
 def render(tokens):
@@ -89,9 +111,10 @@ def penalty(reply, word):
     local = reply[-REPEAT_WINDOW:].count(word) + 2 * (reply[-1:] == [word])
     p = REPEAT_PENALTY ** local
     seen = reply.count(word)
-    if word.isalpha() and word.lower() not in STOPWORDS:
+    alpha = word.replace(" ", "").isalpha()
+    if alpha and word.lower() not in STOPWORDS:
         p *= CONTENT_PENALTY ** min(seen, CONTENT_PENALTY_CAP)
-    elif word.isalpha():
+    elif alpha:
         p *= STOP_PENALTY ** min(seen, STOP_PENALTY_CAP)
     return p
 
@@ -168,7 +191,7 @@ async def generate_reply(message, history=None):
             if not probs:
                 break
 
-            stoppable = sum(1 for w in words if w.isalnum()) >= MIN_WORDS
+            stoppable = sum(1 for w in words if is_word(w)) >= MIN_WORDS
             if stoppable and complete >= STOP_THRESHOLD:
                 log.info(f"  noul={complete:.2f} stop")
                 break
