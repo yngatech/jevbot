@@ -47,7 +47,8 @@ STOPWORDS = set(
     "some each into over under about above below up down out off again more most very "
     "can will just do does did have has had would could should may might must".split()
 )
-NO_SPACE_BEFORE = set(".,!?;:)\"'")
+NO_SPACE_BEFORE = set(".,!?;:)\"'\n")
+NEWLINE = "\\n"  # vocab.txt's line break token — jev sees it literally, Discord gets a real newline
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jev")
@@ -93,11 +94,17 @@ def is_word(w):
 def render(tokens):
     out = ""
     for t in tokens:
+        t = "\n" if t == NEWLINE else t
         if not out or out.endswith(("\n", " ")) or t in NO_SPACE_BEFORE:
             out += t
         else:
             out += " " + t
-    return re.sub(r"(^|[.!?]\s+|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out.strip())
+    return re.sub(r"(^|[.!?]\s+|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), out.strip(" "))
+
+
+# One line per turn in the transcript — newlines go back to the token jev chose them as
+def unrender(text):
+    return text.replace("\n", NEWLINE)
 
 
 def vocabulary(message):
@@ -182,9 +189,9 @@ async def generate_reply(message, author, bot_name, history=None):
             if history:
                 for h in history:
                     name = bot_name if h["role"] == "assistant" else h["name"]
-                    turns.append(f"{name}: {h['content']}")
-            turns.append(f"{author}: {message}")
-            turns.append(f"{bot_name}: {render(words)}")
+                    turns.append(f"{name}: {unrender(h['content'])}")
+            turns.append(f"{author}: {unrender(message)}")
+            turns.append(f"{bot_name}: {unrender(render(words))}")
             state = "\n".join(turns)
 
             probs, complete = await next_word(session, state, vocab, rng)
@@ -214,7 +221,7 @@ async def generate_reply(message, author, bot_name, history=None):
             if word == END: break
             words.append(word)
 
-    return render(words) if words else "..."
+    return render(words).strip() or "..."
 
 
 # Discord
