@@ -169,7 +169,7 @@ async def next_word(session, state, vocab, rng):
     return probs, complete_noul
 
 
-async def generate_reply(message, author, history=None):
+async def generate_reply(message, author, bot_name, history=None):
     rng = random.Random()
     vocab = vocabulary(f"{author} {message}")  # lets jev say the author's name
     words = []
@@ -181,10 +181,10 @@ async def generate_reply(message, author, history=None):
             turns = []
             if history:
                 for h in history:
-                    name = "Jev" if h["role"] == "assistant" else h["name"]
+                    name = bot_name if h["role"] == "assistant" else h["name"]
                     turns.append(f"{name}: {h['content']}")
             turns.append(f"{author}: {message}")
-            turns.append(f"Jev: {render(words)}")
+            turns.append(f"{bot_name}: {render(words)}")
             state = "\n".join(turns)
 
             probs, complete = await next_word(session, state, vocab, rng)
@@ -247,10 +247,12 @@ async def on_message(m):
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
     h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
+    # Server nickname, so the transcript uses the name people call the bot by
+    bot_name = (m.guild.me if m.guild else bot.user).display_name
     try:
         async with m.channel.typing():
             async with gen_lock:
-                r = await generate_reply(c, m.author.display_name, history=h)
+                r = await generate_reply(c, m.author.display_name, bot_name, history=h)
         log.info(f"[OUT] {r}")
         await m.reply(r, mention_author=False)
     except Exception as e:
