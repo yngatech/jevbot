@@ -10,7 +10,7 @@ Jev is a non-autoregressive decision model. It answers questions with calibrated
 2. **Runoff**: Top-2 from each bucket compete in a final round  
 3. **Completeness judge**: A separate `noul` question asks "is the reply complete?" — jev stops when it thinks it's done
 4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops
-5. **User-only history**: Last 3 user messages included as context; jev's own broken output is excluded (it poisons follow-ups)
+5. **User-only history**: Last 3 user messages included as context, each labelled with the sender's display name (which jev can also say); jev's own broken output is excluded (it poisons follow-ups)
 
 ## Output examples
 
