@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -50,6 +50,10 @@ STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
+STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each) — 0 to leave the status alone
+STATUS_MIN_WORDS = 6            # a short status is just "Fine thanks" — the soup comes from making it keep going
+STATUS_MAX_WORDS = 12
+STATUS_CHAT = 8                 # recent messages from the latest active channel, in view for every other status — 0 for none
 # Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
 # instead of continuing it, but "Next word of {bot_name}'s reply?" didn't help live and made <END> far likelier
 NEXT_WORD = "Next word?"
@@ -310,28 +314,23 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     return finalists[0] if finalists else None
 
 
-async def generate_reply(message, author, bot_name, history=None):
+# Words jev picks one at a time to continue state(words), until it stops, runs out, or has max_words (MAX_WORDS).
+# It can't stop before min_words (MIN_WORDS) real words.
+async def loom(state, vocab, instructions, max_words=None, min_words=None):
     rng = random.Random()
-    # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
-    # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
-    vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
-                                + [f"{author} {message}"]))
-    instructions = NEXT_WORD.format(bot_name=bot_name)
     words = []
     steps = []
-    note(transcript=transcript(message, author, bot_name, history, []), steps=steps, stop="max words")
+    note(steps=steps, stop="max words")
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        for step in range(MAX_WORDS):
-            state = transcript(message, author, bot_name, history, words)
-
-            probs, complete = await next_word(session, state, vocab, rng, instructions)
+        for step in range(max_words or MAX_WORDS):
+            probs, complete = await next_word(session, state(words), vocab, rng, instructions)
             if not probs:
                 note(stop="no answer")
                 break
 
             said = sum(1 for w in words if is_word(w))
-            stoppable = said >= MIN_WORDS
+            stoppable = said >= (min_words or MIN_WORDS)
             if stoppable and complete >= STOP_THRESHOLD:
                 log.info(f"  noul={complete:.2f} stop")
                 note(stop=f"done={complete:.2f}")
@@ -363,7 +362,42 @@ async def generate_reply(message, author, bot_name, history=None):
                 break
             words.append(word)
 
+    return words
+
+
+async def generate_reply(message, author, bot_name, history=None):
+    # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
+    # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
+    vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
+                                + [f"{author} {message}"]))
+    note(transcript=transcript(message, author, bot_name, history, []))
+    words = await loom(lambda words: transcript(message, author, bot_name, history, words),
+                       vocab, NEXT_WORD.format(bot_name=bot_name))
     return render(words).strip() or "..."
+
+
+# How statuses start, taken in turn. Each is the rest of a diary entry — asked "how are you feeling?" jev says
+# "Fine thanks", asked "what are you thinking about?" "I dunno anything", and as a status "Is online"
+STATUS_STARTS = [["i", "feel"], ["i'm", "thinking", "about"], ["i", "wonder"]]
+
+# The last STATUS_CHAT messages people sent in the channel that heard from someone most recently, one per line
+def recent_chat():
+    active = [h for h in channel_history.values() if h]
+    if not STATUS_CHAT or not active:
+        return ""
+    h = max(active, key=lambda h: h[-1]["at"])[-STATUS_CHAT:]
+    return "\n".join(f"{e['name']}: {unrender(e['content'])}" for e in h)
+
+def status_state(bot_name, start, chat, words):
+    return (f"{chat}\n\n" if chat else "") + f"{bot_name}'s diary, today: {render(start + words)}"
+
+
+async def generate_status(bot_name, start, chat=""):
+    vocab = [w for w in vocabulary(chat) if w != NEWLINE]  # a status is one line
+    note(transcript=status_state(bot_name, start, chat, []))
+    words = await loom(lambda words: status_state(bot_name, start, chat, words), vocab, NEXT_WORD,
+                       max_words=STATUS_MAX_WORDS, min_words=STATUS_MIN_WORDS)
+    return render(start + words)[:128] if words else None  # 128: Discord's custom status limit
 
 
 # Discord
@@ -393,6 +427,7 @@ NO_MONEY = [
     "https://static2.klipy.com/ii/4493325008d34b7bf8cd6813cd5c1619/7c/91/P9M6TXIqsKJx.gif",         # we have no money
 ]
 has_credit: bool | None = None
+status: discord.CustomActivity | None = None  # update_status()'s latest, shown whenever jev has credit
 credit_check: asyncio.Task | None = None
 
 async def set_credit(ok):
@@ -412,7 +447,7 @@ async def show_credit():
         if has_credit is False:
             await bot.change_presence(status=discord.Status.idle, activity=discord.CustomActivity("out of credit"))
         else:
-            await bot.change_presence(status=discord.Status.online)
+            await bot.change_presence(status=discord.Status.online, activity=status)
     except Exception as e:
         log.warning(f"Changing status failed: {e}")
 
@@ -555,8 +590,41 @@ async def on_ready():
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
     if has_credit is None and (left := await credit_left()) is not None:
         await set_credit(left > 0)
-    await show_credit()  # a reconnect starts over as online
+    await show_credit()  # a reconnect starts over as online, with no status
     await catch_up()
+    # on_ready runs again after a reconnect, so only start it the first time
+    if STATUS_EVERY and not update_status.is_running():
+        update_status.start()
+
+# A new custom status for jev, shown in every server and on its profile. The starts take turns, and every other
+# status has recent chat in view (and its words in the vocab) — so it can say what people said, anywhere jev is.
+# 3 starts, alternating chat: each start gets a turn with and without it.
+@tasks.loop(minutes=STATUS_EVERY or 1)
+async def update_status():
+    global status
+    if has_credit is False:  # showing "out of credit" — and every request would fail anyway
+        return
+    bot_name = bot.user.display_name
+    t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": None, "cost": 0.0, "requests": 0}
+    trace.set(t)
+    start = time.monotonic()
+    try:
+        async with gen_lock:  # after any reply in progress, not alongside it
+            n = update_status.current_loop
+            chat = recent_chat() if n % 2 else ""
+            mood = await generate_status(bot_name, STATUS_STARTS[n % len(STATUS_STARTS)], chat)
+        if not mood:  # the API didn't answer — keep the old status rather than a bare "I feel"
+            return
+        status = discord.CustomActivity(name=mood)
+        await show_credit()
+        t["status"] = mood
+        log.info(f"[STATUS] {mood} (${t['cost']:.5f})")
+    except Exception as e:  # keep the old status and try again next time — an uncaught error would end the loop
+        log.error(f"Status error: {e}", exc_info=True)
+        t["error"] = repr(e)
+    finally:
+        t["seconds"] = round(time.monotonic() - start, 1)
+        write_trace(t)
 
 # Messages sent while jev was offline (a restart, an outage) never reach on_message. On (re)connect, answer each
 # channel's latest message to jev from the last CATCH_UP_WINDOW minutes since jev last replied or reacted there —
