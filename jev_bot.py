@@ -55,9 +55,9 @@ log = logging.getLogger("jev")
 # History
 channel_history: dict[int, list[dict]] = defaultdict(list)
 
-def add_history(ch_id, role, content):
+def add_history(ch_id, role, name, content):
     h = channel_history[ch_id]
-    h.append({"role": role, "content": content})
+    h.append({"role": role, "name": name, "content": content})
     if len(h) > MAX_HISTORY:
         channel_history[ch_id] = h[-MAX_HISTORY:]
 
@@ -169,9 +169,9 @@ async def next_word(session, state, vocab, rng):
     return probs, complete_noul
 
 
-async def generate_reply(message, history=None):
+async def generate_reply(message, author, history=None):
     rng = random.Random()
-    vocab = vocabulary(message)
+    vocab = vocabulary(f"{author} {message}")  # lets jev say the author's name
     words = []
 
     headers = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
@@ -181,9 +181,9 @@ async def generate_reply(message, history=None):
             turns = []
             if history:
                 for h in history:
-                    name = "Jev" if h["role"] == "assistant" else "User"
+                    name = "Jev" if h["role"] == "assistant" else h["name"]
                     turns.append(f"{name}: {h['content']}")
-            turns.append(f"User: {message}")
+            turns.append(f"{author}: {message}")
             turns.append(f"Jev: {render(words)}")
             state = "\n".join(turns)
 
@@ -243,14 +243,14 @@ async def on_message(m):
     if not should_respond(m): return
     c = strip_mention(m.content, bot.user.id) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
-    add_history(m.channel.id, "user", c)
+    add_history(m.channel.id, "user", m.author.display_name, c)
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     # Only user messages in history — jev's own broken output poisons follow-ups
     h = [x for x in channel_history[m.channel.id][:-1] if x["role"] == "user"]
     try:
         async with m.channel.typing():
             async with gen_lock:
-                r = await generate_reply(c, history=h)
+                r = await generate_reply(c, m.author.display_name, history=h)
         log.info(f"[OUT] {r}")
         await m.reply(r, mention_author=False)
     except Exception as e:
