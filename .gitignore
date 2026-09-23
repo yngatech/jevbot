@@ -4,3 +4,4 @@ __pycache__/
 *.log
 .venv/
 custom_vocab.txt
+logs/
