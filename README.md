@@ -48,6 +48,17 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 
 Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042 per million input tokens (output is free), which comes to ~$0.003 per word with the 10K vocab, so ~$0.01-0.10 per reply depending on length.
 
+## Testing changes
+
+`jev_eval.py` runs a fixed set of conversations against the live Jev API and reports what's measurable: whether the question check sends questions to a reply and chatter to a reaction, and how jev's first-word candidates split between real answers, `<END>`, words that describe the reply ("silent", "crickets"), and words that only the transcript's formatting contains. Save a run on master, then compare your branch against it:
+
+```bash
+python jev_eval.py --save before.json     # on master
+python jev_eval.py --compare before.json  # on your branch
+```
+
+A run costs ~$0.04. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
+
 ## Vocab
 
 `vocab.txt` is a 20K word list (from [bewinxed/jevgpt](https://github.com/bewinxed/jevgpt)) with slurs removed, ordered from most to least common. Jev only uses the first `VOCAB_SIZE` (10K) words, since every word in the vocab is paid for on every step. Words can be added or removed freely — the vocab IS the content filter — but a word added past the cutoff is never used, so put new words in `custom_vocab.txt`. Words from the message jev is replying to are always added, so it can repeat a rarer word someone just used.
