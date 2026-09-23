@@ -4,6 +4,7 @@ Live checks for jev — run before and after a change to see whether it broke an
     python jev_eval.py --save before.json        # on master
     python jev_eval.py --compare before.json     # on your branch
     python jev_eval.py --replies                 # also generate a few full replies to judge by eye
+    python jev_eval.py --set HISTORY_CHATTER=8   # try a setting without editing jev_bot.py
 
 Costs real API calls: ~$0.04 by default, plus ~$0.05-0.10 per full reply with --replies.
 
@@ -16,7 +17,8 @@ Measured (cheap):
   react  — the "is this a question?" check: questions should get a reply, chatter a reaction
   first  — jev's first-word candidates: how much goes to words describing the reply ("silent",
            "crickets"), to <END>, to words only the transcript scaffolding contains (a format
-           leak), and to the obvious answer where there is one ("yes" to "do you drink water?")
+           leak), to words only earlier messages used (going back to an old topic), and to the
+           obvious answer where there is one ("yes" to "do you drink water?")
 Taste (--replies): full replies printed side by side, for a human to judge.
 """
 
@@ -39,11 +41,16 @@ DESCRIBING = {"empty", "silent", "silence", "crickets", "blank", "quiet", "unans
 NOW = datetime.now(timezone.utc)
 
 
-def said(name, text, mins_ago, reaction=None):
-    entry = {"role": "user", "name": name, "content": text, "at": NOW - timedelta(minutes=mins_ago)}
+def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None):
+    entry = {"role": "user", "name": name, "content": text, "at": NOW - timedelta(minutes=mins_ago), "to_bot": to_bot}
     if reaction:
         entry["reaction"] = reaction
+    if reply:
+        entry["reply"] = reply  # what jev answered
     return entry
+
+def chat(name, text, mins_ago):  # said in the channel, not to jev
+    return said(name, text, mins_ago, to_bot=False)
 
 
 # A run of questions that jev reacted to — the history that made real questions get emoji
@@ -64,6 +71,20 @@ def jazz(mins_ago):
     return [said("kettle", "i love jazz, been listening all day", mins_ago)]
 
 DAYS = 2 * 24 * 60
+
+# The answer is only in the channel chatter
+CAT = [chat("kettle", "my cat biscuit just knocked my tea over", 4), chat("pip", "lol rip", 3),
+       chat("mossy", "biscuit is a menace honestly", 2), chat("pip", "she did it to me last week too", 1)]
+# The answer was said to jev five messages ago
+COLOUR = [said("mossy", "my favourite colour is green", 6), said("pip", "do you like tea?", 5),
+          said("kettle", "what's 2+2", 4), said("pip", "do you like jazz?", 3), said("kettle", "is it raining where you are?", 2)]
+# Two earlier questions, then a new topic — with jev's answers shown, and without (how it used to look)
+FLAN = [said("pip", "what's a flan", 3, reply="Dunno a custard dessert wobbly sweet"),
+        said("mossy", "you?", 2, reply="No not wobbly")]
+FLAN_UNANSWERED = [{k: v for k, v in h.items() if k != "reply"} for h in FLAN]
+# Chatter with nothing to do with the question
+NOISE = [chat("kettle", "anyone up for games tonight", 7), chat("pip", "can't, got work", 6), chat("mossy", "boo", 5),
+         chat("kettle", "maybe tomorrow then", 4), chat("mossy", "what time", 3), chat("kettle", "8ish", 2)]
 
 # (id, author, message, history, expected: "reply"/"react", or the emoji it should react with)
 REACT = [
@@ -90,6 +111,11 @@ REACT = [
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], "reply"),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, "reply"),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], "reply"),
+    ("cat", "kettle", "what's my cat called?", CAT, "reply"),
+    ("water-noisy", "mossy", "do you drink water?", NOISE, "reply"),
+    ("lol-noisy", "pip", "lol", NOISE, "react"),
+    ("moved-on", "kettle", "are landlords ethical", FLAN, "reply"),
+    ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -109,6 +135,15 @@ FIRST = [
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], None),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, None),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], None),
+    # Longer history: can jev use something said further back? Does unrelated chatter hurt?
+    ("cat", "kettle", "what's my cat called?", CAT, {"biscuit"}),
+    ("colour", "mossy", "what's my favourite colour?", COLOUR, {"green"}),
+    ("water-noisy", "mossy", "do you drink water?", NOISE, YES),
+    # A new question after two answered ones: does jev go back to the flan?
+    ("moved-on", "kettle", "are landlords ethical", FLAN, None),
+    ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, None),
+    ("follow-up", "mossy", "you?", FLAN[:1], YES),
+    ("follow-up-unanswered", "mossy", "you?", FLAN_UNANSWERED[:1], YES),
 ]
 
 REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply")]
@@ -140,6 +175,13 @@ async def next_word(session, state, vocab, rng, instructions):
 j.post, j.next_word = post, next_word
 
 
+# What the bot would put in the transcript: jev_bot.recent() of people's messages, then a replied-to jev line
+def visible(history):
+    if not history:
+        return history
+    return j.recent([h for h in history if h["role"] == "user"]) + [h for h in history if h["role"] == "assistant"]
+
+
 def words_in(text):
     return set(re.findall(r"[a-z']+", text.lower()))
 
@@ -147,7 +189,7 @@ def words_in(text):
 async def check_react(sem, sid, author, message, history, expected):
     scenario.set(f"react:{sid}")
     async with sem:
-        emoji = await j.choose_reaction(message, author, BOT, j.emoji_vocabulary(None), history=history)
+        emoji = await j.choose_reaction(message, author, BOT, j.emoji_vocabulary(None), history=visible(history))
     asked = next((a["asked"].get("noul") for kind, _, _, a in captured.get(f"react:{sid}", [])
                   if kind == "post" and "asked" in a), None)
     got = "react" if emoji else "reply"
@@ -161,7 +203,7 @@ async def first_step(sem, sid, author, message, history, k):
     scenario.set(f"first:{sid}:{k}")
     seed.set(f"{author}|{message}|{k}")
     async with sem:
-        await j.generate_reply(message, author, BOT, history=history)
+        await j.generate_reply(message, author, BOT, history=visible(history))
     return next((c for c in captured.get(f"first:{sid}:{k}", []) if c[0] == "step"), None)
 
 
@@ -176,15 +218,20 @@ async def check_first(sem, sid, author, message, history, expected):
         for w, p in step_probs.items():
             probs[w] = probs.get(w, 0) + p / len(steps)
     # Words the transcript adds around the messages (labels, timestamps...) — jev picking these is a format leak
-    spoken = " ".join([BOT, author, message] + [f"{h['name']} {h['content']}" for h in history or []])
+    spoken = " ".join([BOT, author, message] + [f"{h['name']} {h['content']} {h.get('reply', '')}" for h in visible(history) or []])
     scaffold = words_in(state) - words_in(spoken)
     share = lambda ws: sum(p for w, p in probs.items() if w.lower() in ws)
+    # Words only earlier messages used — jev picking these is going back to an old topic
+    names = words_in(" ".join([BOT, author] + [h["name"] for h in visible(history) or []]))
+    earlier = words_in(" ".join(h["content"] for h in visible(history) or [] if h["role"] == "user"))
+    old_topic = earlier - words_in(message) - names - j.STOPWORDS - (expected or set())
     return sid, {
         "top": sorted(probs.items(), key=lambda kv: -kv[1])[:6],
         "describing": share(DESCRIBING),
         "end": probs.get(j.END, 0),
         "leak": share(scaffold),
         "leaked": sorted(w for w in probs if w.lower() in scaffold),
+        "old_topic": share(old_topic),
         "expected": share(expected) if expected else None,
     }
 
@@ -193,7 +240,7 @@ async def check_reply(sid, author, message, history, _expected):
     scenario.set(f"reply:{sid}")
     seed.set(f"{author}|{message}|reply")
     start = time.monotonic()
-    text = await j.generate_reply(message, author, BOT, history=history)
+    text = await j.generate_reply(message, author, BOT, history=visible(history))
     steps = sum(1 for c in captured.get(f"reply:{sid}", []) if c[0] == "step")
     return sid, {"text": text, "steps": steps, "seconds": round(time.monotonic() - start)}
 
@@ -212,6 +259,7 @@ def summarise(res):
         "first P(describing)": mean(f["describing"] for f in first),
         "first P(<END>)": mean(f["end"] for f in first),
         "first P(leak)": mean(f["leak"] for f in first),
+        "first P(old topic)": mean(f.get("old_topic") for f in first),
         "first P(expected answer)": mean(f["expected"] for f in first),
     }
 
@@ -265,11 +313,20 @@ async def main():
     ap.add_argument("--save", help="write results to this JSON file")
     ap.add_argument("--compare", help="show results next to a file saved with --save")
     ap.add_argument("--replies", action="store_true", help="also generate full replies (~$0.05-0.10 each)")
+    ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
+                    help="override a jev_bot setting for this run, e.g. HISTORY_CHATTER=8")
     args = ap.parse_args()
+    for setting in args.set:
+        name, value = setting.split("=", 1)
+        if not hasattr(j, name):
+            ap.error(f"jev_bot has no setting {name}")
+        setattr(j, name, type(getattr(j, name))(value))
+    settings = {k: getattr(j, k) for k in ("HISTORY_TO_BOT", "HISTORY_CHATTER", "REACT_THRESHOLD", "NEXT_WORD")}
+    print("settings: " + "  ".join(f"{k}={v!r}" for k, v in settings.items()))
     logging.getLogger("jev").setLevel(logging.WARNING)
 
     sem = asyncio.Semaphore(4)
-    res = {"react": dict(await asyncio.gather(*(check_react(sem, *s) for s in REACT)))}
+    res = {"settings": settings, "react": dict(await asyncio.gather(*(check_react(sem, *s) for s in REACT)))}
     max_words, j.MAX_WORDS = j.MAX_WORDS, 1  # first word only
     res["first"] = dict(await asyncio.gather(*(check_first(sem, *s) for s in FIRST)))
     j.MAX_WORDS = max_words
