@@ -180,8 +180,9 @@ def unrender(text):
 
 def vocabulary(message):
     seen = set(BASE_VOCAB)
-    extra = [w for w in re.findall(r"[A-Za-z']+", message.lower())
-             if w not in seen and not seen.add(w)]
+    # Apostrophes only inside a word, and no single letters — "'s" on its own would come out as "He 's" or "He s"
+    extra = [w for w in re.findall(r"[a-z]+(?:'[a-z]+)*", message.lower())
+             if len(w) > 1 and w not in seen and not seen.add(w)]
     return BASE_VOCAB + extra + [END]
 
 
@@ -490,11 +491,12 @@ async def wait_for_credit():
 def bot_role(m):
     return m.guild.self_role if m.guild else None
 
+# A mention used as a name ("@rocky's seeing…") becomes the bot's name — dropped, it left "'s" behind, which jev
+# then picked as a word
 def strip_mention(m):
-    c = re.sub(rf"<@!?{bot.user.id}>", "", m.content)
-    if role := bot_role(m):
-        c = c.replace(role.mention, "")
-    return c.strip()
+    mention = rf"<@!?{bot.user.id}>" + (f"|{re.escape(role.mention)}" if (role := bot_role(m)) else "")
+    c = re.sub(rf"(?:{mention})(?=')", (m.guild.me if m.guild else bot.user).display_name, m.content)
+    return re.sub(mention, "", c).strip()
 
 # Links, e.g. a GIF from Discord's picker (https://klipy.com/gifs/azumanga-daioh-sakai) — shown as a tag with the
 # embed's title (a tweet's has none, so its author and the start of its text), or the link's site and path words while there's no embed.
