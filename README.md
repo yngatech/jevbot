@@ -9,7 +9,7 @@ Jev is a non-autoregressive decision model. It answers questions with calibrated
 1. **Tournament sampling**: 10K vocab shuffled into 255-word buckets, all scored in parallel
 2. **Runoff**: Top-2 from each bucket compete in a final round  
 3. **Completeness judge**: A separate `noul` question asks "is the reply complete?" — jev stops when it thinks it's done
-4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops
+4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops. Fillers and greetings that say the same thing (`SIMILAR`: yes/yeah/yea, hi/hey/hello, …) count as repeats of each other, so "Hi hey hi hey" is penalised like "Hi hi hi hi"; sound-alikes ("Google goo woo") are left alone
 5. **History**: The last 6 messages to jev (`HISTORY_TO_BOT`) and the last 8 other messages in the channel (`HISTORY_CHATTER`) are included as context, each labelled with the sender's display name, and jev's own turn labelled with the bot's server nickname; jev's replies and emoji reactions are shown under the messages they answered, so earlier questions don't look ignored (jev's own words aren't added to the vocab, though). Every word and sender name in those messages is added to the vocab, so jev can repeat them. Jev can't see images or follow links, so a link is shown as a tag with its embed's title, or its site and path words until Discord adds the embed (`https://klipy.com/gifs/azumanga-daioh-sakai` → `[gif: Azumanga Daioh Sakai: 100% Real, True, Based]`, a BBC article → `[link: <headline>]`, a tweet → `[link: <author>]`), and attachments and stickers as tags (`[photo]`, `[video]`, `[sticker: name]`). History lives in memory, so after a restart it is rebuilt from the channel's recent messages the first time someone talks to jev there (needs **Read Message History**)
 6. **Reactions**: Before replying, jev is asked whether the message is a question or request for it — if not, chatty one-liners ("lol", "i just got a new job!!") get a 😂 or 🎉 instead of a reply
 
@@ -70,6 +70,8 @@ python jev_eval.py --compare before.json  # on your branch
 ```
 
 A run costs ~$0.04. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
+
+`test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
 ## Vocab
 

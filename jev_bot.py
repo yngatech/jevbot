@@ -185,7 +185,20 @@ def vocabulary(message):
     return BASE_VOCAB + extra + [END]
 
 
+# Words that say the same thing, so penalty() counts them as repeats of each other — otherwise jev dodges it by
+# switching between them ("Hi hey hi hey", "Yeah yes yea yes yea yeah"). Only fillers and greetings: words that
+# merely look or sound alike ("Google goo woo") or mean nearly the same ("skinny thin") are left alone.
+SIMILAR = ["yes yeah yea yep yup ya yah yeh ye yas", "no nah nope naw", "hi hey hello hiya heya howdy hai yo",
+           "ok okay k kk okey", "lol lmao lmfao haha hahaha rofl", "dunno idk", "what wat wut",
+           "thanks thx ty", "bye cya goodbye", "hmm hm hmmm", "um uh erm uhh umm", "wow whoa woah"]
+SAME = {w: g.split()[0] for g in SIMILAR for w in g.split()}
+
+def same(word):
+    return SAME.get(word.lower(), word)
+
+
 def penalty(reply, word):
+    reply, word = [same(w) for w in reply], same(word)
     local = reply[-REPEAT_WINDOW:].count(word) + 2 * (reply[-1:] == [word])
     p = REPEAT_PENALTY ** local
     seen = reply.count(word)
