@@ -6,8 +6,8 @@ fast-forward onto a clean checkout, it pulls and restarts the bot. It also resta
     python3 run.py                          # runs: uv run --with-requirements requirements.txt jev_bot.py
     python3 run.py -- python jev_bot.py     # or any other command
 
-Restarting and Ctrl-C send the bot one SIGINT, as a Ctrl-C would, and wait for it to exit (if the bot finishes its
-replies before stopping, a restart doesn't cut one off). Ctrl-C again sends another; a third time kills it.
+Restarting and Ctrl-C send the bot one SIGTERM, which it takes as a Ctrl-C, and wait for it to exit (if the bot finishes
+its replies before stopping, a restart doesn't cut one off). Ctrl-C again sends another; a third time kills it.
 """
 
 import argparse
@@ -62,13 +62,15 @@ def main():
 
     # The bot runs in its own session, so the terminal's Ctrl-C reaches only this script, which passes it on.
     # Signal the bot's own process, not its group: `uv run` forwards a signal to Python, so the group would get it twice.
+    # SIGTERM, not SIGINT: with a terminal attached, uv assumes the terminal sent a SIGINT to Python itself and doesn't
+    # forward it — but the bot is in its own session, so it never got it, and kept running until killed.
     bot, presses = None, 0
     def on_signal(sig, frame):
         nonlocal presses
         presses += 1
         if bot and bot.poll() is None:
             if presses < 3:
-                os.kill(bot.pid, signal.SIGINT)
+                os.kill(bot.pid, signal.SIGTERM)
             else:
                 os.killpg(bot.pid, signal.SIGKILL)
     signal.signal(signal.SIGINT, on_signal)
@@ -87,7 +89,7 @@ def main():
                 next_check = time.monotonic() + args.every
                 if update():
                     say("restarting on the new code")
-                    os.kill(bot.pid, signal.SIGINT)
+                    os.kill(bot.pid, signal.SIGTERM)
                     restarting = True
                     break
         try:
