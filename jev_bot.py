@@ -126,7 +126,11 @@ def add_history(ch_id, entry):
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
 CUSTOM_VOCAB_PATH = Path(__file__).parent / "custom_vocab.txt"
 BANNED = {"unanswered"}
-BASE_VOCAB = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED][:VOCAB_SIZE]
+ALL_WORDS = [w for w in VOCAB_PATH.read_text().split("\n") if w and w.lower() not in BANNED]
+# Punctuation is at the end of vocab.txt, so these are kept past the cutoff — without them jev spells out "period"
+# when it wants a full stop. Not quotes or brackets: jev scatters them unpaired ("I?' remember' her")
+PUNCTUATION = [".", ",", "!", "?", NEWLINE]
+BASE_VOCAB = ALL_WORDS[:VOCAB_SIZE] + [w for w in PUNCTUATION if w not in ALL_WORDS[:VOCAB_SIZE]]
 log.info(f"Loaded {len(BASE_VOCAB)} vocab words")
 
 # Server words/phrases: one per line, "#" comments, multi-word phrases are picked as a single unit
