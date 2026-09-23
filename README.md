@@ -10,7 +10,7 @@ Jev is a non-autoregressive decision model. It answers questions with calibrated
 2. **Runoff**: Top-2 from each bucket compete in a final round  
 3. **Completeness judge**: A separate `noul` question asks "is the reply complete?" — jev stops when it thinks it's done
 4. **Penalty system**: Content words penalized 2.5x per reuse, stopwords 1.6x — prevents "is are I is are" loops
-5. **History**: Last 3 user messages included as context, each labelled with the sender's display name (which jev can also say), and jev's own turn labelled with the bot's server nickname; jev's own broken output is excluded (it poisons follow-ups), but its emoji reactions are kept. History lives in memory, so after a restart it is rebuilt from the channel's recent messages the first time someone talks to jev there (needs **Read Message History**)
+5. **History**: Last 3 user messages included as context, each labelled with the sender's display name, and jev's own turn labelled with the bot's server nickname; jev's own broken output is excluded (it poisons follow-ups), but its emoji reactions are kept. Every word and sender name in those messages is added to the vocab, so jev can repeat them. History lives in memory, so after a restart it is rebuilt from the channel's recent messages the first time someone talks to jev there (needs **Read Message History**)
 6. **Reactions**: Before replying, jev is asked whether to react with an emoji instead — chatty one-liners ("lol", "i just got a new job!!") get a 😂 or 🎉, real questions still get a reply
 
 ## Output examples
