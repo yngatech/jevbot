@@ -41,12 +41,14 @@ DESCRIBING = {"empty", "silent", "silence", "crickets", "blank", "quiet", "unans
 NOW = datetime.now(timezone.utc)
 
 
-def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None):
+def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None, reply_reactions=None):
     entry = {"role": "user", "name": name, "content": text, "at": NOW - timedelta(minutes=mins_ago), "to_bot": to_bot}
     if reaction:
         entry["reaction"] = reaction
     if reply:
         entry["reply"] = reply  # what jev answered
+    if reply_reactions:
+        entry["reply_reactions"] = reply_reactions  # people's reactions to jev's answer
     return entry
 
 def chat(name, text, mins_ago):  # said in the channel, not to jev
@@ -59,11 +61,13 @@ def scones(mins_ago):
             said("The Hedge Wizard", "bad rocky", mins_ago + 1, "🤷"),
             said("mossy", "do you like tea?", mins_ago, "🤷")]
 
-def rocky_said(text, mins_ago):
-    return {"role": "assistant", "name": BOT, "content": text, "at": NOW - timedelta(minutes=mins_ago)}
+def rocky_said(text, mins_ago, reactions=None):
+    return {"role": "assistant", "name": BOT, "content": text, "at": NOW - timedelta(minutes=mins_ago),
+            "reactions": reactions or {}}
 
 # Someone replying to one of jev's replies, with and without that reply in view
 GIRLFRIEND = [said("kettle", "are you seeing anyone?", 2), rocky_said("No straight happily guy with girlfriend", 1)]
+GIRLFRIEND_LAUGHED = [GIRLFRIEND[0], rocky_said(GIRLFRIEND[1]["content"], 1, {"😂": 4, "💀": 2})]
 GARBLED = [said("pip", "do you like kelp and perhaps algae", 2),
            rocky_said("Is? Is are are garbled? What? Huh pip you pip rocky ives unclear", 1)]
 
@@ -81,6 +85,8 @@ COLOUR = [said("mossy", "my favourite colour is green", 6), said("pip", "do you 
 # Two earlier questions, then a new topic — with jev's answers shown, and without (how it used to look)
 FLAN = [said("pip", "what's a flan", 3, reply="Dunno a custard dessert wobbly sweet"),
         said("mossy", "you?", 2, reply="No not wobbly")]
+# The same, with people laughing at jev's second answer
+FLAN_LAUGHED = [FLAN[0], said("mossy", "you?", 2, reply="No not wobbly", reply_reactions={"😂": 3, "💀": 1})]
 FLAN_UNANSWERED = [{k: v for k, v in h.items() if k != "reply"} for h in FLAN]
 # Only the flan question missed (say, sent while jev was offline) — the bot leaves it out of the transcript
 FLAN_ONE_MISSED = [FLAN_UNANSWERED[0], FLAN[1]]
@@ -111,6 +117,7 @@ REACT = [
     ("scone-poll", "kettle", "jam or cream first on a scone, ✅ for jam, ❌ for cream", None, {"✅", "❌"}),
     ("gf-reply", "kettle", "what's her name?", GIRLFRIEND, "reply"),
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], "reply"),
+    ("gf-laughed", "kettle", "what's her name?", GIRLFRIEND_LAUGHED, "reply"),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, "reply"),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], "reply"),
     ("cat", "kettle", "what's my cat called?", CAT, "reply"),
@@ -119,6 +126,7 @@ REACT = [
     ("moved-on", "kettle", "are landlords ethical", FLAN, "reply"),
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, "reply"),
     ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, "reply"),
+    ("moved-on-laughed", "kettle", "are landlords ethical", FLAN_LAUGHED, "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -136,6 +144,8 @@ FIRST = [
     # jev's earlier reply in view vs not (what the bot did before replies to it were in context)
     ("gf-reply", "kettle", "what's her name?", GIRLFRIEND, None),
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], None),
+    # People laughed at jev's earlier reply — does it change what jev says next, or leak into it?
+    ("gf-laughed", "kettle", "what's her name?", GIRLFRIEND_LAUGHED, None),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, None),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], None),
     # Longer history: can jev use something said further back? Does unrelated chatter hurt?
@@ -146,11 +156,12 @@ FIRST = [
     ("moved-on", "kettle", "are landlords ethical", FLAN, None),
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, None),
     ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, None),
+    ("moved-on-laughed", "kettle", "are landlords ethical", FLAN_LAUGHED, None),
     ("follow-up", "mossy", "you?", FLAN[:1], YES),
     ("follow-up-unanswered", "mossy", "you?", FLAN_UNANSWERED[:1], YES),
 ]
 
-REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply")]
+REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply", "gf-laughed")]
 
 
 # Wrap the bot's own functions so the checks exercise the real code paths
@@ -169,10 +180,10 @@ async def post(session, state, questions):
     captured.setdefault(scenario.get(), []).append(("post", state, questions, dict(answers)))  # the bot pops from it
     return answers
 
-async def next_word(session, state, vocab, rng, instructions):
+async def next_word(session, state, vocab, rng, instructions, done_state=None):
     # Seeded per scenario, so before/after runs shuffle the vocab the same way and differ only by the change
     rng = shuffles.setdefault(scenario.get(), random.Random(seed.get()))
-    probs, complete = await real_next_word(session, state, vocab, rng, instructions)
+    probs, complete = await real_next_word(session, state, vocab, rng, instructions, done_state)
     captured.setdefault(scenario.get(), []).append(("step", state, probs, complete))
     return probs, complete
 
