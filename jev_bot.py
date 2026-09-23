@@ -15,7 +15,7 @@ import random
 import contextvars
 from pathlib import Path
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import discord
@@ -38,6 +38,7 @@ MIN_WORDS = 2
 HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, replies) in the transcript
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
+CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
 STOP_THRESHOLD = 0.5            # let jev stop earlier — the good part is always the first half
 REPEAT_PENALTY = 1.5
 REPEAT_WINDOW = 8
@@ -408,6 +409,36 @@ async def load_history(first):
 @bot.event
 async def on_ready():
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
+    await catch_up()
+
+# Messages sent while jev was offline (a restart, an outage) never reach on_message. On (re)connect, answer each
+# channel's latest message to jev from the last CATCH_UP_WINDOW minutes since jev last replied or reacted there —
+# only the latest, so a long outage doesn't bring a burst of replies to messages people have moved on from.
+async def catch_up():
+    since = datetime.now(timezone.utc) - timedelta(minutes=CATCH_UP_WINDOW)
+    missed = []
+    for guild in bot.guilds:
+        for ch in [*guild.text_channels, *guild.threads]:
+            perms = ch.permissions_for(guild.me)
+            if not (perms.read_messages and perms.read_message_history):
+                continue
+            try:
+                found = [m async for m in ch.history(limit=HISTORY_SCAN, after=since, oldest_first=False)]
+            except discord.HTTPException as e:
+                log.warning(f"Catching up on {ch.id} failed: {e}")
+                continue
+            mine = [m for m in found if m.author.id == bot.user.id]
+            answered = {m.reference.message_id for m in mine if m.reference}
+            handled = [m for m in found if m.id in answered or any(r.me for r in m.reactions)]
+            # Only what came after jev last replied or reacted here — anything older was left behind, not missed,
+            # and answering it would walk back one more old message on every reconnect
+            last = max((m.created_at for m in mine + handled), default=since)
+            unanswered = [m for m in found if m.created_at > last and should_respond(m)]
+            if unanswered:
+                log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
+                missed.append(max(unanswered, key=lambda m: m.created_at))
+    for m in sorted(missed, key=lambda m: m.created_at):
+        await respond(m, caught_up=True)
 
 @bot.event
 async def on_message(m):
@@ -416,11 +447,15 @@ async def on_message(m):
         if HISTORY_CHATTER and (entry := history_entry(m)):
             add_history(m.channel.id, entry)
         return
+    await respond(m)
+
+
+async def respond(m, **extra):
     c = strip_mention(m) or "hello"
     log.info(f"[IN] {m.author}: {c[:80]}")
     # discord.py runs each event in its own task, so this trace only sees this message's requests
     t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "channel": getattr(m.channel, "name", None),
-         "channel_id": m.channel.id, "author": m.author.display_name, "message": c, "cost": 0.0, "requests": 0}
+         "channel_id": m.channel.id, "author": m.author.display_name, "message": c, "cost": 0.0, "requests": 0, **extra}
     trace.set(t)
     start = time.monotonic()
     try:
