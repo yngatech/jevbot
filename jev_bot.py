@@ -41,7 +41,7 @@ CONTENT_PENALTY_CAP = 4
 STOP_PENALTY = 1.6
 STOP_PENALTY_CAP = 6
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
-REACT_THRESHOLD = 0.45          # chatty one-liners ("lol", "i hate mondays") land ~0.5, real questions ~0.1-0.2
+REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
 # Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
 # instead of continuing it. Set back to "Next word?" to compare.
 NEXT_WORD = "Next word of {bot_name}'s reply?"
@@ -216,19 +216,20 @@ HEADERS = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "applica
 # The emoji jev reacts with instead of replying, or None to reply
 async def choose_reaction(message, author, bot_name, emoji, history=None):
     rng = random.Random()
-    # Without past reactions — a run of them reads as a habit to keep up, pushing real questions over REACT_THRESHOLD
+    # Without past reactions — a run of them reads as a habit to keep up, and jev copies the last emoji
     state = transcript(message, author, bot_name, history, [], reactions=False)
     shuffled = list(emoji)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
     questions = {f"b{i}": choice_q(b, "Reaction?") for i, b in enumerate(buckets[:QUESTIONS_PER_CALL - 1])}
-    questions["react"] = {"type": "noul", "instructions": f"Should {bot_name} react with an emoji instead of replying?"}
+    # Asked as "is it a question?" — "should jev react instead?" scored everything ~0.4-0.55, so no threshold separated them
+    questions["asked"] = {"type": "noul", "instructions": f"Is {author}'s last message a question or request for {bot_name}?"}
 
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         answers = await post(session, state, questions)
-        react = answers.pop("react", {}).get("noul", 0)
-        if react < REACT_THRESHOLD:
-            log.info(f"  react={react:.2f} reply")
+        asked = answers.pop("asked", {}).get("noul", 1)
+        if asked >= REACT_THRESHOLD:
+            log.info(f"  asked={asked:.2f} reply")
             return None
 
         finalists = [w for ans in answers.values() for w, p in by_prob(ans)[:TOP_PER_BUCKET] if p > 0]
@@ -236,7 +237,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
             runoff = await post(session, state, {"final": choice_q(finalists[:MAX_CHOICES], "Reaction?")})
             finalists = [w for w, p in by_prob(runoff.get("final", {})) if p > 0]
 
-    log.info(f"  react={react:.2f} {' '.join(finalists[:3])}")
+    log.info(f"  asked={asked:.2f} {' '.join(finalists[:3])}")
     return finalists[0] if finalists else None
 
 
