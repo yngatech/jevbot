@@ -95,6 +95,20 @@ def recent(entries, to_bot=None, chatter=None):
             keep.append(e)
     return keep[::-1]
 
+# What the transcript shows: recent() of the channel, minus messages to jev it never answered but has answered
+# something after since — left behind (sent while it was offline, say), they pull jev back to their topic.
+# One being answered right now is "pending", so a quick reaction to a later message doesn't hide it.
+def shown(entries):
+    keep, answered_since = [], False
+    for e in reversed(entries):
+        if e.get("to_bot", True):
+            if "reply" in e or "reaction" in e:
+                answered_since = True
+            elif answered_since and not e.get("pending"):
+                continue
+        keep.append(e)
+    return recent(keep[::-1])
+
 def add_history(ch_id, entry):
     h = channel_history[ch_id]
     h.append(entry)
@@ -436,10 +450,11 @@ async def handle(m, c):
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
     await history_loaded[m.channel.id]
     entry = add_history(m.channel.id, history_entry(m))
+    entry["pending"] = True
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
-    h = recent(channel_history[m.channel.id][:-1])
+    h = shown(channel_history[m.channel.id][:-1])
     # The reply of jev's someone is answering, if it isn't already shown under the message it answered
     if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
         h.append({"role": "assistant", "name": bot_name, "content": r.content})
@@ -468,6 +483,8 @@ async def handle(m, c):
         note(error=repr(e))
         try: await m.reply("...", mention_author=False)
         except: pass
+    finally:
+        entry.pop("pending", None)
 
 if __name__ == "__main__":
     bot.run(TOKEN, log_handler=None)
