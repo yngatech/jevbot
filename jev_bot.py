@@ -705,9 +705,13 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
-# m as a history entry, or None for messages that never go in one (bots, including jev itself, and empty ones)
+def is_why(m):
+    return not m.author.bot and strip_mention(m).lower() == "!why"
+
+# m as a history entry, or None for messages that never go in one (bots, including jev itself, empty ones, and !why —
+# a reply to jev, so after a restart it came back as a message jev never answered)
 def history_entry(m):
-    if m.author.bot:
+    if m.author.bot or is_why(m):
         return None
     to_bot = should_respond(m)
     content = message_text(m) or ("hello" if to_bot else "")
@@ -856,7 +860,7 @@ async def catch_up():
 async def on_message(m):
     if m.guild is None and m.author.id not in DM_USERS:
         return  # a DM from anyone else, or jev's own — not even kept as history
-    if not m.author.bot and strip_mention(m).lower() == "!why":
+    if is_why(m):
         if not stopping.is_set():
             await why(m)
         return
