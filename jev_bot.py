@@ -421,7 +421,9 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
                 if p <= 0: continue
                 if w in NO_SPACE_BEFORE and words[-1:] == [w]: continue
                 if w == END and not stoppable: continue
-                if w == NEWLINE and not said: continue  # leading newlines get stripped anyway — don't spend steps on them
+                # Nothing opens with punctuation: leading newlines get stripped anyway, and a leading "?" took over
+                # whenever jev's favourite first word was held back ("? Public? Public?", "? No? No?")
+                if w in PUNCTUATION and not said: continue
                 scored[w] = p / penalty(words, w, recent, exempt)
 
             if not scored:
