@@ -48,6 +48,8 @@ python3 run.py
 
 Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
 
+`!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for its emoji candidates as text. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
+
 DMs are ignored, except from the Discord user IDs listed in `dm_users.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments) — every message they DM jev gets answered, no mention needed. What's said in DMs never makes it into jev's status. Restart the bot to pick up changes.
 
 Ctrl-C (or SIGTERM) lets replies in progress finish first: jev stops taking new messages (it catches up on them next start) and exits once it's done. Ctrl-C again quits without finishing.
@@ -60,7 +62,7 @@ Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042
 
 ## Logs
 
-Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, the reaction or each word it picked (with its top candidates and the done score), and what the API calls actually cost. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
+Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, the reaction or each word it picked (with its top candidates, each with its probability and its score after penalties, and the done score), and what the API calls actually cost. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
 
 ## Testing changes
 

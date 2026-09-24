@@ -5,6 +5,7 @@ This is the version that produced "I depends on on situation of circumstances."
 20K vocab, bucket tournament, empty descriptions, 3-turn history.
 """
 
+import io
 import os
 import re
 import json
@@ -23,6 +24,8 @@ import aiohttp
 import discord
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
+
+import why_chart
 
 load_dotenv()
 
@@ -444,9 +447,13 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
             top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
             log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}"
                      + ("  ends" if ends else ""))
-            # Raw probabilities of the best-scoring candidates, so penalties' effect on the pick is visible
+            # The best-scoring candidates, then every other one at 1% or more, each as [word, probability, score].
+            # Asked to pick from 33 countries jev said "No? Idk": "idk" at 23% scored below "no" at 4% after the echo
+            # penalty, and the countries split their vote at ~3% each — the top five showed neither.
+            likely = [w for w, _ in sorted(scored.items(), key=lambda kv: -probs[kv[0]]) if probs[w] >= 0.01]
             steps.append({"word": word, "done": round(complete, 3), "ends": ends,
-                          "top": [[w, round(probs[w], 3)] for w, _ in ranked[:5]]})
+                          "top": [[w, round(probs[w], 3), round(scored[w], 3)]
+                                  for w in dict.fromkeys([w for w, _ in ranked[:5]] + likely)]})
 
             if word == END:
                 note(stop="<END>")
@@ -823,6 +830,10 @@ async def catch_up():
 async def on_message(m):
     if m.guild is None and m.author.id not in DM_USERS:
         return  # a DM from anyone else, or jev's own — not even kept as history
+    if not m.author.bot and strip_mention(m).lower() == "!why":
+        if not stopping.is_set():
+            await why(m)
+        return
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
         if HISTORY_CHATTER and (entry := history_entry(m)):
@@ -841,6 +852,77 @@ async def on_message_edit(before, after):
         entry["content"] = content
 
 
+# !why: what jev weighed for one of its answers, from the logs — the reply the !why is a Discord reply to (or the
+# message it reacted to), or on its own jev's latest answer in the channel. A reply gets why_chart's chart; a reaction
+# gets its candidates as text, since the chart's font has no emoji. Costs nothing: no API calls.
+WHY_DAYS = 7  # how many days of logs it looks back through
+
+# The latest log entry in the channel for an answer with candidates to show, or the one for `target` if given
+def find_trace(channel_id, target=None):
+    for path in sorted(LOG_DIR.glob("*.jsonl"), reverse=True)[:WHY_DAYS]:
+        for line in reversed(path.read_text().splitlines()):
+            try:
+                t = json.loads(line)
+            except ValueError:
+                continue
+            if t.get("channel_id") != channel_id or not (t.get("steps") or t.get("reaction_candidates")):
+                continue
+            if target is None:
+                return t
+            if target.author.id == bot.user.id:
+                # Entries from before reply_id was logged: the reply's text instead
+                if t.get("reply_id", target.id) == target.id and t.get("reply") == target.content:
+                    return t
+            elif t.get("message_id") == target.id or ("message_id" not in t
+                                                      and t.get("message") == (message_text(target) or "hello")):
+                return t
+    return None
+
+# One why_chart panel per word jev picked. Entries from before scores were logged get them from penalty() again,
+# with the history they logged.
+def why_panels(t):
+    recent, exempt = recent_answers(t.get("history")), said_in(t["message"])
+    words, panels = [], []
+    for s in t["steps"]:
+        rows = [[w, p, rest[0] if rest else p / penalty(words, w, recent, exempt)] for w, p, *rest in s["top"]]
+        rows.sort(key=lambda r: -r[2])
+        keep = rows[:8] + [r for r in rows[8:] if r[0] == s["word"]]
+        panels.append({"so_far": render(words), "picked": s["word"], "ends": s.get("ends", False), "rows": keep})
+        if s["word"] != END:
+            words.append(s["word"])
+    return panels
+
+async def why(m):
+    target = None
+    if m.reference and m.reference.message_id:
+        target = m.reference.resolved
+        if not isinstance(target, discord.Message):  # not in discord.py's cache, or deleted
+            try:
+                target = await m.channel.fetch_message(m.reference.message_id)
+            except discord.HTTPException:
+                target = None
+        if target is None:
+            await m.reply("Can't see that message", mention_author=False)
+            return
+    t = await asyncio.to_thread(find_trace, m.channel.id, target)
+    if t is None:
+        await m.reply("Nothing logged for that", mention_author=False)
+        return
+    bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
+    if t.get("steps"):
+        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t))
+        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        log.info(f"[WHY] chart for {t.get('reply')!r}")
+    else:
+        # [emoji, probability, score], likeliest first
+        cands = "  ".join(f"{e} {p:.0%}" + (f" → {s:.1%}" if round(p, 3) != round(s, 3) else "")
+                          for e, p, s in t["reaction_candidates"])
+        # Quotes what someone said, so no pings from mentions in it
+        await m.reply(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {cands}", mention_author=False,
+                      allowed_mentions=discord.AllowedMentions.none())
+        log.info(f"[WHY] reaction {t.get('reaction')}")
+
+
 async def respond(m, **extra):
     handling.add(task := asyncio.current_task())
     try:
@@ -854,7 +936,8 @@ async def respond_traced(m, **extra):
     log.info(f"[IN] {m.author}: {c[:80]}")
     # discord.py runs each event in its own task, so this trace only sees this message's requests
     t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "channel": getattr(m.channel, "name", None),
-         "channel_id": m.channel.id, "author": m.author.display_name, "message": c, "cost": 0.0, "requests": 0, **extra}
+         "channel_id": m.channel.id, "message_id": m.id, "author": m.author.display_name, "message": c,
+         "cost": 0.0, "requests": 0, **extra}
     trace.set(t)
     start = time.monotonic()
     try:
@@ -908,6 +991,7 @@ async def handle(m, c):
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
         sent = await m.reply(r, mention_author=False)
+        note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
     except Exception as e:
