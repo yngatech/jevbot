@@ -76,7 +76,7 @@ python jev_eval.py --save before.json     # on master
 python jev_eval.py --compare before.json  # on your branch
 ```
 
-A run costs ~$0.04, on `OPENROUTER_API_KEY_EVAL`. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
+A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter billed for it. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
 
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 

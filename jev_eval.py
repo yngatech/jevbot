@@ -6,7 +6,7 @@ Live checks for jev — run before and after a change to see whether it broke an
     python jev_eval.py --replies                 # also generate a few full replies to judge by eye
     python jev_eval.py --set HISTORY_CHATTER=8   # try a setting without editing jev_bot.py
 
-Costs real API calls: ~$0.04 by default, plus ~$0.05-0.10 per full reply with --replies.
+Costs real API calls: ~$0.21 by default, plus ~$0.05-0.10 per full reply with --replies.
 
 Which words land in which bucket is random and moves the first-word numbers a lot, so each scenario
 averages SHUFFLES seeded shuffles, and scenarios with the same message share them (fresh vs stale
@@ -170,13 +170,10 @@ scenario = contextvars.ContextVar("scenario")  # key for what a scenario sent an
 seed = contextvars.ContextVar("seed")          # vocab shuffle, shared by scenarios with the same message
 captured: dict[str, list] = {}
 shuffles: dict[str, random.Random] = {}
-sent_chars = 0
 
 real_post, real_next_word = j.post, j.next_word
 
 async def post(session, state, questions):
-    global sent_chars
-    sent_chars += len(state) + len(json.dumps(questions, ensure_ascii=False))
     answers = await real_post(session, state, questions)
     captured.setdefault(scenario.get(), []).append(("post", state, questions, dict(answers)))  # the bot pops from it
     return answers
@@ -346,6 +343,9 @@ async def main():
     print("settings: " + "  ".join(f"{k}={v!r}" for k, v in settings.items()))
     logging.getLogger("jev").setLevel(logging.WARNING)
 
+    # What OpenRouter billed, added up by the bot's own post() — the scenarios' tasks copy this context, so share the dict
+    spent = {"cost": 0.0, "requests": 0}
+    j.trace.set(spent)
     sem = asyncio.Semaphore(4)
     res = {"settings": settings, "react": dict(await asyncio.gather(*(check_react(sem, *s) for s in REACT)))}
     max_words, j.MAX_WORDS = j.MAX_WORDS, 1  # first word only
@@ -356,7 +356,7 @@ async def main():
 
     base = json.load(open(args.compare)) if args.compare else None
     report(res, base)
-    print(f"\n~${sent_chars / 4 * 0.042 / 1e6:.3f} spent (estimated from characters sent)")
+    print(f"\n${spent['cost']:.3f} spent ({spent['requests']} requests)")
     if args.save:
         json.dump(res, open(args.save, "w"), ensure_ascii=False, indent=1)
         print(f"saved to {args.save}")
