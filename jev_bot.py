@@ -96,6 +96,7 @@ def write_trace(t):
 
 # History: recent messages per channel, oldest first. "to_bot" marks the ones that mentioned or replied to jev.
 channel_history: dict[int, list[dict]] = defaultdict(list)
+dm_channels: set[int] = set()  # channels in channel_history that are DMs, kept out of the status
 
 # The last `to_bot` messages to jev and the last `chatter` other messages, in order
 def recent(entries, to_bot=None, chatter=None):
@@ -478,7 +479,7 @@ STATUS_STARTS = [["i", "feel"], ["i'm", "thinking", "about"], ["i", "wonder"]]
 
 # The last STATUS_CHAT messages people sent in the channel that heard from someone most recently, one per line
 def recent_chat():
-    active = [h for h in channel_history.values() if h]
+    active = [h for ch, h in channel_history.items() if h and ch not in dm_channels]  # the status is public
     if not STATUS_CHAT or not active:
         return ""
     h = max(active, key=lambda h: h[-1]["at"])[-STATUS_CHAT:]
@@ -496,10 +497,28 @@ async def generate_status(bot_name, start, chat=""):
     return render(start + words)[:128] if words else None  # 128: Discord's custom status limit
 
 
+# DMs: only from the Discord user IDs in dm_users.txt (gitignored, one per line, "#" comments) — every reply costs
+# credit, and nobody else sees what's said in private. Restart the bot to pick up changes.
+DM_USERS_PATH = Path(__file__).parent / "dm_users.txt"
+
+def load_dm_users():
+    if not DM_USERS_PATH.exists():
+        return set()
+    users = set()
+    for line in DM_USERS_PATH.read_text().split("\n"):
+        if w := line.split("#", 1)[0].strip():
+            try:
+                users.add(int(w))
+            except ValueError:
+                log.warning(f"{DM_USERS_PATH.name}: {w!r} isn't a user ID")
+    return users
+
+DM_USERS = load_dm_users()
+log.info(f"Loaded {len(DM_USERS)} DM user(s)")
+
 # Discord
 intents = discord.Intents.default()
 intents.message_content = True
-intents.dm_messages = False  # no DMs — every reply costs credit, and nobody sees what's said in private
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
@@ -643,6 +662,7 @@ def replied_to_bot(m):
 
 def should_respond(m):
     if m.author.bot: return False
+    if m.guild is None: return m.author.id in DM_USERS  # in a DM, every message is to jev
     if bot.user in m.mentions: return True
     if (role := bot_role(m)) and role in m.role_mentions: return True
     return replied_to_bot(m) is not None
@@ -768,27 +788,30 @@ async def wait_for_status():  # the kept status stays until it's due
 # only the latest, so a long outage doesn't bring a burst of replies to messages people have moved on from.
 async def catch_up():
     since = datetime.now(timezone.utc) - timedelta(minutes=CATCH_UP_WINDOW)
+    channels = [ch for guild in bot.guilds for ch in [*guild.text_channels, *guild.threads]
+                if (perms := ch.permissions_for(guild.me)).read_messages and perms.read_message_history]
+    for user_id in DM_USERS:
+        try:
+            channels.append(await (await bot.fetch_user(user_id)).create_dm())
+        except discord.HTTPException as e:
+            log.warning(f"Opening a DM with {user_id} failed: {e}")
     missed = []
-    for guild in bot.guilds:
-        for ch in [*guild.text_channels, *guild.threads]:
-            perms = ch.permissions_for(guild.me)
-            if not (perms.read_messages and perms.read_message_history):
-                continue
-            try:
-                found = [m async for m in ch.history(limit=HISTORY_SCAN, after=since, oldest_first=False)]
-            except discord.HTTPException as e:
-                log.warning(f"Catching up on {ch.id} failed: {e}")
-                continue
-            mine = [m for m in found if m.author.id == bot.user.id]
-            answered = {m.reference.message_id for m in mine if m.reference}
-            handled = [m for m in found if m.id in answered or any(r.me for r in m.reactions)]
-            # Only what came after jev last replied or reacted here — anything older was left behind, not missed,
-            # and answering it would walk back one more old message on every reconnect
-            last = max((m.created_at for m in mine + handled), default=since)
-            unanswered = [m for m in found if m.created_at > last and should_respond(m)]
-            if unanswered:
-                log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
-                missed.append(max(unanswered, key=lambda m: m.created_at))
+    for ch in channels:
+        try:
+            found = [m async for m in ch.history(limit=HISTORY_SCAN, after=since, oldest_first=False)]
+        except discord.HTTPException as e:
+            log.warning(f"Catching up on {ch.id} failed: {e}")
+            continue
+        mine = [m for m in found if m.author.id == bot.user.id]
+        answered = {m.reference.message_id for m in mine if m.reference}
+        handled = [m for m in found if m.id in answered or any(r.me for r in m.reactions)]
+        # Only what came after jev last replied or reacted here — anything older was left behind, not missed,
+        # and answering it would walk back one more old message on every reconnect
+        last = max((m.created_at for m in mine + handled), default=since)
+        unanswered = [m for m in found if m.created_at > last and should_respond(m)]
+        if unanswered:
+            log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
+            missed.append(max(unanswered, key=lambda m: m.created_at))
     for m in sorted(missed, key=lambda m: m.created_at):
         if stopping.is_set():
             break
@@ -796,6 +819,8 @@ async def catch_up():
 
 @bot.event
 async def on_message(m):
+    if m.guild is None and m.author.id not in DM_USERS:
+        return  # a DM from anyone else, or jev's own — not even kept as history
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
         if HISTORY_CHATTER and (entry := history_entry(m)):
@@ -838,6 +863,8 @@ async def respond_traced(m, **extra):
 
 
 async def handle(m, c):
+    if m.guild is None:
+        dm_channels.add(m.channel.id)  # before its history loads, so a status made meanwhile can't show it
     # Shared task, so messages arriving while it loads wait for it instead of loading twice
     if m.channel.id not in history_loaded:
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
