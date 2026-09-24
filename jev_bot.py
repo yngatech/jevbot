@@ -57,6 +57,15 @@ STOP_PENALTY_CAP = 6
 # from 15 of 40 to 8 and kept the ones it clearly meant; 2.5 dropped "Dunno" for "Yes" at 0.12 vs 0.09 after one
 ECHO_TURNS = 3
 ECHO_PENALTY = 2.0
+# Words that say jev has nothing to say. Funny once in a while, but they opened half its replies, and the echo
+# penalty only moved jev from one to the next: "dunno" went, "no" (a stopword, so never echoed) took over, "No? No?"
+# three times running. So they count as one word across replies: each of jev's last ECHO_TURNS answers that said
+# any of them divides them all by NOTHING_PENALTY, instead of ECHO_PENALTY. The first is free, and a run breaks
+# into saying something ("century egg?" "Yuck", "toast with butter? jam?" "Jam"). Replayed over two days' logs,
+# 3.0 took replies opening with one from 59 of 130 to 35; 2.0 left 49, 4.0 left 28
+NOTHING = {"dunno", "no", "crickets", "chirping", "silence", "silent", "empty", "quiet", "blank", "shrug", "huh",
+           "ignoring"}
+NOTHING_PENALTY = 3.0
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
 STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each) — 0 to leave the status alone
@@ -252,10 +261,13 @@ def penalty(reply, word, recent=(), exempt=()):
     alpha = word.replace(" ", "").isalpha()
     if alpha and word.lower() not in STOPWORDS:
         p *= CONTENT_PENALTY ** min(seen, CONTENT_PENALTY_CAP)
-        if said_as(word) not in exempt:
-            p *= ECHO_PENALTY ** sum(said_as(word) in a for a in recent)
     elif alpha:
         p *= STOP_PENALTY ** min(seen, STOP_PENALTY_CAP)
+    if said_as(word) not in exempt:
+        if said_as(word) in NOTHING:
+            p *= NOTHING_PENALTY ** sum(bool(a & NOTHING) for a in recent)
+        elif alpha and word.lower() not in STOPWORDS:
+            p *= ECHO_PENALTY ** sum(said_as(word) in a for a in recent)
     return p
 
 

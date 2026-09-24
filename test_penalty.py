@@ -129,6 +129,9 @@ ECHOES = {
     # Clearly meant: a dunno after one other, and "four" for 2+2 with dunno everywhere
     "Dunno maybe positive": (["He 's annoying", "🤣", "No dunno ninja"],
                              [("dunno", .3), ("no", .1), ("i", .07), ("yes", .05), ("nope", .05)]),
+    # "century egg?" / "toast with butter? jam?" after runs of answers that said nothing
+    "Century egg": (["No? No?", "No? No"], [("no", .31), ("yuck", .06), ("nope", .04), ("not", .04), ("nor", .03)]),
+    "Jam": (["Crickets chirping"], [("no", .08), ("jam", .08), ("empty", .06), ("nay", .05), ("nope", .03)]),
     "Four dunno": (["Dunno? Dunno?", "Dunno? Dunno?", "Dunno gone"], [("four", .86), ("dunno", .08), ("idk", .03)]),
 }
 
@@ -152,6 +155,20 @@ def test_meant_answers_kept():
     assert first_word("Dunno maybe positive") == "dunno"
     assert first_word("Four dunno") == "four"
     assert first_word("Dunno? Dunno?", message="idk what to do") == "dunno"  # said to jev: fair game
+
+# jev's answers said nothing ("No? No?", "Crickets chirping"): the other words that say nothing count against it too
+def test_nothing_words_count_together():
+    crickets = recent_answers([{"role": "assistant", "name": "jev", "content": "Crickets chirping"}])
+    assert penalty([], "no", crickets) == penalty([], "dunno", crickets) > 1
+    assert penalty([], "jam", crickets) == 1
+    assert penalty([], "no", recent_answers([{"role": "assistant", "name": "jev", "content": "No? No?"}])) > 1
+    assert penalty([], "no", crickets, said_in("no dunno idk")) == 1  # said to jev: fair game
+
+def test_nothing_runs_break():
+    assert first_word("Century egg", message="century egg?") == "yuck"
+    assert first_word("Jam", message="toast with butter? jam?") == "jam"
+    assert first_word("Century egg", ["Yes rock"], "century egg?") == "no"  # the first is free
+    assert first_word("Century egg", ["No? No"], "century egg?") == "no"  # one before: "no" at 31% still clearly meant
 
 def test_only_last_answers_count():
     old = ["Dunno", "Dunno", "Dunno"]
