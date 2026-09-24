@@ -1,5 +1,6 @@
 """
-Offline checks for penalty(): near-synonyms count as repeats, interesting phrases don't. No API calls, no cost.
+Offline checks for penalty() and pick(): near-synonyms count as repeats and vote together, interesting phrases
+don't. No API calls, no cost.
 
 The replays are real replies from the logs: each step's top candidates with their raw probabilities, re-scored
 with today's penalty() given the words picked before it. Only the first step that changes means anything —
@@ -14,7 +15,7 @@ import os
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "test")
 
-from jev_bot import END, MIN_WORDS, is_word, penalty, recent_answers, render, said_in  # noqa: E402
+from jev_bot import END, MIN_WORDS, is_word, penalty, pick, recent_answers, render, said_in  # noqa: E402
 
 # reply: [(word picked, [(candidate, raw probability), ...]), ...] — "top" from logs/*.jsonl
 REPLAYS = {
@@ -82,7 +83,7 @@ def replay(steps):
     for picked, top in steps:
         stoppable = sum(1 for w in words if is_word(w)) >= MIN_WORDS
         scored = {w: p / penalty(words, w) for w, p in top if w != END or stoppable}
-        picks.append(max(scored, key=scored.get))
+        picks.append(pick(scored, stoppable)[0])
         if picked != END:
             words.append(picked)
     return picks
@@ -109,11 +110,12 @@ def test_lookalikes_are_not_repeats():
 
 def test_variant_loops_break():
     assert first_change(REPLAYS["Hi hey hi hey"]) == (2, "dunno")
-    assert first_change(REPLAYS["Yeah yes https https too is"]) == (2, "too")
+    # yes, yeah, yea and yep had 47% between them, so even penalised they outvote "too": a repeat, not a variant
+    assert first_change(REPLAYS["Yeah yes https https too is"]) == (2, "yeah")
     assert first_change(REPLAYS["Yes yeah"]) == (2, "dunno")
 
 def test_funny_replies_unchanged():
-    for reply in ["Google goo woo", "He 's annoying", "Yes no is no",
+    for reply in ["He 's annoying", "Yes no is no",
                   "Dunno a know is mean means knows skinny thin young gay"]:
         assert first_change(REPLAYS[reply]) is None, reply
 
@@ -173,6 +175,34 @@ def test_nothing_runs_break():
 def test_only_last_answers_count():
     old = ["Dunno", "Dunno", "Dunno"]
     assert first_word("Dunno? Dunno?", old + ["Yes", "No", "Hi"]) == "dunno"
+
+# Its ending goes on: whoa 4% and wow 3% outvote stopping at 6%. The sound-alikes still don't pool
+def test_google_goo_woo_whoa():
+    assert first_change(REPLAYS["Google goo woo"]) == (4, "whoa")
+
+# Near-synonyms vote together, so a split doesn't hand it to another word
+def test_similar_words_pool_their_vote():
+    assert pick({"um": .08, "uh": .07, "erm": .05, "cat": .1}, True) == ("um", False, ["uh", "erm"])
+    assert pick({"hmm": .06, "hm": .05, "cat": .1}, True)[0] == "hmm"
+    assert pick({"Yeah": .06, "yes": .05, "cat": .1}, True)[0] == "Yeah"
+    assert pick({"um": .08, "cat": .1}, True) == ("cat", False, [])
+    assert pick({"google": .06, "goo": .05, "cat": .1}, True)[0] == "cat"  # lookalikes aren't the same word
+
+# From the logs: "Closed.? Yes?" — yes 7%, yep 2%, yea 1%, yup 1% against "closed" at 8%
+def test_split_yes_wins():
+    top = {"closed": .08, "yes": .07, "no": .05, "is": .04, "yep": .02, "yea": .01, "yup": .01, "nope": .01}
+    assert pick(top, False) == ("yes", False, ["yep", "yea", "yup"])
+
+# ...but the words that say nothing don't: "Hello world am positive." kept "hello" at 19% over idk 18% + dunno 8%
+def test_nothing_words_do_not_pool():
+    top = {"hello": .19, "idk": .18, "i": .09, "dunno": .08, "no": .05, "nope": .01}
+    assert pick(top, False)[0] == "hello"
+    assert pick({"no": .06, "nah": .05, "cat": .1}, True)[0] == "cat"
+
+def test_endings_pool():
+    assert pick({END: .04, ".": .03, "?": .02, "cat": .06}, True) == (END, True, [".", "?"])
+    assert pick({END: .02, "?": .05, "cat": .06}, True) == ("?", True, [END])
+    assert pick({".": .04, "?": .03, "cat": .06}, False) == ("cat", False, [])  # can't stop yet
 
 
 if __name__ == "__main__":

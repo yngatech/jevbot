@@ -1,6 +1,7 @@
 """
 The chart !why posts: one panel per word of a reply, showing the candidates jev weighed for it — how likely the model
-thought each was, and its score once jev's penalties for repeating itself were applied. The best score was picked.
+thought each was, and its score once jev's penalties for repeating itself were applied. The best score was picked,
+with similar words adding up.
 """
 
 import io
@@ -29,8 +30,8 @@ def clip_start(text, n):
     return text if len(text) <= n else "…" + text[-(n - 1):]
 
 
-# panels: one per word, {"so_far": the reply before it, "picked": word, "ends": bool, "rows": [[word, prob, score]]}
-# with rows best score first. Returns PNG bytes.
+# panels: one per word, {"so_far": the reply before it, "picked": word, "ends": bool, "pooled": the words
+# that voted with it, "rows": [[word, prob, score]]} with rows best score first. Returns PNG bytes.
 def render(bot_name, reply, panels):
     cols = min(len(panels), COLUMNS)
     grid_rows = math.ceil(len(panels) / cols)
@@ -44,7 +45,8 @@ def render(bot_name, reply, panels):
              fontsize=18, fontweight="bold", color=INK, va="top", family=FONT)
     fig.text(0.012, 1 - 0.85 / fig.get_figheight(),
              "Wide pale bar: how likely the model thought the word was.   "
-             "Thin bar: its score after the penalties for repeating itself.   The best score wins (gold).",
+             "Thin bar: its score after the penalties for repeating itself.   "
+             "The best score wins (gold), with similar words adding up.",
              fontsize=10.5, color=INK2, va="top", family=FONT, wrap=True)
     fig.subplots_adjust(left=0.1 if cols > 1 else 0.3, right=0.98, bottom=0.3 / fig.get_figheight(),
                         top=1 - (header + 0.55) / fig.get_figheight(), wspace=0.6, hspace=0.9 / panel_h * 2)
@@ -76,7 +78,9 @@ def render(bot_name, reply, panels):
         for sp in ax.spines.values():
             sp.set_visible(False)
         so_far = f"{plain(bot_name)}: {clip_start(plain(p['so_far']), 22)}".rstrip()
-        note = "  ·  stop + . ! ? pooled" if p["ends"] else ""
+        pooled = p.get("pooled")
+        note = ("  ·  stop + . ! ? pooled" if p["ends"] else
+                f"  ·  {clip(' + '.join(label(w) for w in [p['picked']] + pooled), 24)} pooled" if pooled else "")
         ax.set_title(f"word {i + 1}{note}\n{so_far} ___", loc="left", fontsize=11, color=INK2, pad=8, family=FONT)
 
     out = io.BytesIO()
