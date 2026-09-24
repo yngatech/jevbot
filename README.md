@@ -46,7 +46,9 @@ python3 run.py
 
 ## Usage
 
-Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it. DMs are ignored entirely.
+Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
+
+DMs are ignored, except from the Discord user IDs listed in `dm_users.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments) — every message they DM jev gets answered, no mention needed. What's said in DMs never makes it into jev's status. Restart the bot to pick up changes.
 
 Ctrl-C (or SIGTERM) lets replies in progress finish first: jev stops taking new messages (it catches up on them next start) and exits once it's done. Ctrl-C again quits without finishing.
 
