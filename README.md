@@ -53,6 +53,8 @@ Mention jev or reply to jev's messages. Replies only — it won't respond to mes
 
 `!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for its emoji candidates as text. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
 
+Put `!nocontext` in a message to jev (`@jev !nocontext what's your favourite colour?`) and it answers with none of the channel's history in view, just that message. The message still goes into the history for later replies, without the `!nocontext`.
+
 DMs are ignored, except from the Discord user IDs listed in `dm_users.txt` (gitignored, create it next to `jev_bot.py`), one per line (`#` for comments) — every message they DM jev gets answered, no mention needed. What's said in DMs never makes it into jev's status. Restart the bot to pick up changes.
 
 Ctrl-C (or SIGTERM) lets replies in progress finish first: jev stops taking new messages (it catches up on them next start) and exits once it's done. Ctrl-C again quits without finishing.
