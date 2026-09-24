@@ -34,7 +34,10 @@ Create `.env`:
 ```
 DISCORD_TOKEN_JEV=your_discord_bot_token
 OPENROUTER_API_KEY=your_openrouter_key
+OPENROUTER_API_KEY_EVAL=another_openrouter_key
 ```
+
+`OPENROUTER_API_KEY` is the bot's; `jev_eval.py` uses `OPENROUTER_API_KEY_EVAL` instead, so each key can have its own credit limit on OpenRouter and their usage shows up separately.
 
 Enable **Message Content Intent** in Discord developer portal.
 
@@ -73,7 +76,7 @@ python jev_eval.py --save before.json     # on master
 python jev_eval.py --compare before.json  # on your branch
 ```
 
-A run costs ~$0.04. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
+A run costs ~$0.04, on `OPENROUTER_API_KEY_EVAL`. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
 
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
