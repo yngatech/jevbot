@@ -407,6 +407,28 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     return reaction
 
 
+# Near-synonyms split jev's vote: with "um" at 8%, "uh" at 7% and "erm" at 5% a word at 10% beats all three. So a
+# word votes for its SIMILAR group, the group with the most votes wins, and its best-scoring word is said. Same for
+# ending: ".", "!" and "?" are jev ending as much as <END> is. Apart, they split the vote to end and a word won
+# instead: where master ended, jev picked <END> 31% of the time with them in the vocab and 78% without ("Dunno
+# google" went on "for", "on", "type"). So they count together, and the reply ends with the mark if jev liked that
+# best ("Dunno forgot?"). Not the words that say nothing: pooled, "dunno idk" and "no nah nope" won where jev meant
+# something else ("idk" over "hello" at 19%), which undoes NOTHING_PENALTY.
+def vote(word, stoppable):
+    if stoppable and (word == END or word in SENTENCE_ENDS):
+        return END
+    return word if said_as(word) in NOTHING else same(word).lower()
+
+# The word jev says from scored ({word: score}), whether it ends the reply, and the others that voted with it
+def pick(scored, stoppable):
+    votes = defaultdict(float)
+    for w, s in scored.items():
+        votes[vote(w, stoppable)] += s
+    best = max(votes, key=votes.get)
+    group = sorted((w for w in scored if vote(w, stoppable) == best), key=scored.get, reverse=True)
+    return group[0], best == END, group[1:]
+
+
 # Words jev picks one at a time to continue state(words), until it stops, runs out, or has max_words (MAX_WORDS).
 # It can't stop before min_words (MIN_WORDS) real words. done_state(words), if given, is what the "is the reply
 # complete?" question sees instead of state(words). recent and exempt go to penalty().
@@ -446,15 +468,7 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
                 break
 
             ranked = sorted(scored.items(), key=lambda kv: -kv[1])
-            word = ranked[0][0]
-            # ".", "!" and "?" are jev ending as much as <END> is. Apart, they split the vote to end and a word won
-            # instead: where master ended, jev picked <END> 31% of the time with them in the vocab and 78% without
-            # ("Dunno google" went on "for", "on", "type"). So they count together, and the reply ends with the
-            # mark if jev liked that best ("Dunno forgot?")
-            ending = {w: s for w, s in scored.items() if w == END or w in SENTENCE_ENDS} if stoppable else {}
-            ends = sum(ending.values()) > max((s for w, s in scored.items() if w not in ending), default=0)
-            if ends:
-                word = max(ending, key=ending.get)
+            word, ends, pooled = pick(scored, stoppable)
 
             top3 = [(w, probs.get(w, 0)) for w, _ in ranked[:3]]
             log.info(f"  [{step+1:2d}] {word:12s}  {' '.join(f'{w}:{p:.0%}' for w,p in top3)}  done={complete:.2f}"
@@ -463,7 +477,7 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
             # Asked to pick from 33 countries jev said "No? Idk": "idk" at 23% scored below "no" at 4% after the echo
             # penalty, and the countries split their vote at ~3% each — the top five showed neither.
             likely = [w for w, _ in sorted(scored.items(), key=lambda kv: -probs[kv[0]]) if probs[w] >= 0.01]
-            steps.append({"word": word, "done": round(complete, 3), "ends": ends,
+            steps.append({"word": word, "done": round(complete, 3), "ends": ends, "pooled": pooled,
                           "top": [[w, round(probs[w], 3), round(scored[w], 3)]
                                   for w in dict.fromkeys([w for w, _ in ranked[:5]] + likely)]})
 
@@ -899,7 +913,8 @@ def why_panels(t):
         rows = [[w, p, rest[0] if rest else p / penalty(words, w, recent, exempt)] for w, p, *rest in s["top"]]
         rows.sort(key=lambda r: -r[2])
         keep = rows[:8] + [r for r in rows[8:] if r[0] == s["word"]]
-        panels.append({"so_far": render(words), "picked": s["word"], "ends": s.get("ends", False), "rows": keep})
+        panels.append({"so_far": render(words), "picked": s["word"], "ends": s.get("ends", False),
+                       "pooled": s.get("pooled", []), "rows": keep})
         if s["word"] != END:
             words.append(s["word"])
     return panels
