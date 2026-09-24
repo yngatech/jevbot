@@ -681,10 +681,17 @@ def attachment_tag(a):
     kind = (a.content_type or "").split("/")[0]
     return {"image": "[photo]", "video": "[video]", "audio": "[audio]"}.get(kind, "[file]")
 
-# m as jev sees it: without the mention if it's to jev, links as tags, and a tag for each attachment and sticker —
-# otherwise a photo on its own is an empty message, dropped or read as "hello"
+# "@jev !nocontext ..." answers with no history in view. Taken out of the text, so jev never sees it, and "nocontext"
+# never reaches the vocab from the message or, later, from the history.
+NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)", re.IGNORECASE)
+
+def no_context(m):
+    return should_respond(m) and NO_CONTEXT.search(strip_mention(m)) is not None
+
+# m as jev sees it: without the mention (and !nocontext) if it's to jev, links as tags, and a tag for each attachment
+# and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
 def message_text(m):
-    text = strip_mention(m) if should_respond(m) else m.content
+    text = NO_CONTEXT.sub("", strip_mention(m)) if should_respond(m) else m.content
     only = len(LINK.findall(text)) == 1
     text = LINK.sub(lambda l: link_tag(l[1], embed_for(l[1], m, only)), text)
     tags = [attachment_tag(a) for a in m.attachments] + [f"[sticker: {s.name}]" for s in m.stickers]
@@ -994,6 +1001,9 @@ async def handle(m, c):
     # The reply of jev's someone is answering, if it isn't already shown under the message it answered
     if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
         h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
+    if no_context(m):
+        h = []  # still in the history above, for the messages after it
+        note(no_context=True)
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
