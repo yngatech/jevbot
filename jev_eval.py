@@ -27,6 +27,7 @@ import asyncio
 import contextvars
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -331,6 +332,11 @@ async def main():
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="override a jev_bot setting for this run, e.g. HISTORY_CHATTER=8")
     args = ap.parse_args()
+    # Its own key, so eval spend has its own limit and usage on OpenRouter, apart from the bot's
+    eval_key = os.environ.get("OPENROUTER_API_KEY_EVAL")
+    if not eval_key:
+        ap.error("set OPENROUTER_API_KEY_EVAL in .env — evals don't use the bot's OPENROUTER_API_KEY")
+    j.HEADERS = {**j.HEADERS, "Authorization": f"Bearer {eval_key}"}
     for setting in args.set:
         name, value = setting.split("=", 1)
         if not hasattr(j, name):
