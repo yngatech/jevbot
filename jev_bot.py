@@ -373,6 +373,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     rng = random.Random()
     # Without past reactions — a run of them reads as a habit to keep up, and jev copies the last emoji
     state = transcript(message, author, bot_name, history, [], reactions=False, marked=True)
+    note(asked_transcript=state)  # for !context
     shuffled = list(emoji)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
@@ -712,13 +713,17 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
-def is_why(m):
-    return not m.author.bot and strip_mention(m).lower() == "!why"
+# !why and !context, on their own in a message — the command, or None
+COMMANDS = {"!why", "!context"}
 
-# m as a history entry, or None for messages that never go in one (bots, including jev itself, empty ones, and !why —
-# a reply to jev, so after a restart it came back as a message jev never answered)
+def command(m):
+    c = strip_mention(m).lower()
+    return c if not m.author.bot and c in COMMANDS else None
+
+# m as a history entry, or None for messages that never go in one (bots, including jev itself, empty ones, and
+# commands — often a reply to jev, so after a restart one came back as a message jev never answered)
 def history_entry(m):
-    if m.author.bot or is_why(m):
+    if m.author.bot or command(m):
         return None
     to_bot = should_respond(m)
     content = message_text(m) or ("hello" if to_bot else "")
@@ -854,7 +859,7 @@ async def catch_up():
         # Only what came after jev last replied or reacted here — anything older was left behind, not missed,
         # and answering it would walk back one more old message on every reconnect
         last = max((m.created_at for m in mine + handled), default=since)
-        unanswered = [m for m in found if m.created_at > last and should_respond(m)]
+        unanswered = [m for m in found if m.created_at > last and should_respond(m) and not command(m)]
         if unanswered:
             log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
             missed.append(max(unanswered, key=lambda m: m.created_at))
@@ -867,9 +872,9 @@ async def catch_up():
 async def on_message(m):
     if m.guild is None and m.author.id not in DM_USERS:
         return  # a DM from anyone else, or jev's own — not even kept as history
-    if is_why(m):
+    if cmd := command(m):
         if not stopping.is_set():
-            await why(m)
+            await (why if cmd == "!why" else context)(m)
         return
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
@@ -894,15 +899,16 @@ async def on_message_edit(before, after):
 # gets its candidates as text, since the chart's font has no emoji. Costs nothing: no API calls.
 WHY_DAYS = 7  # how many days of logs it looks back through
 
-# The latest log entry in the channel for an answer with candidates to show, or the one for `target` if given
-def find_trace(channel_id, target=None):
+# The latest log entry in the channel that has(), or the one for `target` if given — by default an answer with
+# candidates to show
+def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("reaction_candidates")):
     for path in sorted(LOG_DIR.glob("*.jsonl"), reverse=True)[:WHY_DAYS]:
         for line in reversed(path.read_text().splitlines()):
             try:
                 t = json.loads(line)
             except ValueError:
                 continue
-            if t.get("channel_id") != channel_id or not (t.get("steps") or t.get("reaction_candidates")):
+            if t.get("channel_id") != channel_id or not has(t):
                 continue
             if target is None:
                 return t
@@ -930,18 +936,22 @@ def why_panels(t):
             words.append(s["word"])
     return panels
 
-async def why(m):
-    target = None
-    if m.reference and m.reference.message_id:
-        target = m.reference.resolved
-        if not isinstance(target, discord.Message):  # not in discord.py's cache, or deleted
-            try:
-                target = await m.channel.fetch_message(m.reference.message_id)
-            except discord.HTTPException:
-                target = None
-        if target is None:
+# The message a command is a Discord reply to: None if it isn't a reply, False (having said so) if it can't be seen
+async def command_target(m):
+    if not (m.reference and m.reference.message_id):
+        return None
+    target = m.reference.resolved
+    if not isinstance(target, discord.Message):  # not in discord.py's cache, or deleted
+        try:
+            target = await m.channel.fetch_message(m.reference.message_id)
+        except discord.HTTPException:
             await m.reply("Can't see that message", mention_author=False)
-            return
+            return False
+    return target
+
+async def why(m):
+    if (target := await command_target(m)) is False:
+        return
     t = await asyncio.to_thread(find_trace, m.channel.id, target)
     if t is None:
         await m.reply("Nothing logged for that", mention_author=False)
@@ -959,6 +969,44 @@ async def why(m):
         await m.reply(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {cands}", mention_author=False,
                       allowed_mentions=discord.AllowedMentions.none())
         log.info(f"[WHY] reaction {t.get('reaction')}")
+
+
+# !context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,
+# the one it picked words from; for a reaction, the question check's, which chose reacting (messages to jev marked
+# "@jev", no past reactions). Entries logged without one (out of credit, or from before asked_transcript) get it
+# from their history again — which is logged at the end, so can show a reaction or reply that came in meanwhile.
+CONTEXT_LIMIT = 2000  # Discord's message length — a longer transcript goes as a file
+
+# A code block in someone's message would open or end ours
+def unfence(text):
+    return text.replace("```", "`\u200b``")
+
+def logged_context(t):
+    if t.get("reaction"):
+        return t.get("asked_transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [],
+                                                       reactions=False, marked=True)
+    return t.get("transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [])
+
+async def context(m):
+    if (target := await command_target(m)) is False:
+        return
+    t = await asyncio.to_thread(find_trace, m.channel.id, target,
+                                lambda t: "history" in t and (t.get("reply") or t.get("reaction")))
+    if t is None:
+        await m.reply("Nothing logged for that", mention_author=False)
+        return
+    what = f"reacting {t['reaction']} to" if t.get("reaction") else "replying to"
+    head = (f"What {t['bot_name']} saw before {what} \"{unfence(t['message'][:80])}\""
+            + (" (!nocontext)" if t.get("no_context") else ""))
+    text = logged_context(t)
+    body = f"{head}:\n```\n{unfence(text)}\n```"
+    # Quotes what people said, so no pings from mentions in it
+    if len(body) <= CONTEXT_LIMIT:
+        await m.reply(body, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await m.reply(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"), mention_author=False,
+                      allowed_mentions=discord.AllowedMentions.none())
+    log.info(f"[CONTEXT] {what} {t['message'][:40]!r}")
 
 
 async def respond(m, **extra):
