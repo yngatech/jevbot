@@ -6,9 +6,9 @@ with similar words adding up. For a reaction, one panel of the emoji it weighed.
 
 import io
 import math
-import re
 import unicodedata
 
+from matplotlib import font_manager
 from matplotlib.figure import Figure
 from matplotlib.image import imread
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
@@ -19,9 +19,12 @@ RAW, SCORE, PICKED = "#3a4a63", "#3987e5", "#eda100"
 COLUMNS = 4
 FONT = "DejaVu Sans"
 
-# DejaVu has no emoji, which would come out as boxes
+# DejaVu has no emoji, which would come out as boxes — the newer ones above U+FFFF, and older ones like ❌ and ❓
+# too, so anything the font has no glyph for goes
+GLYPHS = set(font_manager.get_font(font_manager.findfont(FONT)).get_charmap())
+
 def plain(text):
-    return re.sub(r"[\U00010000-\U0010ffff️]", "", text).strip()
+    return "".join(c for c in text if (ord(c) in GLYPHS or c.isspace()) and c not in "\u200d\ufe0f").strip()
 
 # An emoji with no image to show goes by its name ("face with tears of joy"); a server's own already has one
 def label(word):
@@ -43,8 +46,8 @@ EMOJI_PT = 16  # how tall an emoji's image is, in points
 # panels: one per word, {"so_far": the reply before it, "picked": word, "ends": bool, "pooled": the words
 # that voted with it, "rows": [[word, prob, score]]} with rows best score first. For a reaction, `reacted_to` is the
 # message and its one panel's so_far is who sent it. images: PNG bytes by emoji, shown in place of their labels.
-# Returns PNG bytes.
-def render(bot_name, reply, panels, reacted_to=None, images=None):
+# note: a line under the title. Returns PNG bytes.
+def render(bot_name, reply, panels, reacted_to=None, images=None, note=None):
     images = {e: imread(io.BytesIO(png), format="png") for e, png in (images or {}).items()}
     cols = min(len(panels), COLUMNS)
     grid_rows = math.ceil(len(panels) / cols)
@@ -53,13 +56,17 @@ def render(bot_name, reply, panels, reacted_to=None, images=None):
     xmax = max(top * 100 * 1.55, 10)  # room for the "23% → 2.9%" labels
 
     header, panel_h = 1.25 if reacted_to is None else 1.55, 1.0 + 0.4 * bars  # one panel wraps the key to 3 lines
+    below = 0.4 if note else 0  # the key moves down for the note
+    header += below
     fig = Figure(figsize=(4 * cols, header + panel_h * grid_rows + 0.3), facecolor=BG)
     # A reaction's message goes over its panel — one panel is too narrow for it in the title
     title = f"Why {plain(bot_name)} reacted" if reacted_to is not None else f'Why {plain(bot_name)} said "{plain(reply)}"'
     fig.text(0.012, 1 - 0.3 / fig.get_figheight(), clip(title, 20 * cols),
              fontsize=18, fontweight="bold", color=INK, va="top", family=FONT)
+    if note:
+        fig.text(0.012, 1 - 0.8 / fig.get_figheight(), note, fontsize=12, color=INK, va="top", family=FONT)
     noun = "word" if reacted_to is None else "emoji"
-    fig.text(0.012, 1 - 0.85 / fig.get_figheight(),
+    fig.text(0.012, 1 - (0.85 + below) / fig.get_figheight(),
              f"Wide pale bar: how likely the model thought the {noun} was.   "
              "Thin bar: its score after the penalties for repeating itself.   "
              + ("The best score wins (gold), with similar words adding up." if reacted_to is None
@@ -83,7 +90,9 @@ def render(bot_name, reply, panels, reacted_to=None, images=None):
                     va="center", fontsize=9.5, color=INK if k else INK2, fontweight="bold" if k else "normal",
                     family=FONT)
         ax.tick_params(colors=MUTED, length=0, labelsize=9)
-        ax.set_yticks(list(y), ["" if w in images else clip(label(w), 14) for w, _, _ in rows], fontsize=11, family=FONT)
+        # A reaction's one panel has less room to its left than a reply's — and emoji names run long
+        n = 14 if reacted_to is None else 11
+        ax.set_yticks(list(y), ["" if w in images else clip(label(w), n) for w, _, _ in rows], fontsize=11, family=FONT)
         for yy, (w, _, _) in zip(y, rows):
             if (img := images.get(w)) is not None:
                 ax.add_artist(AnnotationBbox(OffsetImage(img, zoom=EMOJI_PT / max(img.shape[:2])), (0, yy),

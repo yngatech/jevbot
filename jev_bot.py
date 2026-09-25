@@ -7,6 +7,7 @@ This is the version that produced "I depends on on situation of circumstances."
 
 import io
 import os
+import math
 import re
 import json
 import time
@@ -971,6 +972,14 @@ async def command_target(m):
             return False
     return target
 
+# The question check that chose between replying and reacting, and how close it came to going the other way
+def asked_note(t, bot_name):
+    if (asked := t.get("asked")) is None:
+        return None
+    side = f"reacts below {REACT_THRESHOLD:.0%}" if t.get("reaction") else f"replies from {REACT_THRESHOLD:.0%}"
+    # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
+    return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
+
 async def why(m):
     if (target := await command_target(m)) is False:
         return
@@ -980,7 +989,8 @@ async def why(m):
         return
     bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
     if t.get("steps"):
-        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t))
+        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t),
+                                      note=asked_note(t, bot_name))
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
         log.info(f"[WHY] chart for {t.get('reply')!r}")
     elif isinstance(t["reaction_candidates"][0], str):
@@ -995,7 +1005,8 @@ async def why(m):
             images = await asyncio.gather(*(emoji_image(session, e, m.guild) for e, _, _ in rows))
         panel = {"so_far": t.get("author") or "", "picked": t.get("reaction"), "ends": False, "rows": rows}
         png = await asyncio.to_thread(why_chart.render, bot_name, "", [panel], reacted_to=t["message"],
-                                      images={e: img for (e, _, _), img in zip(rows, images) if img})
+                                      images={e: img for (e, _, _), img in zip(rows, images) if img},
+                                      note=asked_note(t, bot_name))
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
         log.info(f"[WHY] chart for reaction {t.get('reaction')}")
 
