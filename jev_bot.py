@@ -7,6 +7,7 @@ This is the version that produced "I depends on on situation of circumstances."
 
 import io
 import os
+import math
 import re
 import json
 import time
@@ -895,9 +896,31 @@ async def on_message_edit(before, after):
 
 
 # !why: what jev weighed for one of its answers, from the logs — the reply the !why is a Discord reply to (or the
-# message it reacted to), or on its own jev's latest answer in the channel. A reply gets why_chart's chart; a reaction
-# gets its candidates as text, since the chart's font has no emoji. Costs nothing: no API calls.
+# message it reacted to), or on its own jev's latest answer in the channel, as why_chart's chart. Costs nothing: no
+# API calls.
 WHY_DAYS = 7  # how many days of logs it looks back through
+
+# The chart's font has no emoji, so a reaction's are drawn from images: Twemoji's, which Discord's are, and the
+# server's own from Discord. Kept for as long as jev runs; one that can't be fetched is shown by name instead.
+TWEMOJI = "https://cdn.jsdelivr.net/gh/jdecked/twemoji@17.0.3/assets/72x72/{}.png"
+emoji_images: dict[str, bytes] = {}
+
+def emoji_url(e, guild):
+    if e.startswith(":"):
+        custom = guild and discord.utils.get(guild.emojis, name=e.strip(":"))
+        return custom and f"https://cdn.discordapp.com/emojis/{custom.id}.png?size=64"  # .png: animated ones too
+    # Twemoji's file names: the code points, without the variation selector unless it's a sequence joined by ZWJ
+    return TWEMOJI.format("-".join(f"{ord(c):x}" for c in (e if "\u200d" in e else e.replace("\ufe0f", ""))))
+
+async def emoji_image(session, e, guild):
+    if (url := emoji_url(e, guild)) and url not in emoji_images:
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as r:
+                r.raise_for_status()
+                emoji_images[url] = await r.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+            log.warning(f"Fetching {e} failed: {ex.status if isinstance(ex, aiohttp.ClientResponseError) else repr(ex)}")
+    return emoji_images.get(url)
 
 # The latest log entry in the channel that has(), or the one for `target` if given — by default an answer with
 # candidates to show
@@ -949,6 +972,14 @@ async def command_target(m):
             return False
     return target
 
+# The question check that chose between replying and reacting, and how close it came to going the other way
+def asked_note(t, bot_name):
+    if (asked := t.get("asked")) is None:
+        return None
+    side = f"reacts below {REACT_THRESHOLD:.0%}" if t.get("reaction") else f"replies from {REACT_THRESHOLD:.0%}"
+    # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
+    return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
+
 async def why(m):
     if (target := await command_target(m)) is False:
         return
@@ -958,17 +989,26 @@ async def why(m):
         return
     bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
     if t.get("steps"):
-        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t))
+        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t),
+                                      note=asked_note(t, bot_name))
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
         log.info(f"[WHY] chart for {t.get('reply')!r}")
-    else:
-        # [emoji, probability, score], likeliest first
-        cands = "  ".join(f"{e} {p:.0%}" + (f" → {s:.1%}" if round(p, 3) != round(s, 3) else "")
-                          for e, p, s in t["reaction_candidates"])
+    elif isinstance(t["reaction_candidates"][0], str):
+        # Entries from before their probabilities were logged: just the emoji, likeliest first
         # Quotes what someone said, so no pings from mentions in it
-        await m.reply(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {cands}", mention_author=False,
-                      allowed_mentions=discord.AllowedMentions.none())
+        await m.reply(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {' '.join(t['reaction_candidates'])}",
+                      mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         log.info(f"[WHY] reaction {t.get('reaction')}")
+    else:
+        rows = sorted(t["reaction_candidates"], key=lambda r: -r[2])  # [emoji, probability, score], best score first
+        async with aiohttp.ClientSession() as session:
+            images = await asyncio.gather(*(emoji_image(session, e, m.guild) for e, _, _ in rows))
+        panel = {"so_far": t.get("author") or "", "picked": t.get("reaction"), "ends": False, "rows": rows}
+        png = await asyncio.to_thread(why_chart.render, bot_name, "", [panel], reacted_to=t["message"],
+                                      images={e: img for (e, _, _), img in zip(rows, images) if img},
+                                      note=asked_note(t, bot_name))
+        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        log.info(f"[WHY] chart for reaction {t.get('reaction')}")
 
 
 # !context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,

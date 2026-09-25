@@ -51,7 +51,7 @@ python3 run.py
 
 Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
 
-`!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for its emoji candidates as text. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
+`!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for a chart of the emoji it weighed. The chart's font has no emoji, so those are drawn from images: [Twemoji](https://github.com/jdecked/twemoji)'s, the set Discord uses, and the server's own emoji from Discord; one that can't be fetched is shown by name. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
 
 `!context` posts what jev had in view for its latest answer in the channel: the transcript it was given, history and all, ending in its own empty turn. Send it as a Discord reply to one of jev's replies, or to a message jev reacted to, for that one. For a reply it's the transcript jev picked words from; for a reaction, the one the question check saw when it chose to react (messages to jev marked `@jev`, no past reactions). A long one comes as `context.txt`. Like `!why`, it reads `logs/` and costs nothing.
 
