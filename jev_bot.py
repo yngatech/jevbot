@@ -32,6 +32,7 @@ load_dotenv()
 
 TOKEN = os.environ["DISCORD_TOKEN_JEV"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
+STATUS_CHANNEL = int(os.environ.get("STATUS_CHANNEL_ID") or 0)  # where each new status is also posted — unset for nowhere
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
 END = "<END>"
@@ -820,6 +821,7 @@ async def update_status():
         status = discord.CustomActivity(name=mood)
         save_status(mood, n, t["at"])
         await show_credit()
+        await post_status(mood)
         t["status"] = mood
         log.info(f"[STATUS] {mood} (${t['cost']:.5f})")
     except Exception as e:  # keep the old status and try again next time — an uncaught error would end the loop
@@ -828,6 +830,17 @@ async def update_status():
     finally:
         t["seconds"] = round(time.monotonic() - start, 1)
         write_trace(t)
+
+# A status is gone when the next comes, so each is also posted in STATUS_CHANNEL, to keep and react to. jev's own
+# messages never enter the history, so a posted status isn't in the next one's recent chat.
+async def post_status(mood):
+    if not STATUS_CHANNEL:
+        return
+    try:
+        channel = bot.get_channel(STATUS_CHANNEL) or await bot.fetch_channel(STATUS_CHANNEL)
+        await channel.send(mood, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:  # the status itself is already showing
+        log.warning(f"Posting the status in {STATUS_CHANNEL} failed: {e}")
 
 @update_status.before_loop
 async def wait_for_status():  # the kept status stays until it's due
