@@ -70,7 +70,7 @@ NOTHING_PENALTY = 3.0
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
 STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each) — 0 to leave the status alone
-STATUS_MIN_WORDS = 6            # a short status is just "Fine thanks" — the soup comes from making it keep going
+STATUS_MIN_WORDS = 4            # a short status is just "Fine thanks" — the soup comes from making it keep going
 STATUS_MAX_WORDS = 12
 STATUS_CHAT = 8                 # recent messages from the latest active channel, in view for every other status — 0 for none
 # Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
