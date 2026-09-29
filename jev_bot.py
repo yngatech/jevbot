@@ -777,9 +777,12 @@ async def on_ready():
 # 3 starts, alternating chat: each start gets a turn with and without it.
 # The latest is kept in STATUS_PATH, so a restart shows it again instead of paying for a new one, and the next
 # comes when it's due — with the next start, not "I feel" every time.
+# One is only made once someone has said something in a server since the last (or since jev started), so a quiet
+# night doesn't cost anything or fill STATUS_CHANNEL with statuses talking to nobody.
 STATUS_PATH = Path(__file__).parent / "status.json"
 status_turn = 0      # which start and chat the next status gets
 status_at = None     # when the kept one was made
+heard = False        # whether someone has spoken since then
 
 def load_status():
     global status, status_turn, status_at
@@ -804,9 +807,13 @@ if STATUS_EVERY:
 
 @tasks.loop(minutes=STATUS_EVERY or 1)
 async def update_status():
-    global status, status_turn
+    global status, status_turn, heard
     if has_credit is False:  # showing "out of credit" — and every request would fail anyway
         return
+    if not heard:
+        log.info("[STATUS] nobody's spoken since the last, keeping it")
+        return
+    heard = False  # before making it, so a message that comes meanwhile counts for the next
     bot_name = bot.user.display_name
     t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": None, "cost": 0.0, "requests": 0}
     trace.set(t)
@@ -817,6 +824,7 @@ async def update_status():
             chat = recent_chat() if n % 2 else ""
             mood = await generate_status(bot_name, STATUS_STARTS[n % len(STATUS_STARTS)], chat)
         if not mood:  # the API didn't answer — keep the old status rather than a bare "I feel"
+            heard = True
             return
         status = discord.CustomActivity(name=mood)
         save_status(mood, n, t["at"])
@@ -826,6 +834,7 @@ async def update_status():
         log.info(f"[STATUS] {mood} (${t['cost']:.5f})")
     except Exception as e:  # keep the old status and try again next time — an uncaught error would end the loop
         log.error(f"Status error: {e}", exc_info=True)
+        heard = True
         t["error"] = repr(e)
     finally:
         t["seconds"] = round(time.monotonic() - start, 1)
@@ -884,8 +893,11 @@ async def catch_up():
 
 @bot.event
 async def on_message(m):
+    global heard
     if m.guild is None and m.author.id not in DM_USERS:
         return  # a DM from anyone else, or jev's own — not even kept as history
+    if m.guild and not m.author.bot:  # not jev's own posts, or each status would earn the next
+        heard = True
     if cmd := command(m):
         if not stopping.is_set():
             await (why if cmd == "!why" else context)(m)
