@@ -815,7 +815,8 @@ async def update_status():
         return
     heard = False  # before making it, so a message that comes meanwhile counts for the next
     bot_name = bot.user.display_name
-    t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": None, "cost": 0.0, "requests": 0}
+    t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": None, "bot_name": bot_name,
+         "cost": 0.0, "requests": 0}
     trace.set(t)
     start = time.monotonic()
     try:
@@ -829,8 +830,8 @@ async def update_status():
         status = discord.CustomActivity(name=mood)
         save_status(mood, n, t["at"])
         await show_credit()
-        await post_status(mood)
         t["status"] = mood
+        await post_status(mood)
         log.info(f"[STATUS] {mood} (${t['cost']:.5f})")
     except Exception as e:  # keep the old status and try again next time — an uncaught error would end the loop
         log.error(f"Status error: {e}", exc_info=True)
@@ -841,13 +842,15 @@ async def update_status():
         write_trace(t)
 
 # A status is gone when the next comes, so each is also posted in STATUS_CHANNEL, to keep and react to. jev's own
-# messages never enter the history, so a posted status isn't in the next one's recent chat.
+# messages never enter the history, so a posted status isn't in the next one's recent chat. Its id is logged, so
+# !why and !context can find it.
 async def post_status(mood):
     if not STATUS_CHANNEL:
         return
     try:
         channel = bot.get_channel(STATUS_CHANNEL) or await bot.fetch_channel(STATUS_CHANNEL)
-        await channel.send(mood, allowed_mentions=discord.AllowedMentions.none())
+        sent = await channel.send(mood, allowed_mentions=discord.AllowedMentions.none())
+        note(status_id=sent.id)
     except Exception as e:  # the status itself is already showing
         log.warning(f"Posting the status in {STATUS_CHANNEL} failed: {e}")
 
@@ -947,8 +950,14 @@ async def emoji_image(session, e, guild):
             log.warning(f"Fetching {e} failed: {ex.status if isinstance(ex, aiohttp.ClientResponseError) else repr(ex)}")
     return emoji_images.get(url)
 
-# The latest log entry in the channel that has(), or the one for `target` if given — by default an answer with
-# candidates to show
+# Whether a log entry is for something jev did in the channel: an answer there, or in STATUS_CHANNEL a status
+def in_channel(t, channel_id):
+    if "channel_id" in t:
+        return t["channel_id"] == channel_id
+    return bool(t.get("status")) and channel_id == STATUS_CHANNEL
+
+# The latest log entry in the channel that has(), or the one for `target` if given — by default an answer or status
+# with candidates to show
 def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("reaction_candidates")):
     for path in sorted(LOG_DIR.glob("*.jsonl"), reverse=True)[:WHY_DAYS]:
         for line in reversed(path.read_text().splitlines()):
@@ -956,13 +965,16 @@ def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("r
                 t = json.loads(line)
             except ValueError:
                 continue
-            if t.get("channel_id") != channel_id or not has(t):
+            if not in_channel(t, channel_id) or not has(t):
                 continue
             if target is None:
                 return t
             if target.author.id == bot.user.id:
-                # Entries from before reply_id was logged: the reply's text instead
-                if t.get("reply_id", target.id) == target.id and t.get("reply") == target.content:
+                # Entries from before reply_id (or status_id) was logged: the text instead
+                if "status" in t:
+                    if t.get("status_id", target.id) == target.id and t["status"] == target.content:
+                        return t
+                elif t.get("reply_id", target.id) == target.id and t.get("reply") == target.content:
                     return t
             elif t.get("message_id") == target.id or ("message_id" not in t
                                                       and t.get("message") == (message_text(target) or "hello")):
@@ -970,10 +982,15 @@ def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("r
     return None
 
 # One why_chart panel per word jev picked. Entries from before scores were logged get them from penalty() again,
-# with the history they logged.
+# with the history they logged. A status's words come after its start, which it was given.
 def why_panels(t):
-    recent, exempt = recent_answers(t.get("history")), said_in(t["message"])
-    words, panels = [], []
+    if "status" in t:
+        recent, exempt = (), ()  # generate_status() doesn't pass them
+        words = list(next((s for s in STATUS_STARTS if t["status"].startswith(render(s))), []))
+    else:
+        recent, exempt = recent_answers(t.get("history")), said_in(t["message"])
+        words = []
+    panels = []
     for s in t["steps"]:
         rows = [[w, p, rest[0] if rest else p / penalty(words, w, recent, exempt)] for w, p, *rest in s["top"]]
         rows.sort(key=lambda r: -r[2])
@@ -1014,10 +1031,10 @@ async def why(m):
         return
     bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
     if t.get("steps"):
-        png = await asyncio.to_thread(why_chart.render, bot_name, t.get("reply") or "", why_panels(t),
-                                      note=asked_note(t, bot_name))
+        said = t.get("reply") or t.get("status") or ""
+        png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
-        log.info(f"[WHY] chart for {t.get('reply')!r}")
+        log.info(f"[WHY] chart for {t.get('reply') or t.get('status')!r}")
     elif isinstance(t["reaction_candidates"][0], str):
         # Entries from before their probabilities were logged: just the emoji, likeliest first
         # Quotes what someone said, so no pings from mentions in it
@@ -1038,8 +1055,9 @@ async def why(m):
 
 # !context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,
 # the one it picked words from; for a reaction, the question check's, which chose reacting (messages to jev marked
-# "@jev", no past reactions). Entries logged without one (out of credit, or from before asked_transcript) get it
-# from their history again — which is logged at the end, so can show a reaction or reply that came in meanwhile.
+# "@jev", no past reactions); for a status, its diary entry, with any recent chat. Entries logged without one (out
+# of credit, or from before asked_transcript) get it from their history again — which is logged at the end, so can
+# show a reaction or reply that came in meanwhile.
 CONTEXT_LIMIT = 2000  # Discord's message length — a longer transcript goes as a file
 
 # A code block in someone's message would open or end ours
@@ -1047,6 +1065,8 @@ def unfence(text):
     return text.replace("```", "`\u200b``")
 
 def logged_context(t):
+    if "status" in t:
+        return t["transcript"]
     if t.get("reaction"):
         return t.get("asked_transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [],
                                                        reactions=False, marked=True)
@@ -1056,13 +1076,20 @@ async def context(m):
     if (target := await command_target(m)) is False:
         return
     t = await asyncio.to_thread(find_trace, m.channel.id, target,
-                                lambda t: "history" in t and (t.get("reply") or t.get("reaction")))
+                                lambda t: "history" in t and (t.get("reply") or t.get("reaction"))
+                                or t.get("status") and "transcript" in t)
     if t is None:
         await m.reply("Nothing logged for that", mention_author=False)
         return
-    what = f"reacting {t['reaction']} to" if t.get("reaction") else "replying to"
-    head = (f"What {t['bot_name']} saw before {what} \"{unfence(t['message'][:80])}\""
-            + (" (!nocontext)" if t.get("no_context") else ""))
+    # Statuses from before bot_name was logged: the name now
+    bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
+    if "status" in t:
+        what = "its status"
+        head = f"What {bot_name} saw before the status \"{unfence(t['status'])}\""
+    else:
+        what = f"reacting {t['reaction']} to" if t.get("reaction") else "replying to"
+        head = (f"What {bot_name} saw before {what} \"{unfence(t['message'][:80])}\""
+                + (" (!nocontext)" if t.get("no_context") else ""))
     text = logged_context(t)
     body = f"{head}:\n```\n{unfence(text)}\n```"
     # Quotes what people said, so no pings from mentions in it
@@ -1071,7 +1098,7 @@ async def context(m):
     else:
         await m.reply(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"), mention_author=False,
                       allowed_mentions=discord.AllowedMentions.none())
-    log.info(f"[CONTEXT] {what} {t['message'][:40]!r}")
+    log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
 
 
 async def respond(m, **extra):
