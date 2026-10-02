@@ -74,6 +74,8 @@ STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each
 STATUS_MIN_WORDS = 4            # a short status is just "Fine thanks" — the soup comes from making it keep going
 STATUS_MAX_WORDS = 12
 STATUS_CHAT = 8                 # recent messages from the latest active channel, in view for every other status — 0 for none
+STATUS_ATTEMPTS = 3             # keep the previous status if this many candidates fail the meaning check
+STATUS_THRESHOLD = 0.6          # P(the finished status makes sense on its own), allowing jev's broken wording
 # Bare "Next word?" reads as "which word fits this?" — jev described its reply ("empty", "silent", "garbled")
 # instead of continuing it, but "Next word of {bot_name}'s reply?" didn't help live and made <END> far likelier
 NEXT_WORD = "Next word?"
@@ -535,6 +537,74 @@ async def generate_status(bot_name, start, chat=""):
     return render(start + words)[:128] if words else None  # 128: Discord's custom status limit
 
 
+# The judge sees only the finished status, so unseen chat cannot rescue an otherwise meaningless sentence.
+STATUS_RUBRIC = '''Judge a word-by-word generated diary status posted on its own. Its readers cannot see the conversation that inspired it. Accept a status when a reader can recover a feeling, thought, topic, or question from the words themselves. It may be silly, vague, repetitive, philosophical, or grammatically broken. It need not be informative, original, or polished.
+Ignore spelling mistakes, broken grammar, weird punctuation, repetition, and a few stray words. Read the whole status. Extra words can add a compatible thought, emphasis, humour, or uncertainty; they must not turn the status into uninterpretable question fragments or unrelated words. Do not rescue a broken sentence by imagining what its writer was responding to. A clear opening alone does not rescue a tail that loses the thought.
+An explicit feeling can stand alone: feeling strange and not knowing why is meaningful. A self-contained philosophical thought or understandable question can also stand alone. Conversely, "how it happens" with no identifiable subject, "what this means" with no intelligible thought, or a chain of "what", "is", "about", and "means" may only look like a response to unseen context. Such fragments do not make a useful standalone status.
+Examples:
+Accept: "I'm thinking about dinner hi for i about tonight what we have fridge and of" — tonight's dinner and what's in the fridge.
+Accept: "I feel hot weird strange? Why dunno?" — feels hot and strange, doesn't know why.
+Accept: "I'm thinking about something about life meaning is of matter matters." — life's meaning and what matters.
+Accept: "I wonder what does mean it? Means meaning itself is itself." — a philosophical thought about meaning itself.
+Accept: "I wonder what is happening?.? Dunno confusion confused" — wonders what's happening and expresses confusion.
+Accept: "I'm thinking about about boxing about boxing." — repetitive but clearly about boxing.
+Borderline: "I feel good. And also else." — a feeling followed by empty filler.
+Borderline: "I'm thinking about something about thing of thing." — too vague to identify a topic.
+Reject: "I wonder what is how mean means" — no recoverable question.
+Reject: "I feel fine. Period. Sans. Fat" — a feeling followed by unrelated words.
+Reject: "I'm thinking about about what the about of the of" — empty connective words.
+'''
+STATUS_QUESTION = ('Does this work as a meaningful standalone diary status under the rubric? Judge only the actual '
+                   'words. Do not assume any unseen source conversation. Borderline statuses may pass if they '
+                   'contain a recoverable thought.')
+
+
+async def status_score(mood):
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        answers = await post(session, STATUS_RUBRIC + '\nStatus to judge: ' + json.dumps(mood),
+                             {"acceptable": {"type": "noul", "instructions": STATUS_QUESTION}})
+    answer = answers.get("acceptable", {})
+    score = answer.get("noul") if isinstance(answer, dict) else None
+    # Missing or malformed decisions must not publish a candidate or spend more on regeneration.
+    return score if type(score) in (int, float) and math.isfinite(score) and 0 <= score <= 1 else None
+
+
+async def generate_filtered_status(bot_name, start, chat=""):
+    parent = trace.get()
+    attempts = []
+    note(status_attempts=attempts)
+    for _ in range(STATUS_ATTEMPTS):
+        attempt = {"status": None, "score": None, "accepted": False, "cost": 0.0, "requests": 0}
+        attempts.append(attempt)
+        token = trace.set(attempt)
+        try:
+            mood = await generate_status(bot_name, start, chat)
+            attempt["status"] = mood
+            if not mood or has_credit is False:
+                return None
+            score = await status_score(mood)
+            attempt["score"] = score
+            if score is None or has_credit is False:
+                return None
+            attempt["accepted"] = score >= STATUS_THRESHOLD
+            log.info(f"[STATUS] candidate {len(attempts)}/{STATUS_ATTEMPTS}: {mood} "
+                     f"(meaning={score:.2f}, {'accepted' if attempt['accepted'] else 'rejected'})")
+            if attempt["accepted"]:
+                # !why and !context keep using the accepted generation, while the full retry history stays local.
+                if parent is not None:
+                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop") if k in attempt})
+                    parent["status_score"] = score
+                return mood
+        finally:
+            trace.reset(token)
+            if parent is not None:
+                parent["cost"] += attempt["cost"]
+                parent["requests"] += attempt["requests"]
+                if "error" in attempt:
+                    parent["error"] = attempt["error"]
+    return None
+
+
 # DMs: only from the Discord user IDs in dm_users.txt (gitignored, one per line, "#" comments) — every reply costs
 # credit, and nobody else sees what's said in private. Restart the bot to pick up changes.
 DM_USERS_PATH = Path(__file__).parent / "dm_users.txt"
@@ -823,8 +893,8 @@ async def update_status():
         async with gen_lock:  # after any reply in progress, not alongside it
             n, status_turn = status_turn, status_turn + 1
             chat = recent_chat() if n % 2 else ""
-            mood = await generate_status(bot_name, STATUS_STARTS[n % len(STATUS_STARTS)], chat)
-        if not mood:  # the API didn't answer — keep the old status rather than a bare "I feel"
+            mood = await generate_filtered_status(bot_name, STATUS_STARTS[n % len(STATUS_STARTS)], chat)
+        if not mood:  # no acceptable candidate, or the API didn't answer — keep the old status
             heard = True
             return
         status = discord.CustomActivity(name=mood)
