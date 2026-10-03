@@ -838,25 +838,9 @@ async def on_ready():
         await set_credit(left > 0)
     await show_credit()  # a reconnect starts over as online, with no status — put the latest back
     await catch_up()
-    await say_hi()
     # on_ready runs again after a reconnect, so only start it the first time
     if STATUS_EVERY and not update_status.is_running():
         update_status.start()
-
-# Say hi in general once — HI_PATH remembers it was said, so a restart or reconnect doesn't say it again
-HI_CHANNEL = 502527924772012033  # 👋-kontri-pipo-generalé
-HI_PATH = Path(__file__).parent / "said_hi"
-
-async def say_hi():
-    if HI_PATH.exists():
-        return
-    try:
-        channel = bot.get_channel(HI_CHANNEL) or await bot.fetch_channel(HI_CHANNEL)
-        await channel.send("hi")
-        HI_PATH.touch()
-        log.info(f"Said hi in {HI_CHANNEL}")
-    except Exception as e:
-        log.warning(f"Saying hi in {HI_CHANNEL} failed: {e}")
 
 # A new custom status for jev, shown in every server and on its profile. The starts take turns, and every other
 # status has recent chat in view (and its words in the vocab) — so it can say what people said, anywhere jev is.
