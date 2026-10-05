@@ -42,7 +42,7 @@ QUESTIONS_PER_CALL = 20
 TOP_PER_BUCKET = 2
 MAX_WORDS = 30
 MIN_WORDS = 2
-HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, replies) in the transcript
+HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged replies) in the transcript
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
@@ -110,7 +110,7 @@ def write_trace(t):
     except OSError as e:
         log.warning(f"Writing {LOG_DIR} failed: {e}")
 
-# History: recent messages per channel, oldest first. "to_bot" marks the ones that mentioned or replied to jev.
+# History: recent messages per channel, oldest first. "to_bot" marks the ones that mentioned jev.
 channel_history: dict[int, list[dict]] = defaultdict(list)
 dm_channels: set[int] = set()  # channels in channel_history that are DMs, kept out of the status
 
@@ -782,7 +782,7 @@ def should_respond(m):
     if m.guild is None: return m.author.id in DM_USERS  # in a DM, every message is to jev
     if bot.user in m.mentions: return True
     if (role := bot_role(m)) and role in m.role_mentions: return True
-    return replied_to_bot(m) is not None
+    return False  # replying with the author ping off doesn't ask jev to respond
 
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
