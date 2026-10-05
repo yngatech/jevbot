@@ -10,11 +10,14 @@ shows what it goes on to say).
     python test_penalty.py      # or: uv run --with pytest --with-requirements requirements.txt pytest test_penalty.py
 """
 
+import asyncio
 import os
+from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "test")
 
+import jev_bot as j  # noqa: E402
 from jev_bot import END, MIN_WORDS, is_word, penalty, pick, recent_answers, render, said_in  # noqa: E402
 
 # reply: [(word picked, [(candidate, raw probability), ...]), ...] — "top" from logs/*.jsonl
@@ -101,6 +104,8 @@ def test_variants_count_as_repeats():
     assert penalty(["hi"], "hey") == penalty(["hi"], "hi")
     assert penalty(["yeah", "yes"], "yea") == penalty(["yeah", "yeah"], "yeah")
     assert penalty(["Yeah"], "yep") == penalty(["yeah"], "yeah")
+    assert penalty(["um"], "uh") == penalty(["um"], "um") > 1
+    assert penalty(["hmm"], "hmmm") == penalty(["hmm"], "hmm") > 1
 
 def test_lookalikes_are_not_repeats():
     assert penalty(["google"], "goo") == 1
@@ -182,11 +187,35 @@ def test_google_goo_woo_whoa():
 
 # Near-synonyms vote together, so a split doesn't hand it to another word
 def test_similar_words_pool_their_vote():
-    assert pick({"um": .08, "uh": .07, "erm": .05, "cat": .1}, True) == ("um", False, ["uh", "erm"])
-    assert pick({"hmm": .06, "hm": .05, "cat": .1}, True)[0] == "hmm"
     assert pick({"Yeah": .06, "yes": .05, "cat": .1}, True)[0] == "Yeah"
-    assert pick({"um": .08, "cat": .1}, True) == ("cat", False, [])
     assert pick({"google": .06, "goo": .05, "cat": .1}, True)[0] == "cat"  # lookalikes aren't the same word
+
+
+def test_fillers_compete_individually():
+    assert pick({"um": .08, "uh": .07, "erm": .05, "uhh": .04, "umm": .03, "cat": .1}, True) == ("cat", False, [])
+    assert pick({"hmm": .06, "hm": .05, "hmmm": .04, "cat": .1}, False) == ("cat", False, [])
+    assert pick({"Uh": .12, "um": .08, "cat": .1}, True) == ("Uh", False, [])
+    assert pick({"hmm": .12, "hm": .05, "cat": .1}, True) == ("hmm", False, [])
+
+
+def test_loom_does_not_pool_fillers():
+    next_word = AsyncMock(side_effect=[
+        ({"um": .08, "uh": .07, "erm": .05, "cat": .1}, 0),
+        ({"hmm": .06, "hm": .05, "purrs": .1}, 0),
+        ({END: .04, ".": .03, "?": .02, "loudly": .06}, 0),
+    ])
+    t = {"cost": 0, "requests": 0}
+    token = j.trace.set(t)
+    try:
+        with patch.object(j, "next_word", next_word):
+            words = asyncio.run(j.loom(lambda words: render(words), [], "Next word?", max_words=3))
+        assert render(words) == "Cat purrs"
+        assert [s["word"] for s in t["steps"]] == ["cat", "purrs", END]
+        assert [s["pooled"] for s in t["steps"][:2]] == [[], []]
+        assert t["steps"][-1]["ends"]
+        assert t["steps"][-1]["pooled"] == [".", "?"]
+    finally:
+        j.trace.reset(token)
 
 # From the logs: "Closed.? Yes?" — yes 7%, yep 2%, yea 1%, yup 1% against "closed" at 8%
 def test_split_yes_wins():

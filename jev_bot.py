@@ -229,6 +229,8 @@ SIMILAR = ["yes yeah yea yep yup ya yah yeh ye yas", "no nah nope naw", "hi hey 
            "ok okay k kk okey", "lol lmao lmfao haha hahaha rofl", "dunno idk", "what wat wut",
            "thanks thx ty", "bye cya goodbye", "hmm hm hmmm", "um uh erm uhh umm", "wow whoa woah"]
 SAME = {w: g.split()[0] for g in SIMILAR for w in g.split()}
+# Hesitation words compete individually, but still count as repeats of each other.
+UNPOOLED = NOTHING | {"um", "hmm"}
 
 def same(word):
     return SAME.get(word.lower(), word)
@@ -412,9 +414,9 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     return reaction
 
 
-# Near-synonyms split jev's vote: with "um" at 8%, "uh" at 7% and "erm" at 5% a word at 10% beats all three. So a
-# word votes for its SIMILAR group, the group with the most votes wins, and its best-scoring word is said. Same for
-# ending: ".", "!" and "?" are jev ending as much as <END> is. Apart, they split the vote to end and a word won
+# Most SIMILAR groups vote together; the group with the most votes wins, and its best-scoring word is said.
+# Hesitation groups (um/uh/erm and hmm/hm) vote apart, so their sum can't crowd out a substantive word.
+# Ending tokens ".", "!" and "?" count with <END>. Apart, they split the vote to end and a word won
 # instead: where master ended, jev picked <END> 31% of the time with them in the vocab and 78% without ("Dunno
 # google" went on "for", "on", "type"). So they count together, and the reply ends with the mark if jev liked that
 # best ("Dunno forgot?"). Not the words that say nothing: pooled, "dunno idk" and "no nah nope" won where jev meant
@@ -422,7 +424,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
 def vote(word, stoppable):
     if stoppable and (word == END or word in SENTENCE_ENDS):
         return END
-    return word if said_as(word) in NOTHING else same(word).lower()
+    return word if said_as(word) in UNPOOLED else same(word).lower()
 
 # The word jev says from scored ({word: score}), whether it ends the reply, and the others that voted with it
 def pick(scored, stoppable):
