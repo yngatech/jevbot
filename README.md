@@ -50,7 +50,7 @@ python3 run.py
 
 ## Usage
 
-Mention jev or reply to jev's messages. Replies only — it won't respond to messages that don't involve it.
+Mention jev or reply to jev's messages with the reply ping enabled. A reply with the ping off won't trigger a response unless you mention jev or its bot role in the message.
 
 `!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for a chart of the emoji it weighed. In the status channel (`STATUS_CHANNEL_ID`) it works the same for the statuses jev posted there: on its own it charts the latest, or send it as a reply to one; the words after the opener ("I feel") are charted. The chart's font has no emoji, so those are drawn from images: [Twemoji](https://github.com/jdecked/twemoji)'s, the set Discord uses, and the server's own emoji from Discord; one that can't be fetched is shown by name. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
 
@@ -86,6 +86,8 @@ A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter bil
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
 `test_status.py` exercises status generation, judging, retries and publishing with synthetic API results and Discord writes (`python -m unittest test_status`). It checks that rejected or unscored candidates keep the previous status, that accepted candidates retain their original wording and diagnostic trace, and that quiet and out-of-credit periods make no attempts.
+
+`test_mentions.py` exercises live message routing and startup catch-up with synthetic Discord messages (`python -m unittest test_mentions`). It checks that unpinged replies stay as chatter, mentions and allowed DMs still trigger responses, and diagnostic commands work without a ping.
 
 ## Vocab
 
