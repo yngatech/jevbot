@@ -392,17 +392,20 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
     def addressed(text, to_bot=True):
         mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
         return f"@{bot_name} {text}" if marked and to_bot and not mentioned else text
-    turns, day = [], None
-    # "[14:32] pip: ...", after a "--- Sat 10 Oct ---" line when the day changes. A turn without a time (a reply of
-    # jev's from before replies kept theirs) goes in as it is.
+    turns, day, minute = [], None, None
+    # Like an IRC log: "14:32 pip: ..." when the minute changes, after a "--- Sat 10 Oct" line when the day does.
+    # Turns in the same minute go without — a time on every line made a 300-line transcript a third longer. A turn
+    # without a time (a reply of jev's from before replies kept theirs) goes in as it is.
     def turn(line, when):
-        nonlocal day
+        nonlocal day, minute
         if at and when:
             local = when.astimezone(TIMEZONE)
             if local.date() != day:
                 day = local.date()
-                turns.append(f"--- {local:%a} {local.day} {local:%b} ---")
-            line = f"[{local:%H:%M}] {line}"
+                turns.append(f"--- {local:%a} {local.day} {local:%b}")
+            if f"{local:%H:%M}" != minute:
+                minute = f"{local:%H:%M}"
+                line = f"{minute} {line}"
         turns.append(line)
     if history:
         for h in history:
