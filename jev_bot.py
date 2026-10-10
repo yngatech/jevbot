@@ -1306,8 +1306,49 @@ async def reactor_name(guild, user_id, user=None):
         return None
     return user.display_name
 
-# Loading history needs Discord's reaction-user endpoint; live events maintain the same map by user ID.
-# Keep counts even when Discord cannot return users, so the feedback is still visible.
+# Who reacted to each of jev's replies, by message id: {"counts": {emoji: n}, "reactors": {emoji: {user id: name}}}.
+# Asking Discord for every reply's reactors made rebuilding a busy channel's history take 25s (rate limits), and the
+# reply waited for it. Kept in REACTORS_PATH (gitignored) and up to date with live reactions, so a rebuild only asks
+# about an emoji whose count has changed since — someone swapping for someone else while jev was offline goes unseen.
+REACTORS_PATH = Path(__file__).parent / "reactors.json"
+REACTORS_KEPT = 2000  # replies, the latest
+reactor_cache: dict[str, dict] = {}
+reactors_save = None  # the pending write, a moment after the last change, so a rebuild writes once
+
+def load_reactors():
+    try:
+        return json.loads(REACTORS_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # unreadable — ask Discord again
+        log.warning(f"Loading {REACTORS_PATH.name} failed: {e}")
+        return {}
+
+def save_reactors():
+    global reactors_save
+    reactors_save = None
+    try:
+        tmp = REACTORS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(reactor_cache, ensure_ascii=False) + "\n")
+        tmp.replace(REACTORS_PATH)
+    except OSError as e:
+        log.warning(f"Writing {REACTORS_PATH.name} failed: {e}")
+
+def remember_reactors(message_id, counts, reactors):
+    global reactors_save
+    reactor_cache.pop(str(message_id), None)  # to the end: the latest
+    if counts:
+        reactor_cache[str(message_id)] = {"counts": dict(counts), "reactors": copy.deepcopy(reactors or {})}
+    while len(reactor_cache) > REACTORS_KEPT:
+        del reactor_cache[next(iter(reactor_cache))]
+    if reactors_save is None:
+        reactors_save = asyncio.get_running_loop().call_later(2, save_reactors)
+
+reactor_cache.update(load_reactors())
+
+# Loading history needs Discord's reaction-user endpoint — for an emoji whose count changed since reactor_cache;
+# live events maintain the same map by user ID. Keep counts even when Discord cannot return users, so the feedback
+# is still visible.
 async def attach_reactions(entry, m, prefix="reply_"):
     counts = reactions_to(m)
     if not counts:
@@ -1315,17 +1356,27 @@ async def attach_reactions(entry, m, prefix="reply_"):
     entry[prefix + "reactions"] = counts
     reactors = entry[prefix + "reactors"] = {}
     guild = getattr(m, "guild", None)
+    saved = reactor_cache.get(str(m.id), {})
+    failed = False
 
     async def load(r):
-        users = reactors[emoji_text(r.emoji)] = {}
+        nonlocal failed
+        e = emoji_text(r.emoji)
+        if saved.get("counts", {}).get(e) == counts[e] and e in saved.get("reactors", {}):
+            reactors[e] = dict(saved["reactors"][e])
+            return
+        users = reactors[e] = {}
         try:
             async for user in r.users():
                 if user.id != bot.user.id:
                     users[str(user.id)] = await reactor_name(guild, user.id, user)
         except discord.HTTPException:
+            failed = True
             log.warning("Could not load reaction users for message %s", m.id)
 
     await asyncio.gather(*(load(r) for r in m.reactions if emoji_text(r.emoji) in counts))
+    if not failed and (saved.get("counts") != counts or saved.get("reactors") != reactors):
+        remember_reactors(m.id, counts, reactors)
 
 async def load_history(first):
     ch = first.channel.id
@@ -2045,6 +2096,7 @@ async def on_reaction_change(p, change):
         name = await reactor_name(guild, p.user_id, p.member)  # None if it can't be found — the count still shows
         if uid in users:
             users[uid] = name
+    remember_reactors(p.message_id, counts, entry.get("reply_reactors"))
 
 @bot.event
 async def on_raw_reaction_add(p):
@@ -2060,6 +2112,7 @@ async def on_raw_reaction_clear(p):
         if e.get("reply_id") == p.message_id:
             e.pop("reply_reactions", None)
             e.pop("reply_reactors", None)
+            remember_reactors(p.message_id, {}, {})
 
 @bot.event
 async def on_raw_reaction_clear_emoji(p):
@@ -2067,6 +2120,7 @@ async def on_raw_reaction_clear_emoji(p):
         if e.get("reply_id") == p.message_id:
             e.get("reply_reactions", {}).pop(emoji_text(p.emoji), None)
             e.get("reply_reactors", {}).pop(emoji_text(p.emoji), None)
+            remember_reactors(p.message_id, e.get("reply_reactions"), e.get("reply_reactors"))
 
 async def main():
     first_signal = None
