@@ -39,7 +39,7 @@ STATUS_CHANNEL_ID=channel_to_post_statuses_in
 TIMEZONE=Europe/London
 ```
 
-For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments): they're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes.
+For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments). A line can start with a note in brackets on what had just happened (`(a friend uses slang he doesn't know) No understand word.`), so the LLM sees when he says it; it's told the notes aren't his words. They're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes.
 
 `TIMEZONE` (an IANA name, UTC if unset) is the clock the times in an LLM's transcript are shown on.
 
