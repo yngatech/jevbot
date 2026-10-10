@@ -785,12 +785,17 @@ async def generate_filtered_status(bot_name, start, chat=""):
 #     it, and Haiku put it on 40 of 46 replies even when told to only use it for real questions
 #   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
 #   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
+#   providers: OpenRouter's providers to try first, in order (others if they're down) — a model's prompt cache is the
+#     provider's, so sent to whichever OpenRouter picked, DeepSeek never hit one: 0.36-0.91¢ a reply on a 7.8K-token
+#     chat. Of the providers taking all of its parameters (Parasail, Cloudflare, Novita), Parasail is the cheapest, and
+#     a repeat read 7.7K of it from the cache for 0.085¢. StreamLake would be 0.026¢, but has no frequency_penalty.
 #   window: its context length on OpenRouter, in tokens, for Context's usage
 #   cache_marks: mark where a long chat's cache ends (LLM_CACHE) — Claude only caches what's marked; DeepSeek and Kimi
 #     cache the same start of a request by themselves
 LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLMS = {
-    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576},
+    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576,
+                 "providers": ["parasail"]},
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
               "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000, "cache_marks": True},
     "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
@@ -871,6 +876,8 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
     if spec.get("logprobs"):
         # Only to providers that give them — some of DeepSeek's don't
         body |= {"logprobs": True, "top_logprobs": LLM_TOP_LOGPROBS, "provider": {"require_parameters": True}}
+    if providers := spec.get("providers"):
+        body["provider"] = body.get("provider", {}) | {"order": providers}
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for attempt in range(3):
             try:
