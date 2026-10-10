@@ -598,7 +598,7 @@ async def generate_filtered_status(bot_name, start, chat=""):
             if attempt["accepted"]:
                 # !why and !context keep using the accepted generation, while the full retry history stays local.
                 if parent is not None:
-                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_tokens")
+                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens")
                                    if k in attempt})
                     parent["status_score"] = score
                 return mood
@@ -727,7 +727,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
 async def llm_reply(name, message, author, bot_name, history=None):
     spec = LLMS[name]
     state = transcript(message, author, bot_name, history, [])
-    note(transcript=state, llm=name)
+    note(transcript=state, llm=name, llm_model=spec["id"])
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
     ask = f"The chat so far:\n\n{chat}\n\nWrite {bot_name}'s next message. Output only the message." + spec.get("tail", "")
     if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
@@ -749,7 +749,7 @@ async def llm_status(name, bot_name, start, chat=""):
     spec = LLMS[name]
     opener = render(start)
     ask = (f"Recent chat in the server:\n{chat}\n\n" if chat else "") + LLM_STATUS.format(bot=bot_name, start=opener)
-    note(transcript=ask, llm=name)
+    note(transcript=ask, llm=name, llm_model=spec["id"])
     text, tokens = await llm(name, [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
                               {"role": "user", "content": ask}])
     mood = " ".join(clean_llm(text, bot_name).split())  # one line
@@ -1307,7 +1307,8 @@ async def why(m):
             return
         said = t.get("reply") or t.get("status") or ""
         n = len(t["llm_tokens"])
-        note = f"Written by {t['llm']}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
+        model = t.get("llm_model") or LLMS.get(t["llm"], {}).get("id", t["llm"])  # from before llm_model was logged
+        note = f"Model: {model}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
         png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
                                       tokens=True)
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
