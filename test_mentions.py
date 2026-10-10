@@ -28,7 +28,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.user = SimpleNamespace(id=100000000000000001, bot=True, display_name="Testbot")
         self.role = SimpleNamespace(id=200000000000000001, mention="<@&200000000000000001>", name="Testbot")
-        self.guild = SimpleNamespace(self_role=self.role, me=self.user, threads=[],
+        self.guild = SimpleNamespace(id=400, self_role=self.role, me=self.user, threads=[],
                                      get_member=lambda _: None, get_role=lambda _: None,
                                      _resolve_channel=lambda _: None)
         self.channel = Mock(id=300)
@@ -45,6 +45,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "heard", False),
             (j, "side_talk", {}),
             (j, "side_of", {}),
+            (j, "reactor_names", {}),
         ]:
             p = patch.object(obj, attr, value)
             p.start()
@@ -60,7 +61,7 @@ class ReactionContextTests(_Discord):
 
     def payload(self, uid=501, name="Moss", emoji="😂"):
         return SimpleNamespace(channel_id=self.channel.id, message_id=700, guild_id=400,
-                               user_id=uid, member=SimpleNamespace(id=uid, display_name=name), emoji=emoji)
+                               user_id=uid, member=Mock(spec=discord.Member, id=uid, display_name=name, guild=self.guild), emoji=emoji)
 
     def transcript(self, **kwargs):
         return j.transcript("how are you?", "Speaker", "Testbot", [self.entry], [], **kwargs)
@@ -78,7 +79,7 @@ class ReactionContextTests(_Discord):
         await j.on_raw_reaction_add(self.payload())
         await j.on_raw_reaction_add(self.payload(502, "Pip"))
         await j.on_raw_reaction_add(self.payload(self.user.id, "Testbot"))
-        self.assertIn("Hello (😂×2 by @Moss, @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
         self.assertNotIn("😂", self.transcript(reactions=False, marked=True))
         self.assertNotIn("@Moss", self.transcript(their_reactions=False))
         await j.on_raw_reaction_remove(self.payload())
@@ -108,7 +109,7 @@ class ReactionContextTests(_Discord):
         j.channel_history[self.channel.id] = []
         await j.load_history(SimpleNamespace(channel=self.channel))
         self.entry = j.channel_history[self.channel.id][0]
-        self.assertIn("Hello (😂×2 by @Moss, @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
 
     async def test_side_chain_and_standalone_reply_names(self):
         question = MentionTests.message(self)
@@ -118,7 +119,7 @@ class ReactionContextTests(_Discord):
         self.assertEqual(entries[0]["reply_reactors"]["😂"], {"501": "Moss", "502": "Pip"})
         standalone = {"role": "assistant", "content": "Hello"}
         await j.attach_reactions(standalone, reply, prefix="")
-        self.assertIn("Hello (😂×2 by @Moss, @Pip)",
+        self.assertIn("Hello (😂 by @Moss, @Pip)",
                       j.transcript("hi", "Speaker", "Testbot", [standalone], []))
 
     async def test_http_failure_keeps_counts_and_old_logs_render(self):
@@ -133,6 +134,21 @@ class ReactionContextTests(_Discord):
         ):
             await j.on_raw_reaction_add(p)
         self.assertIn("😂×3 by @Moss", self.transcript())
+
+    async def test_history_names_are_server_nicknames(self):
+        # Reaction users come back as plain users with global names; the member lookup gives the nickname,
+        # once per person however many replies they reacted to.
+        fetch = AsyncMock(side_effect=lambda uid: SimpleNamespace(display_name={501: "Mossy", 502: "Pipsqueak"}[uid]))
+        guild = SimpleNamespace(id=400, get_member=lambda _: None, fetch_member=fetch)
+        replies = [SimpleNamespace(id=700 + i, guild=guild, reactions=[self.reaction()]) for i in range(2)]
+        entries = [{"reply": "Hello"} for _ in replies]
+        await asyncio.gather(*(j.attach_reactions(e, r) for e, r in zip(entries, replies)))
+        self.assertEqual(entries[1]["reply_reactors"]["😂"], {"501": "Mossy", "502": "Pipsqueak"})
+        self.assertEqual(fetch.await_count, 2)
+
+    def test_count_shown_only_when_names_are_missing(self):
+        self.assertEqual(j.reacted({"😂": 2, "💀": 3}, {"😂": {"1": "Moss", "2": "Pip"}, "💀": {"3": "Fern"}}),
+                         " (😂 by @Moss, @Pip; 💀×3 by @Fern)")
 
 
 class MentionTests(_Discord):

@@ -377,12 +377,13 @@ async def next_word(session, state, vocab, rng, instructions, done_state=None):
     return probs, complete_noul
 
 
-# People's reactions to one of jev's replies, with readable mentions of the reactors.
+# People's reactions to one of jev's replies, with readable mentions of the reactors: " (😂 by @Moss, @Pip; 💀×3)".
+# The count is left out when every reactor is named, and kept when some names are missing.
 def reacted(counts, reactors=None):
     parts = []
     for e, n in (counts or {}).items():
-        text = e if n == 1 else f"{e}×{n}"
         names = [f"@{name}" for name in (reactors or {}).get(e, {}).values() if name]
+        text = e if n == 1 or len(names) >= n else f"{e}×{n}"
         parts.append(text + (" by " + ", ".join(names) if names else ""))
     return " (" + "; ".join(parts) + ")" if parts else ""
 
@@ -1108,6 +1109,33 @@ def reactions_to(m):
     return {emoji_text(r.emoji): n for r in m.reactions if (n := r.count - r.me)}
 
 
+# Server nickname lookups for reactors, by (guild id, user id). The lookup itself is kept, so a history rebuild
+# loading every reply's reactions at once asks Discord about each person once. A live reaction refreshes it.
+reactor_names = {}
+
+async def member_name(guild, user_id):
+    try:
+        return (guild.get_member(user_id) or await guild.fetch_member(user_id)).display_name
+    except discord.HTTPException:
+        return None  # left the server — their own name will do
+
+# A reactor's name as the server shows it, like the mentions elsewhere in the transcript. Without the members
+# intent Discord hands back plain users, whose display name is the global one, so the member is looked up.
+async def reactor_name(guild, user_id, user=None):
+    if isinstance(user, discord.Member):
+        reactor_names.pop((user.guild.id, user_id), None)
+        return user.display_name
+    if guild:
+        if (guild.id, user_id) not in reactor_names:
+            reactor_names[guild.id, user_id] = asyncio.ensure_future(member_name(guild, user_id))
+        if name := await reactor_names[guild.id, user_id]:
+            return name
+    try:
+        user = user or bot.get_user(user_id) or await bot.fetch_user(user_id)
+    except discord.HTTPException:
+        return None
+    return user.display_name
+
 # Loading history needs Discord's reaction-user endpoint; live events maintain the same map by user ID.
 # Keep counts even when Discord cannot return users, so the feedback is still visible.
 async def attach_reactions(entry, m, prefix="reply_"):
@@ -1116,17 +1144,18 @@ async def attach_reactions(entry, m, prefix="reply_"):
         return
     entry[prefix + "reactions"] = counts
     reactors = entry[prefix + "reactors"] = {}
-    for r in m.reactions:
-        e = emoji_text(r.emoji)
-        if e not in counts:
-            continue
-        users = reactors.setdefault(e, {})
+    guild = getattr(m, "guild", None)
+
+    async def load(r):
+        users = reactors[emoji_text(r.emoji)] = {}
         try:
             async for user in r.users():
                 if user.id != bot.user.id:
-                    users[str(user.id)] = user.display_name
+                    users[str(user.id)] = await reactor_name(guild, user.id, user)
         except discord.HTTPException:
             log.warning("Could not load reaction users for message %s", m.id)
+
+    await asyncio.gather(*(load(r) for r in m.reactions if emoji_text(r.emoji) in counts))
 
 async def load_history(first):
     ch = first.channel.id
@@ -1145,15 +1174,16 @@ async def load_history(first):
             replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
         elif m.id not in known and (entry := history_entry(m)):
             found.append((entry, root))
-    talk = []
+    talk, reacting = [], []
     for entry, root in found:
         if r := replies.get(entry["id"]):
             entry["reply"], entry["reply_id"] = r.content, r.id
-            await attach_reactions(entry, r)
+            reacting.append(attach_reactions(entry, r))
         if root is None:
             talk.append(entry)
         else:
             add_side(root, entry)
+    await asyncio.gather(*reacting)  # all at once: someone is waiting on the reply this history is for
     channel_history[ch] = kept(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
@@ -1702,14 +1732,9 @@ async def on_reaction_change(p, change):
         entry["reply_reactors"].pop(e, None)
     if change > 0:
         guild = bot.get_guild(p.guild_id) if p.guild_id else None
-        user = p.member or (guild.get_member(p.user_id) if guild else None) or bot.get_user(p.user_id)
-        if user is None:
-            try:
-                user = await bot.fetch_user(p.user_id)
-            except discord.HTTPException:
-                return  # counts are still useful when the name cannot be resolved
+        name = await reactor_name(guild, p.user_id, p.member)  # None if it can't be found — the count still shows
         if uid in users:
-            users[uid] = user.display_name
+            users[uid] = name
 
 @bot.event
 async def on_raw_reaction_add(p):
