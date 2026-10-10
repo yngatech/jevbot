@@ -16,9 +16,10 @@ import logging
 import random
 import signal
 import contextvars
+import hashlib
 from pathlib import Path
 from urllib.parse import urlsplit
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -1302,6 +1303,10 @@ async def on_message_edit(before, after):
 # message it reacted to), or on its own jev's latest answer in the channel, as why_chart's chart. Costs nothing: no
 # API calls.
 WHY_DAYS = 7  # how many days of logs it looks back through
+EXPLANATION_CACHE_ENTRIES = 100
+EXPLANATION_CACHE_BYTES = 32 * 1024 * 1024  # text and attachments; least recently used answers go first
+explanation_cache: OrderedDict = OrderedDict()
+explanation_pending: dict[tuple, asyncio.Task] = {}
 
 # The chart's font has no emoji, so a reaction's are drawn from images: Twemoji's, which Discord's are, and the
 # server's own from Discord. Kept for as long as jev runs; one that can't be fetched is shown by name instead.
@@ -1429,6 +1434,48 @@ def why_filename(text, reacted=False):
     words = re.findall(r"[a-z0-9]+", text.lower())[:6]
     return "-".join(["why"] + (["reacted", "to"] if reacted else []) + words)[:60] + ".png"
 
+# Cache the prepared answer, shared by commands and actions. Resolve the trace first: "latest" must follow new
+# answers, edited targets must still match, and deleted logs must stop being shown. Keep bytes, not discord.File:
+# each send needs its own stream, since Discord consumes it. Concurrent requests share the work too.
+async def cached_explanation(kind, channel_id, guild, t):
+    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
+    candidates = t.get("reaction_candidates") or []
+    urls = ()
+    if kind == "why" and candidates and not isinstance(candidates[0], str):
+        urls = tuple(emoji_url(row[0], guild) for row in candidates)
+    key = (kind, channel_id, bot_name, urls, hashlib.sha256(json.dumps(t, sort_keys=True).encode()).digest())
+    if key in explanation_cache:
+        explanation_cache.move_to_end(key)
+        return explanation_cache[key][0]
+
+    async def prepare():
+        try:
+            if kind == "why":
+                response = await why_response(t, guild, bot_name)
+            else:
+                response = context_response(t, bot_name)
+            size = sum(len(part.encode() if isinstance(part, str) else part) for part in response if part is not None)
+            if size <= EXPLANATION_CACHE_BYTES:
+                explanation_cache[key] = (response, size)
+                while len(explanation_cache) > EXPLANATION_CACHE_ENTRIES or \
+                        sum(size for _, size in explanation_cache.values()) > EXPLANATION_CACHE_BYTES:
+                    explanation_cache.popitem(last=False)
+            return response
+        finally:
+            explanation_pending.pop(key, None)
+
+    if key not in explanation_pending:
+        explanation_pending[key] = asyncio.create_task(prepare())
+    # A cancelled interaction mustn't cancel rendering for other people waiting on the same answer.
+    return await asyncio.shield(explanation_pending[key])
+
+async def send_explanation(send, response):
+    content, data, filename = response
+    if data is None:
+        await send(content)
+    else:
+        await send(content, file=discord.File(io.BytesIO(data), filename))
+
 async def why(m):
     if (target := await command_target(m)) is not False:
         await explain_why(m.channel.id, m.guild, target, reply_to(m))
@@ -1439,30 +1486,33 @@ async def explain_why(channel_id, guild, target, send):
     if t is None:
         await send("Nothing logged for that")
         return
-    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
+    await send_explanation(send, await cached_explanation("why", channel_id, guild, t))
+
+# Prepared content, attachment bytes and filename, without any Discord objects tied to a particular send.
+async def why_response(t, guild, bot_name):
     if t.get("llm") and not t.get("reaction"):
         if not t.get("llm_tokens"):
-            await send(f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
-                       " — Context shows what it saw")
             log.info(f"[WHY] no tokens from {t['llm']}")
-            return
+            return (f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
+                    " — Context shows what it saw", None, None)
         said = t.get("reply") or t.get("status") or ""
         n = len(t["llm_tokens"])
         model = t.get("llm_model") or LLMS.get(t["llm"], {}).get("id", t["llm"])  # from before llm_model was logged
         note = f"Model: {model}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
         png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
                                       tokens=True)
-        await send(file=discord.File(io.BytesIO(png), why_filename(said)))
         log.info(f"[WHY] token chart for {said!r}")
+        return None, png, why_filename(said)
     elif t.get("steps"):
         said = t.get("reply") or t.get("status") or ""
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
-        await send(file=discord.File(io.BytesIO(png), why_filename(said)))
         log.info(f"[WHY] chart for {t.get('reply') or t.get('status')!r}")
+        return None, png, why_filename(said)
     elif isinstance(t["reaction_candidates"][0], str):
         # Entries from before their probabilities were logged: just the emoji, likeliest first
-        await send(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {' '.join(t['reaction_candidates'])}")
         log.info(f"[WHY] reaction {t.get('reaction')}")
+        return (f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {' '.join(t['reaction_candidates'])}",
+                None, None)
     else:
         rows = sorted(t["reaction_candidates"], key=lambda r: -r[2])  # [emoji, probability, score], best score first
         async with aiohttp.ClientSession() as session:
@@ -1471,8 +1521,8 @@ async def explain_why(channel_id, guild, target, send):
         png = await asyncio.to_thread(why_chart.render, bot_name, "", [panel], reacted_to=t["message"],
                                       images={e: img for (e, _, _), img in zip(rows, images) if img},
                                       note=asked_note(t, bot_name))
-        await send(file=discord.File(io.BytesIO(png), why_filename(t["message"], reacted=True)))
         log.info(f"[WHY] chart for reaction {t.get('reaction')}")
+        return None, png, why_filename(t["message"], reacted=True)
 
 
 # Context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,
@@ -1502,8 +1552,9 @@ async def explain_context(channel_id, guild, target, send):
     if t is None:
         await send("Nothing logged for that")
         return
-    # Statuses from before bot_name was logged: the name now
-    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
+    await send_explanation(send, await cached_explanation("context", channel_id, guild, t))
+
+def context_response(t, bot_name):
     if "status" in t:
         what = "its status"
         head = f"What {bot_name} saw before the status \"{unfence(t['status'])}\""
@@ -1513,11 +1564,10 @@ async def explain_context(channel_id, guild, target, send):
                 + (" (!nocontext)" if t.get("no_context") else ""))
     text = logged_context(t)
     body = f"{head}:\n```\n{unfence(text)}\n```"
-    if len(body) <= CONTEXT_LIMIT:
-        await send(body)
-    else:
-        await send(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"))
     log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
+    if len(body) <= CONTEXT_LIMIT:
+        return body, None, None
+    return head, text.encode(), "context.txt"
 
 
 # Right-clicking a message for Why or Context: that message, as if !why were a Discord reply to it.

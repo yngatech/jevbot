@@ -62,6 +62,8 @@ For a reply or status an LLM wrote (see `!model`), `!why` charts its tokens inst
 
 `!why` is also an action, **Apps → Why**, as if `!why` were a Discord reply to that message, answered with a message only you can see — `!why` itself posts the chart for everyone. Everyone who can use apps in a channel sees the Why and Context actions; a server can limit them per role or channel in **Server Settings → Integrations**. jev registers them with Discord each time it starts, and a Discord client that was already open may need reloading (Ctrl+R) to show them the first time.
 
+Commands and actions share an in-memory cache of their prepared answers, so asking about the same logged answer reuses its chart or transcript. Requests arriving together share the same preparation. The cache keeps up to `EXPLANATION_CACHE_ENTRIES` (100) answers and `EXPLANATION_CACHE_BYTES` (32 MiB) of text and attachments, dropping the least recently used first, and clears when jev restarts. Each request still checks the logs, so asking for the latest follows new answers and deleted logs stop being shown.
+
 `!model` says which model is writing jev's replies and statuses; `!model <name>` switches, for everyone: `jev` (the default), `deepseek`, `haiku` or `kimi`. The three are ordinary LLMs on OpenRouter, told to talk like Rocky, the Eridian engineer from *Project Hail Mary* who the bot is named after ("Is called Biscuit. Small predator, no respect for hot liquid."), with real lines of his from `rocky_lines.txt` as examples. Jev still decides whether to reply or react, and picks the emoji. The choice is kept in `model.json` (gitignored), so a restart keeps it. Like `!why`, it works without a ping.
 
 Put `!nocontext` in a message to jev (`@jev !nocontext what's your favourite colour?`) and it answers with none of the channel's history in view, just that message. That message and every Discord reply under it, on any branch and from anyone, are a side conversation: a reply in it sees all of it (each branch sees the others) and nothing from the rest of the channel, and the rest of the channel — other questions to jev, and its statuses — never sees it. Mention jev outside it to get the channel back. jev keeps the latest `SIDE_TALKS` (50) side conversations, up to `CHAIN_DEPTH` (20) messages each; after a restart it finds them again in the last `HISTORY_SCAN` messages, or by following a reply's chain back.
@@ -112,6 +114,8 @@ A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter bil
 `test_reactions.py` checks `reactions.py` offline: which log entries count as posts, matching them to synthetic Discord messages, leaving out jev's own reactions, and keeping 👎 apart (`python -m unittest test_reactions`).
 
 `test_mentions.py` exercises live message routing and startup catch-up with synthetic Discord messages (`python -m unittest test_mentions`). It checks that unpinged replies stay as chatter, mentions and allowed DMs still trigger responses, diagnostic commands work without a ping, and the Why and Context actions answer only whoever asked.
+
+`test_explanations.py` exercises the shared Why and Context cache with synthetic logs and Discord sends (`python -m unittest test_explanations`). It renders real charts and checks reuse across commands and actions, fresh attachment streams, concurrent requests and cancellation, eviction, retries after rendering errors, and updates when answers, logs or custom emoji change.
 
 ## Vocab
 
