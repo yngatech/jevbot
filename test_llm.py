@@ -187,6 +187,7 @@ class WhyTests(_Case):
         self.assertTrue(render.call_args.kwargs["tokens"])
         self.assertEqual(len(render.call_args.args[2]), 2)
         self.assertEqual(render.call_args.kwargs["note"], "Model: deepseek/deepseek-v4-pro")  # logged before llm_model
+        self.assertEqual(m.reply.call_args.kwargs["file"].filename, "why-is-called.png")
 
         logged["llm_model"] = "deepseek/deepseek-v4-flash"
         with patch.object(j, "find_trace", return_value=logged), \
@@ -208,6 +209,12 @@ class WhyTests(_Case):
         self.assertEqual(tokens[1]["top"], [["isk", 0.9], ["is", 0.06]])
         self.assertEqual(tokens[2]["top"], [])
         self.assertEqual(j.llm_why_panels(tokens)[2]["rows"], [["ers", 0.99, 0.99]])
+
+    def test_chart_files_are_named_after_what_they_show(self):
+        self.assertEqual(j.why_filename("Day good. Rain make race more interesting."), "why-day-good-rain-make-race-more.png")
+        self.assertEqual(j.why_filename("lol that cat 😂", reacted=True), "why-reacted-to-lol-that-cat.png")
+        self.assertEqual(j.why_filename("🤷"), "why.png")
+        self.assertLessEqual(len(j.why_filename("supercalifragilistic " * 6)), 64)
 
     def test_clean_takes_the_first_paragraph_without_a_name(self):
         self.assertEqual(j.clean_llm('Rocky: "No. Just no."\n\nkettle: ok', "rocky"), "No. Just no.")

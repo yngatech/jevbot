@@ -1328,6 +1328,12 @@ def asked_note(t, bot_name):
     # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
     return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
 
+# The chart's file name, from what it's about, so saved charts don't all overwrite why.png:
+# "why-day-good-rain-make-race.png", "why-reacted-to-lol-that-cat.png"
+def why_filename(text, reacted=False):
+    words = re.findall(r"[a-z0-9]+", text.lower())[:6]
+    return "-".join(["why"] + (["reacted", "to"] if reacted else []) + words)[:60] + ".png"
+
 async def why(m):
     if (target := await command_target(m)) is False:
         return
@@ -1348,12 +1354,12 @@ async def why(m):
         note = f"Model: {model}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
         png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
                                       tokens=True)
-        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        await m.reply(file=discord.File(io.BytesIO(png), why_filename(said)), mention_author=False)
         log.info(f"[WHY] token chart for {said!r}")
     elif t.get("steps"):
         said = t.get("reply") or t.get("status") or ""
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
-        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        await m.reply(file=discord.File(io.BytesIO(png), why_filename(said)), mention_author=False)
         log.info(f"[WHY] chart for {t.get('reply') or t.get('status')!r}")
     elif isinstance(t["reaction_candidates"][0], str):
         # Entries from before their probabilities were logged: just the emoji, likeliest first
@@ -1369,7 +1375,8 @@ async def why(m):
         png = await asyncio.to_thread(why_chart.render, bot_name, "", [panel], reacted_to=t["message"],
                                       images={e: img for (e, _, _), img in zip(rows, images) if img},
                                       note=asked_note(t, bot_name))
-        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        await m.reply(file=discord.File(io.BytesIO(png), why_filename(t["message"], reacted=True)),
+                      mention_author=False)
         log.info(f"[WHY] chart for reaction {t.get('reaction')}")
 
 
