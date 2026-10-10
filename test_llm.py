@@ -96,12 +96,38 @@ class ReplyTests(_Case):
         name, messages = llm.call_args.args
         self.assertEqual(name, "deepseek")
         self.assertIn("talk like Rocky", messages[0]["content"])
-        self.assertTrue(messages[1]["content"].startswith("The chat so far:\n\nkettle: what's my cat called?\n\n"))
+        self.assertRegex(messages[1]["content"],
+                         r"^The chat so far, times in UTC:\n\n--- \w+ \d+ \w+ ---\n\[\d\d:\d\d\] kettle: what's my cat called\?\n\n")
         self.assertNotIn("rocky: \n", messages[1]["content"])  # its empty turn is asked for, not shown
         self.assertIn("Write rocky's reply to kettle's last message.", messages[1]["content"])  # who it answers
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
         self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
         self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for Context
+
+    async def test_transcript_shows_times_on_the_local_clock_with_a_line_per_day(self):
+        j.model_name = "deepseek"
+        utc = j.timezone.utc
+        history = [{"role": "user", "name": "pip", "content": "night all", "to_bot": False,
+                    "at": j.datetime(2026, 10, 9, 22, 50, tzinfo=utc)},
+                   {"role": "user", "name": "kettle", "content": "rocky you up?", "at": j.datetime(2026, 10, 9, 22, 58, tzinfo=utc),
+                    "reply": "Always up.", "reply_at": j.datetime(2026, 10, 9, 22, 59, tzinfo=utc)},
+                   {"role": "user", "name": "pip", "content": "old reply", "at": j.datetime(2026, 10, 9, 23, 30, tzinfo=utc),
+                    "reply": "No time on this one."}]
+        llm = AsyncMock(return_value=("Is morning. Go.", []))
+        with patch.object(j, "llm", llm), patch.object(j, "TIMEZONE", j.ZoneInfo("Europe/London")):
+            await j.generate_reply("morning", "kettle", "rocky", history=history,
+                                   at=j.datetime(2026, 10, 10, 7, 5, tzinfo=utc))
+        self.assertIn("The chat so far, times in Europe/London:\n\n"
+                      "--- Fri 9 Oct ---\n[23:50] pip: night all\n[23:58] kettle: rocky you up?\n[23:59] rocky: Always up.\n"
+                      "--- Sat 10 Oct ---\n[00:30] pip: old reply\nrocky: No time on this one.\n[08:05] kettle: morning\n\n",
+                      llm.call_args.args[1][1]["content"])
+        self.assertIn("[08:05] kettle: morning\nrocky: ", self.trace["transcript"])  # for Context
+
+    async def test_jev_transcript_has_no_times(self):
+        history = [{"role": "user", "name": "pip", "content": "hi", "at": j.datetime.now(j.timezone.utc)}]
+        with patch.object(j, "loom", new_callable=AsyncMock, return_value=["Hi"]):
+            await j.generate_reply("cat?", "kettle", "rocky", history=history, at=j.datetime.now(j.timezone.utc))
+        self.assertEqual(self.trace["transcript"], "pip: hi\nkettle: cat?\nrocky: ")
 
     async def test_jev_still_looms(self):
         with patch.object(j, "llm", new_callable=AsyncMock) as llm, \
