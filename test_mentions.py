@@ -242,9 +242,8 @@ class ActionTests(_Discord):
         self.assertTrue(i.followup.send.call_args.kwargs["ephemeral"])
 
 
-class NoContextChainTests(_Discord):
-    """A "@jev !nocontext ..." message and the replies under it are a side conversation: they see all of it and
-    nothing else, and the rest of the channel doesn't see them."""
+class _Handling(_Discord):
+    """handle() end to end, with what jev would say patched in."""
 
     def setUp(self):
         super().setUp()
@@ -287,6 +286,12 @@ class NoContextChainTests(_Discord):
         with patch.object(j, "generate_reply", new_callable=AsyncMock, return_value=says) as gen:
             await j.handle(m, j.message_text(m))
         return [(e["name"], e["content"], e.get("reply")) for e in gen.call_args.kwargs["history"]]
+
+
+
+class NoContextChainTests(_Handling):
+    """A "@jev !nocontext ..." message and the replies under it are a side conversation: they see all of it and
+    nothing else, and the rest of the channel doesn't see them."""
 
     async def test_every_branch_sees_the_whole_side_conversation(self):
         self.assertEqual(await self.answer(self.said("!nocontext favourite rock?"),
@@ -381,6 +386,62 @@ class NoContextChainTests(_Discord):
         self.channel.fetch_message.side_effect = discord.NotFound(Mock(status=404), "gone")
         history = await self.answer(self.said("geology", to=a))
         self.assertIn(("kettle", "the toaster is on fire again", None), history)
+
+
+class LongHistoryTests(_Handling):
+    """An LLM writing gets the last LLM_HISTORY messages; Jev and the question check keep their short window."""
+
+    def setUp(self):
+        super().setUp()
+        start = datetime.now(timezone.utc) - timedelta(hours=1)
+        j.channel_history[self.channel.id] = []
+        for i in range(300):  # mostly chatter, a message to jev every 10th, the older half answered
+            to_bot = i % 10 == 0
+            entry = {"role": "user", "name": "kettle", "content": f"message {i}", "id": i + 1,
+                     "at": start + timedelta(seconds=i), "to_bot": to_bot}
+            if to_bot:
+                entry |= {"reply": f"answer {i}", "reply_id": 10_000 + i}
+            j.add_history(self.channel.id, entry)
+
+    async def test_store_keeps_enough_for_both(self):
+        stored = [e["content"] for e in j.channel_history[self.channel.id]]
+        self.assertEqual(stored, [f"message {i}" for i in range(300 - j.LLM_HISTORY - 1, 300)])
+
+    async def test_store_keeps_jevs_messages_to_it_past_the_llm_window(self):
+        for i in range(j.LLM_HISTORY + 5):
+            j.add_history(self.channel.id, {"role": "user", "name": "pip", "content": f"chatter {i}", "id": 1000 + i,
+                                            "at": datetime.now(timezone.utc), "to_bot": False})
+        to_bot = [e for e in j.channel_history[self.channel.id] if e["to_bot"]]
+        self.assertEqual(len(to_bot), j.HISTORY_TO_BOT + 1)
+
+    async def test_llm_sees_the_long_history_and_jev_the_short(self):
+        asked = []
+
+        async def llm(name, messages, **kwargs):
+            asked.append(messages[1]["content"])
+            return "Is good.", []
+
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", side_effect=llm):
+            await j.handle(m := self.said("what now?"), j.message_text(m))
+        chat = asked[0]
+        self.assertIn("message 100", chat)  # 200 back
+        self.assertNotIn("message 99\n", chat)
+        self.assertIn("rocky: answer 290", chat.replace(self.user.display_name, "rocky"))
+        self.assertEqual(len(self.trace["history"]), j.LLM_HISTORY)  # logged: what the LLM saw
+        question_check = j.choose_reaction.call_args.kwargs["history"]
+        self.assertEqual(sum(e["to_bot"] for e in question_check), j.HISTORY_TO_BOT)
+        self.assertEqual(sum(not e["to_bot"] for e in question_check), j.HISTORY_CHATTER)
+
+    async def test_jev_keeps_its_short_window(self):
+        with patch.object(j, "loom", new_callable=AsyncMock, return_value=["Dunno"]) as loom:
+            await j.handle(m := self.said("what now?"), j.message_text(m))
+        state = loom.call_args.args[0]([])
+        # 8 chatter back is 292, 6 messages to jev back is 240
+        self.assertIn("message 292\n", state)
+        self.assertNotIn("message 291\n", state)
+        self.assertIn("message 240\n", state)
+        self.assertNotIn("message 230\n", state)
+
 
 if __name__ == "__main__":
     unittest.main()
