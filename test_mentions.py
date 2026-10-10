@@ -22,7 +22,7 @@ import jev_bot as j
 class _Discord(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.user = SimpleNamespace(id=100, bot=True, display_name="Testbot")
-        self.role = SimpleNamespace(id=200, mention="<@&200>")
+        self.role = SimpleNamespace(id=200, mention="<@&200>", name="Testbot")
         self.guild = SimpleNamespace(self_role=self.role, me=self.user, threads=[])
         self.channel = Mock(id=300)
         self.channel.permissions_for.return_value = SimpleNamespace(read_messages=True, read_message_history=True)
@@ -53,6 +53,36 @@ class MentionTests(_Discord):
             reference=SimpleNamespace(message_id=self.target.id, resolved=self.target) if reply else None,
             created_at=datetime.now(timezone.utc), reactions=[], attachments=[], stickers=[], embeds=[],
         )
+
+    async def test_mentions_stay_in_place_in_reply_and_reaction_context(self):
+        for mention, options in (("<@100>", {"ping": True}), ("<@!100>", {"ping": True}),
+                                 ("<@&200>", {"role": True})):
+            with self.subTest(mention=mention):
+                m = self.message(content=f"think {mention} is drunk?", **options)
+                text = j.message_text(m)
+                self.assertEqual(text, "think @Testbot is drunk?")
+                entry = j.history_entry(m)
+                for marked in (False, True):
+                    state = j.transcript(text, "Speaker", "Testbot", [entry], [], marked=marked)
+                    self.assertEqual(state, "Speaker: think @Testbot is drunk?\n"
+                                           "Speaker: think @Testbot is drunk?\nTestbot: ")
+
+    async def test_other_mentions_and_possessives_are_preserved(self):
+        m = self.message(content="<@100>'s friend <@!101> likes <@&201>", ping=True)
+        m.mentions.append(SimpleNamespace(id=101, display_name="Friend"))
+        m.role_mentions.append(SimpleNamespace(id=201, name="Readers"))
+        self.assertEqual(j.message_text(m), "@Testbot's friend @Friend likes @Readers")
+
+    async def test_question_check_still_marks_pinged_reply_without_textual_mention(self):
+        m = self.message(content="is drunk?", ping=True)
+        text = j.message_text(m)
+        self.assertEqual(text, "is drunk?")
+        self.assertEqual(j.transcript(text, "Speaker", "Testbot", [], [], marked=True),
+                         "Speaker: @Testbot is drunk?\nTestbot: ")
+
+    async def test_commands_still_ignore_bot_mentions(self):
+        m = self.message(content="<@100> !context", ping=True)
+        self.assertEqual(j.command(m), "!context")
 
     async def test_unpinged_reply_is_chatter_without_a_response(self):
         m = self.message()
@@ -238,15 +268,15 @@ class NoContextChainTests(_Discord):
         self.assertEqual(await self.answer(self.said("!nocontext favourite rock?"),
                                            "Rock music or geology rock, question?"), [])
         a = self.sent
-        q = ("pip", "favourite rock?", "Rock music or geology rock, question?")
+        q = ("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")
         self.assertEqual(await self.answer(self.said("geology", to=a), "Granite. Very good."), [q])
         granite = self.sent
         # Another branch, also answering a: sees the first
         self.assertEqual(await self.answer(self.said("music", to=a, name="mossy"), "Loud. Good."),
-                         [q, ("pip", "geology", "Granite. Very good.")])
+                         [q, ("pip", "@Testbot geology", "Granite. Very good.")])
         # Back on the first branch: sees the second
         self.assertEqual(await self.answer(self.said("why granite", to=granite)),
-                         [q, ("pip", "geology", "Granite. Very good."), ("mossy", "music", "Loud. Good.")])
+                         [q, ("pip", "@Testbot geology", "Granite. Very good."), ("mossy", "@Testbot music", "Loud. Good.")])
 
     async def test_channel_doesnt_see_the_side_conversation(self):
         await self.answer(self.said("!nocontext favourite rock?"), "Rock music or geology rock, question?")
@@ -261,7 +291,7 @@ class NoContextChainTests(_Discord):
         respond.assert_not_awaited()
         self.assertNotIn("basalt obviously", [e["content"] for e in j.channel_history[self.channel.id]])
         self.assertEqual(await self.answer(self.said("geology", to=a)),
-                         [("pip", "favourite rock?", "Rock music or geology rock, question?"),
+                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
                           ("mossy", "basalt obviously", None)])
 
     async def test_restart_rebuilds_side_conversations_from_discord(self):
@@ -279,7 +309,7 @@ class NoContextChainTests(_Discord):
         m = self.said("geology", to=a)
         with patch.object(j, "load_history", self.load_history):
             got = await self.answer(m)
-        self.assertEqual(got, [("pip", "favourite rock?", "Rock music or geology rock, question?"),
+        self.assertEqual(got, [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
                                ("mossy", "music", None)])
         self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]], ["anyone seen my keys"])
 
@@ -287,7 +317,7 @@ class NoContextChainTests(_Discord):
         q = self.said("!nocontext favourite rock?")
         a = self.said("Rock music or geology rock, question?", to=q, bot=True)
         self.assertEqual(await self.answer(self.said("geology", to=a)),
-                         [("pip", "favourite rock?", "Rock music or geology rock, question?")])
+                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")])
         self.assertTrue(self.trace["no_context"])
 
     async def test_deeper_reply_and_other_people_in_chain(self):
@@ -296,8 +326,8 @@ class NoContextChainTests(_Discord):
         b = self.said("geology", to=a, name="mossy")
         c = self.said("Granite. Very good, very good.", to=b, bot=True)
         self.assertEqual(await self.answer(self.said("why granite", to=c)),
-                         [("pip", "favourite rock?", "Rock music or geology rock, question?"),
-                          ("mossy", "geology", "Granite. Very good, very good.")])
+                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
+                          ("mossy", "@Testbot geology", "Granite. Very good, very good.")])
 
     async def test_chain_starts_at_latest_nocontext(self):
         q = self.said("what's up")
@@ -305,7 +335,7 @@ class NoContextChainTests(_Discord):
         r = self.said("!nocontext favourite rock?", to=a)
         b = self.said("Rock music or geology rock, question?", to=r, bot=True)
         self.assertEqual(await self.answer(self.said("geology", to=b)),
-                         [("pip", "favourite rock?", "Rock music or geology rock, question?")])
+                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")])
 
     async def test_nocontext_in_the_reply_itself_still_sees_nothing(self):
         q = self.said("!nocontext favourite rock?")
