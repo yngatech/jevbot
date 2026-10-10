@@ -373,13 +373,14 @@ async def next_word(session, state, vocab, rng, instructions, done_state=None):
 def reacted(counts):
     return " (" + " ".join(e if n == 1 else f"{e}×{n}" for e, n in counts.items()) + ")" if counts else ""
 
-# marked: show messages to jev as "name: @jev ..." (the mention is stripped otherwise). Tested live: with channel
-# chatter in view it's what tells the question check which messages were for jev, but for picking words it made
-# jev describe more and stop sooner, so only the question check uses it.
+# marked: mark messages addressed to jev for the question check, including pinged replies without a textual
+# mention. Keep existing mentions in place rather than adding a second one.
 # reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies
 def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None):
     their_reactions = reactions if their_reactions is None else their_reactions
-    to = f"@{bot_name} " if marked else ""
+    def addressed(text, to_bot=True):
+        mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
+        return f"@{bot_name} {text}" if marked and to_bot and not mentioned else text
     turns = []
     if history:
         for h in history:
@@ -387,7 +388,7 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
             text = unrender(h["content"])
             if h["role"] == "assistant" and their_reactions:
                 text += reacted(h.get("reactions"))
-            turns.append(f"{name}: {to if h['role'] == 'user' and h.get('to_bot', True) else ''}{text}")
+            turns.append(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}")
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
@@ -395,7 +396,7 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
                 turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if their_reactions else ''}")
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
-    turns.append(f"{author}: {to}{unrender(message)}")
+    turns.append(f"{author}: {addressed(unrender(message))}")
     turns.append(f"{bot_name}: {unrender(render(words))}")
     return "\n".join(turns)
 
@@ -921,6 +922,17 @@ def strip_mention(m):
     c = re.sub(rf"(?:{mention})(?=')", (m.guild.me if m.guild else bot.user).display_name, m.content)
     return re.sub(mention, "", c).strip()
 
+# Discord sends mentions as IDs. Show the names people see, keeping each mention where it was written.
+def mention_text(m):
+    users = {u.id: u.display_name for u in m.mentions}
+    roles = {r.id: r.name for r in m.role_mentions}
+    def replace(match):
+        names = roles if match[1] == "&" else users
+        name = names.get(int(match[2]))
+        return f"@{name}" if name is not None else match[0]
+
+    return re.sub(r"<@([!&]?)(\d+)>", replace, m.content)
+
 # Links, e.g. a GIF from Discord's picker (https://klipy.com/gifs/azumanga-daioh-sakai) — shown as a tag with the
 # embed's title (a tweet's has none, so its author and the start of its text), or the link's site and path words while there's no embed.
 # Raw, "https" went into the vocab, and jev picked it ("Yeah yes https https too is").
@@ -970,7 +982,7 @@ def attachment_tag(a):
 
 # "@jev !nocontext ..." answers with no history in view. Taken out of the text, so jev never sees it, and "nocontext"
 # never reaches the vocab from the message or, later, from the history.
-NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)", re.IGNORECASE)
+NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)[ \t]*", re.IGNORECASE)
 
 def no_context(m):
     return should_respond(m) and NO_CONTEXT.search(strip_mention(m)) is not None
@@ -1029,10 +1041,12 @@ async def side_root(m):
         add_side(root, entry)
     return root
 
-# m as jev sees it: without the mention (and !nocontext) if it's to jev, links as tags, and a tag for each attachment
+# m as jev sees it: mentions as readable names, without !nocontext if it's to jev, links as tags, and a tag for each attachment
 # and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
 def message_text(m):
-    text = NO_CONTEXT.sub("", strip_mention(m)) if should_respond(m) else m.content
+    text = mention_text(m)
+    if should_respond(m):
+        text = NO_CONTEXT.sub("", text)
     only = len(LINK.findall(text)) == 1
     text = LINK.sub(lambda l: link_tag(l[1], embed_for(l[1], m, only)), text)
     tags = [attachment_tag(a) for a in m.attachments] + [f"[sticker: {s.name}]" for s in m.stickers]
