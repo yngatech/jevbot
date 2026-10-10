@@ -317,7 +317,7 @@ def emoji_vocabulary(guild):
 
 
 def is_word(w):
-    return (w.startswith("@") and len(w) > 1) or w.replace(" ", "").isalnum()
+    return w.replace(" ", "").isalnum()
 
 
 def render(tokens):
@@ -386,7 +386,7 @@ def penalty(reply, word, recent=(), exempt=()):
     local = reply[-REPEAT_WINDOW:].count(word) + 2 * (reply[-1:] == [word])
     p = REPEAT_PENALTY ** local
     seen = reply.count(word)
-    alpha = word.startswith("@") or word.replace(" ", "").isalpha()
+    alpha = word.replace(" ", "").isalpha()
     if alpha and word.lower() not in STOPWORDS:
         p *= CONTENT_PENALTY ** min(seen, CONTENT_PENALTY_CAP)
     elif alpha:
@@ -657,7 +657,7 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
 
 # llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times;
 # pages: a long chat's frozen pages, before llm_history
-async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None, mention_names=()):
+async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None):
     if (name := model_name) != "jev":
         return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at,
                                pages)
@@ -665,8 +665,6 @@ async def generate_reply(message, author, bot_name, history=None, llm_history=No
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
                                 + [f"{author} {message}"]))
-    # A mention is one choice, including multi-word display names, rather than an @ followed by loose words.
-    vocab = vocab[:-1] + [f"@{name}" for name in mention_names if f"@{name}" not in vocab] + [END]
     # Who reacted is left to the LLMs: names didn't change what Jev said (jev_eval's *-laughed-names), and Jev sends
     # the transcript with every word it asks for
     note(transcript=transcript(message, author, bot_name, history, [], reactors=False))
@@ -839,7 +837,7 @@ How {bot} talks:
 - Answers what the friends actually said, with an opinion. If he truly doesn't know, "I not know." — rarely.
 - He's in a Discord chat, not on a spaceship: talks about whatever the chat is about. No Grace, Erid, Astrophage or space unless someone brings it up.
 - Says one thing, to the last message only — not a reply to everyone in the chat. Usually a few words or one short sentence, like the lines below; at most two short sentences.
-- To get someone's attention, use @ followed by their full name as shown in the chat. Bare names just talk about them; don't mention everyone you talk about.
+- To get someone's attention, use @ followed by their full name as shown in the chat, ending with punctuation or a line break. Bare names just talk about them; don't mention everyone you talk about.
 - Never emoji, never says he's a bot or AI. Don't copy the lines below word for word or repeat your earlier replies."""
 
 LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
@@ -1212,7 +1210,8 @@ async def chain_entries(chain):
                 entries.append(entry)
         elif (entries and x.reference and entries[-1]["id"] == x.reference.message_id and "reply" not in entries[-1]
               and x.content and x.content not in NO_MONEY):
-            entries[-1]["reply"], entries[-1]["reply_id"], entries[-1]["reply_at"] = x.content, x.id, x.created_at
+            entries[-1]["reply"], entries[-1]["reply_id"], entries[-1]["reply_at"] = message_text(x), x.id, x.created_at
+            entries[-1]["reply_users"] = message_users(x)
             await attach_reactions(entries[-1], x)
     return entries
 
@@ -1302,10 +1301,12 @@ def history_entry(m):
 
 # IDs stay beside the readable transcript, never in the model's vocabulary. Discord has already resolved these
 # users, so no server-wide member search or extra network request is needed.
-def message_users(m):
+def message_users(m, author_name=None):
     # mentions can also contain the author of a pinged reply, whose name isn't written in the transcript.
-    written = {int(uid) for uid in re.findall(r"<@!?(\d+)>", m.content)}
-    return {str(u.id): u.display_name for u in [m.author, *m.mentions] if u.id == m.author.id or u.id in written}
+    written = set(m.raw_mentions)
+    users = {str(u.id): u.display_name for u in m.mentions if u.id in written}
+    users[str(m.author.id)] = m.author.display_name if author_name is None else author_name
+    return users
 
 
 # Only names in this writer's context are eligible. Keep ambiguous and unknown names too, so a longer unresolved
@@ -1341,24 +1342,56 @@ def mention_targets(entries, bot_name, reactors=False):
             for key, ids in people.items()}
 
 
-# Expand explicit @names and allow only the IDs expanded here. Bare names, raw IDs, roles, @everyone, and reply
-# authors cannot create pings. Longest names match first, case-insensitively, with punctuation left intact.
+# Expand explicit @names outside code and URLs, only when the full name ends at punctuation, a line break, or the
+# end of the reply. A space and more prose could be an unknown longer name, so never guess at that boundary.
 def resolve_mentions(text, targets):
     lookup = {name.casefold(): uid for name, uid in targets.items()}
     names = "|".join(re.escape(name) for name in sorted(targets, key=len, reverse=True))
     allowed = set()
 
     def replace(match):
-        uid = lookup.get(match[1].casefold())
+        name = match["name"]
+        uid = lookup.get(name.casefold()) if name is not None else None
         if uid is None:
             return match[0]
         allowed.add(uid)
         return f"<@{uid}>"
 
     if names:
-        text = re.sub(rf"(?<![\w@])@({names})(?!\w)", replace, text, flags=re.I)
+        protected = r"(?P<ticks>`+)(?:[\s\S]*?(?P=ticks)|[\s\S]*$)|\b(?:[a-z][a-z0-9+.-]*://|www\.)[^\s<>]+"
+        boundary = r"(?=[ \t]*(?:$|[\r\n]|[,.!?;:](?=\s|$)|[)\]}\"'](?=\s|$)|['’]s\b))"
+        text = re.sub(rf"{protected}|(?<![\w@/\\])@(?P<name>{names}){boundary}", replace, text, flags=re.I)
     return text, discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
                                          users=[discord.Object(id=uid) for uid in sorted(allowed)])
+
+
+# Older saved pages predate user IDs. Recover their authors from the original messages without changing any
+# frozen text (or its prompt cache). Most messages are already in the startup scan; fetch older ones only once.
+async def restore_page_users(channel, scanned):
+    pages = long_chats.get(channel.id, {}).get("pages", [])
+    missing = [e for p in pages for e in p if "users" not in e]
+    if not missing:
+        return
+    known = {m.id: m for m in scanned}
+    limit = asyncio.Semaphore(5)
+
+    async def restore(e):
+        try:
+            async with limit:
+                m = known.get(e["id"]) or await channel.fetch_message(e["id"])
+        except discord.NotFound:
+            e["users"] = {}  # a deleted message's author cannot be recovered
+            return
+        except discord.HTTPException:
+            log.warning("Could not recover the author of frozen message %s", e["id"])
+            return
+        e["users"] = {str(m.author.id): e["name"]}
+        if message_text(m) == e["content"]:
+            e["users"] = message_users(m, author_name=e["name"])
+            e["roles"] = [r.name for r in m.role_mentions]
+
+    await asyncio.gather(*(restore(e) for e in missing))
+    save_long_chats()
 
 # People's reactions to a message of jev's, emoji to count — not jev's own
 def reactions_to(m):
@@ -1474,6 +1507,7 @@ async def load_history(first):
             scanned.append(m)
     except Exception as e:  # no Read Message History permission — start empty, like before
         log.warning(f"Loading history for {ch} failed: {e}")
+    await restore_page_users(first.channel, scanned)
     for m in reversed(scanned):  # oldest first, so a side conversation's !nocontext comes before the replies under it
         if (root := m.id if no_context(m) else m.reference and side_of.get(m.reference.message_id)) is not None:
             side_of[m.id] = root
@@ -1673,8 +1707,7 @@ async def on_message_edit(before, after):
     entry = next((e for e in entries_with(after.channel.id, after.id) if e.get("id") == after.id), None)
     if entry and (content := message_text(after)):
         entry["content"] = content
-        entry["name"] = after.author.display_name
-        entry["users"] = message_users(after)
+        entry["users"] = message_users(after, author_name=entry["name"])
         entry["roles"] = [r.name for r in after.role_mentions]
 
 
@@ -1741,7 +1774,9 @@ def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("r
                 if "status" in t:
                     if t.get("status_id", target.id) == target.id and t["status"] == target.content:
                         return t
-                elif t.get("reply_id", target.id) == target.id and t.get("reply") == target.content:
+                elif (t.get("reply_id", target.id) == target.id and
+                      (t.get("sent", t.get("reply")) == target.content or
+                       "sent" not in t and t.get("reply") == target.clean_content)):
                     return t
             elif t.get("message_id") == target.id or ("message_id" not in t
                                                       and t.get("message") == (message_text(target) or "hello")):
@@ -2157,22 +2192,21 @@ async def handle(m, c):
         async with m.channel.typing():
             async with gen_lock:
                 using_llm = model_name != "jev"
-                visible = [e for p in pages or [] for e in p] + long if using_llm else h
-                targets = mention_targets([*visible, entry], bot_name, reactors=using_llm)
+                targets = mention_targets([e for p in pages or [] for e in p] + [*long, entry], bot_name,
+                                          reactors=True) if using_llm else {}
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long,
-                                         at=m.created_at, pages=pages,
-                                         mention_names=[name for name, uid in targets.items() if uid is not None])
+                                         at=m.created_at, pages=pages)
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
-        content, allowed = resolve_mentions(r, targets)
+        content, allowed = resolve_mentions(r, targets) if using_llm else (r, discord.AllowedMentions.none())
+        note(sent=content)  # !why matches the actual Discord text, while reply/tokens keep what the model wrote
         sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
-            entry["reply"], entry["reply_id"], entry["reply_at"] = r, sent.id, sent.created_at  # shown under it from now on
-            pinged = {u.id for u in allowed.users}
-            entry["reply_users"] = {str(uid): name for name, uid in targets.items() if uid in pinged}
+            entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(sent), sent.id, sent.created_at
+            entry["reply_users"] = message_users(sent)
             if root is not None:
                 side_of[sent.id] = root  # replies to it carry on the side conversation
     except Exception as e:
