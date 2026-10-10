@@ -417,7 +417,7 @@ async def choose_reaction(message, author, bot_name, emoji, history=None):
     rng = random.Random()
     # Without past reactions — a run of them reads as a habit to keep up, and jev copies the last emoji
     state = transcript(message, author, bot_name, history, [], reactions=False, marked=True)
-    note(asked_transcript=state)  # for !context
+    note(asked_transcript=state)  # for Context
     shuffled = list(emoji)
     rng.shuffle(shuffled)
     buckets = [shuffled[i:i + MAX_CHOICES] for i in range(0, len(shuffled), MAX_CHOICES)]
@@ -635,7 +635,7 @@ async def generate_filtered_status(bot_name, start, chat=""):
             log.info(f"[STATUS] candidate {len(attempts)}/{STATUS_ATTEMPTS}: {mood} "
                      f"(meaning={score:.2f}, {'accepted' if attempt['accepted'] else 'rejected'})")
             if attempt["accepted"]:
-                # !why and !context keep using the accepted generation, while the full retry history stays local.
+                # !why and Context keep using the accepted generation, while the full retry history stays local.
                 if parent is not None:
                     parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens")
                                    if k in attempt})
@@ -1073,8 +1073,8 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
-# !why and !context on their own in a message, and !model with or without a model's name — the command, or None
-COMMANDS = {"!why", "!context", "!model"}
+# !why on its own in a message, and !model with or without a model's name — the command, or None
+COMMANDS = {"!why", "!model"}
 
 def command(m):
     if m.author.bot:
@@ -1215,7 +1215,7 @@ async def update_status():
 
 # A status is gone when the next comes, so each is also posted in STATUS_CHANNEL, to keep and react to. jev's own
 # messages never enter the history, so a posted status isn't in the next one's recent chat. Its id is logged, so
-# !why and !context can find it.
+# !why and Context can find it.
 async def post_status(mood):
     if not STATUS_CHANNEL:
         return
@@ -1275,7 +1275,7 @@ async def on_message(m):
         heard = True
     if cmd := command(m):
         if not stopping.is_set():
-            await {"!why": why, "!context": context, "!model": model_command}[cmd](m)
+            await {"!why": why, "!model": model_command}[cmd](m)
         return
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
@@ -1410,7 +1410,7 @@ def asked_note(t, bot_name):
     # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
     return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
 
-# How !why and !context answer: a text command with a Discord reply to it, the Why and Context actions (right-click
+# How !why and Context answer: the !why command with a Discord reply to it, the Why and Context actions (right-click
 # a message, Apps) with a message only whoever asked can see. Both quote what people said, so no pings from mentions.
 def reply_to(m):
     async def send(content=None, file=None):
@@ -1443,7 +1443,7 @@ async def explain_why(channel_id, guild, target, send):
     if t.get("llm") and not t.get("reaction"):
         if not t.get("llm_tokens"):
             await send(f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
-                       " — !context shows what it saw")
+                       " — Context shows what it saw")
             log.info(f"[WHY] no tokens from {t['llm']}")
             return
         said = t.get("reply") or t.get("status") or ""
@@ -1475,7 +1475,7 @@ async def explain_why(channel_id, guild, target, send):
         log.info(f"[WHY] chart for reaction {t.get('reaction')}")
 
 
-# !context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,
+# Context: the transcript jev had in view for one of its answers, from the logs — found like !why's. For a reply,
 # the one it picked words from; for a reaction, the question check's, which chose reacting (messages to jev marked
 # "@jev", no past reactions); for a status, its diary entry, with any recent chat. Entries logged without one (out
 # of credit, or from before asked_transcript) get it from their history again — which is logged at the end, so can
@@ -1494,11 +1494,7 @@ def logged_context(t):
                                                        reactions=False, marked=True)
     return t.get("transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [])
 
-async def context(m):
-    if (target := await command_target(m)) is not False:
-        await explain_context(m.channel.id, m.guild, target, reply_to(m))
-
-# !context's answer for `target` (None: the latest in the channel), through send(content=None, file=None)
+# The Context action's answer for `target`, through send(content=None, file=None)
 async def explain_context(channel_id, guild, target, send):
     t = await asyncio.to_thread(find_trace, channel_id, target,
                                 lambda t: "history" in t and (t.get("reply") or t.get("reaction"))
@@ -1524,7 +1520,7 @@ async def explain_context(channel_id, guild, target, send):
     log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
 
 
-# Right-clicking a message for Why or Context: that message, as if !why or !context were a Discord reply to it.
+# Right-clicking a message for Why or Context: that message, as if !why were a Discord reply to it.
 # Charts can take longer than the 3s Discord waits for an answer, so it's deferred ("jev is thinking...") first.
 @bot.tree.context_menu(name="Why")
 async def why_action(interaction: discord.Interaction, target: discord.Message):

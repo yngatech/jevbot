@@ -89,9 +89,9 @@ class MentionTests(_Discord):
 
     async def test_commands_still_ignore_bot_mentions(self):
         for mention in ("<@100000000000000001>", "<@!100000000000000001>", self.role.mention):
-            m = self.message(content=f"{mention} !context", ping=True)
-            self.assertEqual(j.command(m), "!context")
-            m.content = f"{mention}'s !context"
+            m = self.message(content=f"{mention} !why", ping=True)
+            self.assertEqual(j.command(m), "!why")
+            m.content = f"{mention}'s !why"
             self.assertIsNone(j.command(m))
 
     async def test_discord_formatter_handles_channels_and_deleted_mentions(self):
@@ -139,14 +139,12 @@ class MentionTests(_Discord):
         self.assertFalse(j.channel_history[self.channel.id])
 
     async def test_unpinged_diagnostic_reply_still_runs_command(self):
-        for content, handler in (("!why", "why"), ("!context", "context")):
-            with self.subTest(content=content):
-                m = self.message(content=content)
-                with patch.object(j, handler, new_callable=AsyncMock) as command, \
-                        patch.object(j, "respond", new_callable=AsyncMock) as respond:
-                    await j.on_message(m)
-                command.assert_awaited_once_with(m)
-                respond.assert_not_awaited()
+        m = self.message(content="!why")
+        with patch.object(j, "why", new_callable=AsyncMock) as why, \
+                patch.object(j, "respond", new_callable=AsyncMock) as respond:
+            await j.on_message(m)
+        why.assert_awaited_once_with(m)
+        respond.assert_not_awaited()
 
     async def test_catch_up_skips_unpinged_reply_and_answers_pinged_reply(self):
         for ping in (False, True):
