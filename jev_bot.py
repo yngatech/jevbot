@@ -46,6 +46,7 @@ HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged repl
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
+CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on
 STOP_THRESHOLD = 0.5            # let jev stop earlier — the good part is always the first half
 REPEAT_PENALTY = 1.5
 REPEAT_WINDOW = 8
@@ -943,6 +944,42 @@ NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)", re.IGNORECASE)
 def no_context(m):
     return should_respond(m) and NO_CONTEXT.search(strip_mention(m)) is not None
 
+# The Discord replies m is the end of, oldest first, without m — up to CHAIN_DEPTH back, or to a message that's gone
+async def reply_chain(m):
+    chain, cur = [], m
+    while len(chain) < CHAIN_DEPTH and cur.reference and cur.reference.message_id:
+        r = cur.reference.resolved
+        if not isinstance(r, discord.Message):  # Discord only sends the first one up with m
+            r = bot._connection._get_message(cur.reference.message_id)
+        if r is None:
+            try:
+                r = await m.channel.fetch_message(cur.reference.message_id)
+            except discord.HTTPException:  # deleted, or no Read Message History
+                break
+        chain.append(r)
+        cur = r
+    return chain[::-1]
+
+# Replying in a chain that started with "@jev !nocontext ..." carries on that conversation, so it's all jev sees: the
+# chain from the latest !nocontext in it, jev's replies under what they answered. None if there's no !nocontext above.
+async def no_context_chain(m):
+    chain = await reply_chain(m)
+    start = next((i for i in reversed(range(len(chain))) if no_context(chain[i])), None)
+    if start is None:
+        return None
+    entries = []
+    for x in chain[start:]:
+        if x.author.id != bot.user.id:
+            if entry := history_entry(x):
+                entries.append(entry)
+        # jev's other messages in it (a !why chart) are left out; the one m answers is added like any reply of jev's
+        elif (entries and x.reference and entries[-1]["id"] == x.reference.message_id and "reply" not in entries[-1]
+              and x.content and x.content not in NO_MONEY):
+            entries[-1]["reply"], entries[-1]["reply_id"] = x.content, x.id
+            if counts := reactions_to(x):
+                entries[-1]["reply_reactions"] = counts
+    return entries
+
 # m as jev sees it: without the mention (and !nocontext) if it's to jev, links as tags, and a tag for each attachment
 # and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
 def message_text(m):
@@ -1439,12 +1476,16 @@ async def handle(m, c):
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     h = shown(channel_history[m.channel.id][:-1])
-    # The reply of jev's someone is answering, if it isn't already shown under the message it answered
-    if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
-        h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
     if no_context(m):
         h = []  # still in the history above, for the messages after it
         note(no_context=True)
+    else:
+        if (chain := await no_context_chain(m)) is not None:
+            h = chain
+            note(no_context=True)
+        # The reply of jev's someone is answering, if it isn't already shown under the message it answered
+        if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
+            h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
