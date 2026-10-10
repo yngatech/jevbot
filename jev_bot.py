@@ -389,8 +389,9 @@ def reacted(counts, reactors=None):
 
 # marked: mark messages addressed to jev for the question check, including pinged replies without a textual
 # mention. Keep existing mentions in place rather than adding a second one.
-# reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies
-def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None):
+# reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies; reactors: who made them
+def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None,
+               reactors=True):
     their_reactions = reactions if their_reactions is None else their_reactions
     def addressed(text, to_bot=True):
         mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
@@ -401,13 +402,13 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
             if h["role"] == "assistant" and their_reactions:
-                text += reacted(h.get("reactions"), h.get("reactors"))
+                text += reacted(h.get("reactions"), reactors and h.get("reactors"))
             turns.append(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}")
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
             if "reply" in h:
-                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions'), h.get('reply_reactors')) if their_reactions else ''}")
+                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions'), reactors and h.get('reply_reactors')) if their_reactions else ''}")
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
     turns.append(f"{author}: {addressed(unrender(message))}")
@@ -551,10 +552,12 @@ async def generate_reply(message, author, bot_name, history=None, llm_history=No
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
                                 + [f"{author} {message}"]))
-    note(transcript=transcript(message, author, bot_name, history, []))
+    # Who reacted is left to the LLMs: names didn't change what Jev said (jev_eval's *-laughed-names), and Jev sends
+    # the transcript with every word it asks for
+    note(transcript=transcript(message, author, bot_name, history, [], reactors=False))
     # People's reactions stay out of the "complete?" question: with 😂×4 on jev's last reply in view it read a
     # two-word reply as done, and jev stopped at "Dunno forgot" where it had gone on to "Dunno forgot liar bitch"
-    words = await loom(lambda words: transcript(message, author, bot_name, history, words),
+    words = await loom(lambda words: transcript(message, author, bot_name, history, words, reactors=False),
                        vocab, NEXT_WORD.format(bot_name=bot_name),
                        done_state=lambda words: transcript(message, author, bot_name, history, words,
                                                             their_reactions=False),

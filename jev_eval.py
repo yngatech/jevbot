@@ -76,7 +76,8 @@ def by(*names):
 # Someone replying to one of jev's replies, with and without that reply in view
 GIRLFRIEND = [said("kettle", "are you seeing anyone?", 2), rocky_said("No straight happily guy with girlfriend", 1)]
 GIRLFRIEND_LAUGHED = [GIRLFRIEND[0], rocky_said(GIRLFRIEND[1]["content"], 1, {"😂": 4, "💀": 2})]
-# The same laughs, with who laughed — kettle, who asked, among them
+# The same laughs, with who laughed — kettle, who asked, among them. Only an LLM sees the names (see !model): under
+# Jev these should match gf-laughed
 GIRLFRIEND_LAUGHED_NAMES = [GIRLFRIEND[0], rocky_said(GIRLFRIEND[1]["content"], 1, {"😂": 4, "💀": 2},
                                                       {"😂": by("kettle", "pip", "mossy", "The Hedge Wizard"),
                                                        "💀": by("pip", "kettle")})]

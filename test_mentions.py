@@ -146,6 +146,21 @@ class ReactionContextTests(_Discord):
         self.assertEqual(entries[1]["reply_reactors"]["😂"], {"501": "Mossy", "502": "Pipsqueak"})
         self.assertEqual(fetch.await_count, 2)
 
+    async def test_jev_gets_counts_and_llms_get_names(self):
+        self.entry.update(reply_reactions={"😂": 2}, reply_reactors={"😂": {"501": "Moss", "502": "Pip"}})
+        seen = []
+        async def loom(state, *args, **kwargs):
+            seen.append(state([]))
+            return ["Hi"]
+        async def llm(name, message, author, bot_name, history):
+            return j.transcript(message, author, bot_name, history, [])
+        with patch.object(j, "model_name", "jev"), patch.object(j, "loom", loom):
+            await j.generate_reply("how are you?", "Speaker", "Testbot", [self.entry])
+        self.assertIn("Hello (😂×2)", seen[0])
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm_reply", llm):
+            text = await j.generate_reply("how are you?", "Speaker", "Testbot", [self.entry])
+        self.assertIn("Hello (😂 by @Moss, @Pip)", text)
+
     def test_count_shown_only_when_names_are_missing(self):
         self.assertEqual(j.reacted({"😂": 2, "💀": 3}, {"😂": {"1": "Moss", "2": "Pip"}, "💀": {"3": "Fern"}}),
                          " (😂 by @Moss, @Pip; 💀×3 by @Fern)")
