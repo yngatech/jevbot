@@ -174,7 +174,8 @@ class WhyTests(_Case):
         self.assertEqual([r[0] for r in second["rows"]], [" Biscuit", " cat", " called"])
 
     async def test_why_charts_tokens_or_says_there_are_none(self):
-        m = SimpleNamespace(channel=SimpleNamespace(id=300), guild=None, reply=AsyncMock(), reference=None)
+        m = SimpleNamespace(channel=SimpleNamespace(id=300), guild=None,
+                            reply=AsyncMock(return_value=SimpleNamespace(attachments=[])), reference=None)
         logged = {"llm": "kimi", "reply": "Biscuit", "bot_name": "rocky"}
         with patch.object(j, "find_trace", return_value=logged), patch.object(j.why_chart, "render") as render:
             await j.why(m)

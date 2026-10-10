@@ -18,8 +18,9 @@ import signal
 import contextvars
 import hashlib
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from collections import OrderedDict, defaultdict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -1304,8 +1305,16 @@ async def on_message_edit(before, after):
 # API calls.
 WHY_DAYS = 7  # how many days of logs it looks back through
 EXPLANATION_CACHE_ENTRIES = 100
-EXPLANATION_CACHE_BYTES = 32 * 1024 * 1024  # text and attachments; least recently used answers go first
-explanation_cache: OrderedDict = OrderedDict()
+EXPLANATION_EXPIRY_MARGIN = 60  # seconds for Discord to send the embed and the client to load it
+
+@dataclass(frozen=True)
+class CachedExplanation:
+    content: str | None
+    url: str | None = None
+    filename: str | None = None
+    expires: float | None = None
+
+explanation_cache: OrderedDict[tuple, CachedExplanation] = OrderedDict()
 explanation_pending: dict[tuple, asyncio.Task] = {}
 
 # The chart's font has no emoji, so a reaction's are drawn from images: Twemoji's, which Discord's are, and the
@@ -1418,14 +1427,16 @@ def asked_note(t, bot_name):
 # How !why and Context answer: the !why command with a Discord reply to it, the Why and Context actions (right-click
 # a message, Apps) with a message only whoever asked can see. Both quote what people said, so no pings from mentions.
 def reply_to(m):
-    async def send(content=None, file=None):
-        await m.reply(content, file=file, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    async def send(content=None, file=None, embed=None):
+        return await m.reply(content, file=file, embed=embed, mention_author=False,
+                             allowed_mentions=discord.AllowedMentions.none())
     return send
 
 def answer_privately(interaction):
-    async def send(content=None, file=None):
-        await interaction.followup.send(content or discord.utils.MISSING, file=file or discord.utils.MISSING,
-                                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    async def send(content=None, file=None, embed=None):
+        return await interaction.followup.send(content or discord.utils.MISSING, file=file or discord.utils.MISSING,
+                                               embed=embed or discord.utils.MISSING, wait=True, ephemeral=True,
+                                               allowed_mentions=discord.AllowedMentions.none())
     return send
 
 # The chart's file name, from what it's about, so saved charts don't all overwrite why.png:
@@ -1434,59 +1445,116 @@ def why_filename(text, reacted=False):
     words = re.findall(r"[a-z0-9]+", text.lower())[:6]
     return "-".join(["why"] + (["reacted", "to"] if reacted else []) + words)[:60] + ".png"
 
-# Cache the prepared answer, shared by commands and actions. Resolve the trace first: "latest" must follow new
-# answers, edited targets must still match, and deleted logs must stop being shown. Keep bytes, not discord.File:
-# each send needs its own stream, since Discord consumes it. Concurrent requests share the work too.
-async def cached_explanation(kind, channel_id, guild, t):
+# Discord's signing parameters must stay on ephemeral URLs: dropping them makes a 0×0 embed, even when the
+# image can still be downloaded. Unknown expiry isn't safe to cache; expired or deleted attachments are remade.
+def explanation_expiry(url):
+    try:
+        return int(parse_qs(urlsplit(url).query)["ex"][0], 16)
+    except (KeyError, ValueError, IndexError):
+        return 0
+
+async def explanation_attachment_available(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, timeout=aiohttp.ClientTimeout(total=5), allow_redirects=True) as response:
+                return response.status == 200
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        return False
+
+def keep_explanation(key, response):
+    explanation_cache[key] = response
+    explanation_cache.move_to_end(key)
+    while len(explanation_cache) > EXPLANATION_CACHE_ENTRIES:
+        explanation_cache.popitem(last=False)
+
+async def send_cached_explanation(send, response):
+    if response.url is None:
+        await send(response.content)
+    elif response.filename.endswith(".png"):
+        await send(response.content, embed=discord.Embed().set_image(url=response.url))
+    else:
+        await send(f"{response.content}\n[{response.filename}]({response.url})")
+
+# Shared by commands and actions. Resolve the trace first: "latest" must follow new answers, edited targets must
+# still match, and deleted logs must stop being shown. Keep only short text or a signed attachment URL after
+# sending. Concurrent requests share validation, preparation and the first upload, then reuse its hosted file.
+async def send_explanation(kind, channel_id, guild, t, send):
     bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
     candidates = t.get("reaction_candidates") or []
     urls = ()
     if kind == "why" and candidates and not isinstance(candidates[0], str):
         urls = tuple(emoji_url(row[0], guild) for row in candidates)
     key = (kind, channel_id, bot_name, urls, hashlib.sha256(json.dumps(t, sort_keys=True).encode()).digest())
-    if key in explanation_cache:
-        explanation_cache.move_to_end(key)
-        return explanation_cache[key][0]
-
-    async def prepare():
+    async def prepare_and_send():
         try:
+            cached = explanation_cache.get(key)
+            if cached and (cached.url is None or cached.expires > time.time() + EXPLANATION_EXPIRY_MARGIN
+                           and await explanation_attachment_available(cached.url)):
+                try:
+                    await send_cached_explanation(send, cached)
+                except discord.HTTPException:
+                    # A channel may allow attachments but not embeds. Fall back to sending a fresh attachment.
+                    pass
+                else:
+                    keep_explanation(key, cached)
+                    return cached
+            explanation_cache.pop(key, None)
             if kind == "why":
                 response = await why_response(t, guild, bot_name)
             else:
                 response = context_response(t, bot_name)
-            size = sum(len(part.encode() if isinstance(part, str) else part) for part in response if part is not None)
-            if size <= EXPLANATION_CACHE_BYTES:
-                explanation_cache[key] = (response, size)
-                while len(explanation_cache) > EXPLANATION_CACHE_ENTRIES or \
-                        sum(size for _, size in explanation_cache.values()) > EXPLANATION_CACHE_BYTES:
-                    explanation_cache.popitem(last=False)
-            return response
+            content, data, filename = response
+            cached = CachedExplanation(content)
+            if data is None:
+                await send(content)
+            else:
+                stream = io.BytesIO(data)
+                file = discord.File(stream, filename)
+                try:
+                    sent = await send(content, file=file)
+                finally:
+                    file.close()
+                    stream.close()
+                attachments = getattr(sent, "attachments", ())
+                if not attachments:
+                    return None  # delivered, but without a URL to reuse
+                url = attachments[0].url
+                expires = explanation_expiry(url)
+                if expires <= time.time() + EXPLANATION_EXPIRY_MARGIN:
+                    return None
+                cached = CachedExplanation(content, url, filename, expires)
+            keep_explanation(key, cached)
+            return cached
         finally:
             explanation_pending.pop(key, None)
 
-    if key not in explanation_pending:
-        explanation_pending[key] = asyncio.create_task(prepare())
-    # A cancelled interaction mustn't cancel rendering for other people waiting on the same answer.
-    return await asyncio.shield(explanation_pending[key])
-
-async def send_explanation(send, response):
-    content, data, filename = response
-    if data is None:
-        await send(content)
-    else:
-        await send(content, file=discord.File(io.BytesIO(data), filename))
+    if task := explanation_pending.get(key):
+        cached = await asyncio.shield(task)
+        if cached is None:
+            await send_explanation(kind, channel_id, guild, t, send)
+        else:
+            try:
+                await send_cached_explanation(send, cached)
+            except discord.HTTPException:
+                if explanation_cache.get(key) is cached:
+                    explanation_cache.pop(key, None)
+                await send_explanation(kind, channel_id, guild, t, send)
+        return
+    explanation_pending[key] = asyncio.create_task(prepare_and_send())
+    # A cancelled interaction mustn't cancel work for other people waiting on the same answer.
+    await asyncio.shield(explanation_pending[key])
 
 async def why(m):
     if (target := await command_target(m)) is not False:
         await explain_why(m.channel.id, m.guild, target, reply_to(m))
 
-# !why's answer for `target` (None: the latest in the channel), through send(content=None, file=None)
+# !why's answer for `target` (None: the latest in the channel), through send(content=None, file=None, embed=None)
 async def explain_why(channel_id, guild, target, send):
     t = await asyncio.to_thread(find_trace, channel_id, target)
     if t is None:
         await send("Nothing logged for that")
         return
-    await send_explanation(send, await cached_explanation("why", channel_id, guild, t))
+    await send_explanation("why", channel_id, guild, t, send)
 
 # Prepared content, attachment bytes and filename, without any Discord objects tied to a particular send.
 async def why_response(t, guild, bot_name):
@@ -1544,7 +1612,7 @@ def logged_context(t):
                                                        reactions=False, marked=True)
     return t.get("transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [])
 
-# The Context action's answer for `target`, through send(content=None, file=None)
+# The Context action's answer for `target`, through send(content=None, file=None, embed=None)
 async def explain_context(channel_id, guild, target, send):
     t = await asyncio.to_thread(find_trace, channel_id, target,
                                 lambda t: "history" in t and (t.get("reply") or t.get("reaction"))
@@ -1552,7 +1620,7 @@ async def explain_context(channel_id, guild, target, send):
     if t is None:
         await send("Nothing logged for that")
         return
-    await send_explanation(send, await cached_explanation("context", channel_id, guild, t))
+    await send_explanation("context", channel_id, guild, t, send)
 
 def context_response(t, bot_name):
     if "status" in t:

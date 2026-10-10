@@ -7,11 +7,12 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "test")
@@ -32,26 +33,41 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                        "reply": "Tea", "transcript": "Speaker: tea?\n\nTestbot: ", "asked": .9,
                        "steps": [{"word": "tea", "top": [["tea", .8, .8], ["coffee", .2, .2]]}]}
         self.sent = []
+        self.uploads = {}
+        self.check_available = j.explanation_attachment_available
+        self.available = AsyncMock(return_value=True)
         for obj, attr, value in [(j, "LOG_DIR", Path(self.dir.name)), (j.bot._connection, "user", self.user),
-                                 (j, "explanation_cache", OrderedDict()), (j, "explanation_pending", {})]:
+                                 (j, "explanation_cache", OrderedDict()), (j, "explanation_pending", {}),
+                                 (j, "explanation_attachment_available", self.available)]:
             p = patch.object(obj, attr, value)
             p.start()
             self.addCleanup(p.stop)
 
     def target(self, t=None, *, original=False):
         t = self.logged if t is None else t
-        return Mock(spec=discord.Message, id=t["message_id"] if original else t["reply_id"],
+        return Mock(spec=discord.Message, id=t["message_id"] if original else t.get("status_id", t.get("reply_id")),
                     author=SimpleNamespace(id=500) if original else self.user,
-                    content=t["message"] if original else t["reply"])
+                    content=t["message"] if original else t.get("status", t.get("reply")))
 
     async def capture(self, content=None, **kwargs):
         file = kwargs.get("file")
         data = None
+        attachments = []
         if file is not None and file is not discord.utils.MISSING:
             data = file.fp.read()
+            route = "ephemeral-attachments" if kwargs.get("ephemeral") else "attachments"
+            expires = int(time.time()) + 3600
+            url = (f"https://cdn.discordapp.com/{route}/300/{900 + len(self.uploads)}/{file.filename}"
+                   f"?ex={expires:x}&is={expires - 3600:x}&hm=synthetic-signature")
+            self.uploads[url] = data  # a stand-in for Discord's hosted files, outside the bot's cache
+            attachments = [SimpleNamespace(url=url)]
             file.close()
-            file.fp.close()  # closing a sent stream mustn't break the next request
+            file.fp.close()
         self.sent.append((content, file, data, kwargs))
+        return SimpleNamespace(attachments=attachments)
+
+    def chart_bytes(self, sent):
+        return sent[2] if sent[2] is not None else self.uploads[sent[3]["embed"].image.url]
 
     def command(self, target=None):
         return SimpleNamespace(channel=self.channel, guild=self.guild, reply=AsyncMock(side_effect=self.capture),
@@ -66,7 +82,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         await {"why": j.explain_why, "context": j.explain_context}[kind](
             self.channel.id, self.guild, self.target(t), self.capture)
 
-    async def test_commands_and_actions_reuse_a_real_chart_with_fresh_files(self):
+    async def test_commands_and_actions_reuse_a_real_chart_without_reuploading(self):
         j.write_trace(self.logged)
         with patch.object(j.why_chart, "render", wraps=j.why_chart.render) as render:
             await j.why(self.command())  # latest
@@ -74,37 +90,59 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
             await j.why_action.callback(interaction, self.target())  # jev's reply
             await j.why(self.command(self.target(original=True)))  # the message jev answered
         render.assert_called_once()
-        files = [s[1] for s in self.sent]
-        self.assertEqual(len({id(f) for f in files}), 3)
-        self.assertTrue(all(f.fp.closed for f in files))
-        self.assertTrue(all(f.filename == "why-tea.png" for f in files))
+        self.assertEqual(len(self.uploads), 1)
+        self.assertTrue(self.sent[0][1].fp.closed)
+        self.assertEqual(self.sent[0][1].filename, "why-tea.png")
         png = self.sent[0][2]
         self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
-        self.assertTrue(all(s[2] == png for s in self.sent))
+        self.assertTrue(all(self.chart_bytes(s) == png for s in self.sent))
+        url = next(iter(self.uploads))
+        self.assertEqual([s[3]["embed"].image.url for s in self.sent[1:]], [url, url])
+        self.assertIs(self.sent[1][1], discord.utils.MISSING)
+        cached, = j.explanation_cache.values()
+        self.assertEqual(cached.url, url)
+        self.assertTrue(all(value is None or isinstance(value, (str, int, float)) for value in vars(cached).values()))
         self.assertTrue(self.sent[1][3]["ephemeral"])
         self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
         interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
 
-    async def test_context_commands_and_actions_reuse_inline_and_attached_transcripts(self):
+    async def test_context_actions_reuse_inline_and_attached_transcripts(self):
         for text in ("Speaker: tea? @everyone ```\n\nTestbot: ", "Speaker: " + "tea " * 600):
             with self.subTest(attached=len(text) > j.CONTEXT_LIMIT):
                 self.logged["transcript"] = text
                 j.write_trace(self.logged)
                 self.sent.clear()
                 with patch.object(j, "logged_context", wraps=j.logged_context) as context:
-                    await j.context(self.command())
+                    await j.context_action.callback(self.interaction(), self.target())
                     await j.context_action.callback(self.interaction(), self.target())
                 context.assert_called_once()
-                self.assertEqual(self.sent[0][0], self.sent[1][0])
                 if len(text) > j.CONTEXT_LIMIT:
-                    self.assertEqual([s[2] for s in self.sent], [text.encode(), text.encode()])
-                    self.assertIsNot(self.sent[0][1], self.sent[1][1])
-                    self.assertEqual(self.sent[1][1].filename, "context.txt")
+                    self.assertEqual(self.sent[0][2], text.encode())
+                    self.assertEqual(self.sent[0][1].filename, "context.txt")
+                    self.assertIs(self.sent[1][1], discord.utils.MISSING)
+                    url = next(reversed(self.uploads))
+                    self.assertEqual(self.sent[1][0], f"{self.sent[0][0]}\n[context.txt]({url})")
                 else:
+                    self.assertEqual(self.sent[0][0], self.sent[1][0])
                     self.assertIn(j.unfence(text), self.sent[0][0])
-                    self.assertIsNone(self.sent[0][1])
+                    self.assertIs(self.sent[0][1], discord.utils.MISSING)
                 self.assertTrue(self.sent[1][3]["ephemeral"])
                 self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_a_private_upload_is_reused_with_all_signing_parameters(self):
+        j.write_trace(self.logged)
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
+            await j.why_action.callback(self.interaction(), self.target())
+            await j.why(self.command())
+            await j.why_action.callback(self.interaction(), self.target())
+        render.assert_called_once()
+        self.assertEqual(len(self.uploads), 1)
+        url = next(iter(self.uploads))
+        self.assertIn("/ephemeral-attachments/", url)
+        self.assertIn("&hm=synthetic-signature", url)
+        self.assertEqual([s[3]["embed"].image.url for s in self.sent[1:]], [url, url])
+        self.assertTrue(self.sent[2][3]["ephemeral"])
+        self.assertTrue(self.sent[0][3]["wait"])
 
     async def test_latest_updates_and_an_older_target_keeps_its_own_chart(self):
         j.write_trace(self.logged)
@@ -113,13 +151,14 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                      steps=[{"word": "coffee", "top": [["coffee", .9, .9]]}])
         with patch.object(j.why_chart, "render", side_effect=[b"tea chart", b"coffee chart"]) as render:
             await j.why(self.command())
-            await j.context(self.command())
+            await j.context_action.callback(self.interaction(), self.target())
             j.write_trace(newer)
             await j.why(self.command())
-            await j.context(self.command())
+            await j.context_action.callback(self.interaction(), self.target(newer))
             await self.explain()
         self.assertEqual(render.call_count, 2)
-        self.assertEqual([self.sent[i][2] for i in (0, 2, 4)], [b"tea chart", b"coffee chart", b"tea chart"])
+        self.assertEqual([self.chart_bytes(self.sent[i]) for i in (0, 2, 4)], [b"tea chart", b"coffee chart", b"tea chart"])
+        self.assertEqual(len(self.uploads), 2)
         self.assertIn("tea?", self.sent[1][0])
         self.assertIn("coffee?", self.sent[3][0])
 
@@ -170,10 +209,10 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
             j.write_trace(status)
             await j.why(self.command())
             await j.why(self.command())
-            await j.context(self.command())
-            await j.context(self.command())
+            await j.context_action.callback(self.interaction(), self.target(status))
+            await j.context_action.callback(self.interaction(), self.target(status))
         self.assertEqual(render.call_count, 2)
-        self.assertTrue(all(s[2].startswith(b"\x89PNG") for s in self.sent[:4]))
+        self.assertTrue(all(self.chart_bytes(s).startswith(b"\x89PNG") for s in self.sent[:4]))
         self.assertEqual(self.sent[4][0], self.sent[5][0])
         self.assertIn("before the status", self.sent[4][0])
 
@@ -227,23 +266,60 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 await self.explain(traces[n])
         self.assertEqual(render.call_count, 4)
 
-    async def test_byte_limit_evicts_old_charts_and_oversized_charts_are_still_sent(self):
-        newer = dict(self.logged, message_id=11, reply_id=21)
+    async def test_expiring_urls_are_regenerated_before_the_client_can_receive_an_expired_image(self):
         j.write_trace(self.logged)
-        j.write_trace(newer)
-        with patch.object(j, "EXPLANATION_CACHE_BYTES", 80), \
-                patch.object(j.why_chart, "render", return_value=b"a" * 40) as render:
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
             await self.explain()
-            await self.explain(newer)
+            cached, = j.explanation_cache.values()
+            with patch.object(j.time, "time", return_value=cached.expires - j.EXPLANATION_EXPIRY_MARGIN):
+                await self.explain()
+                await self.explain()
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(len(self.uploads), 2)
+        self.assertEqual(self.sent[2][3]["embed"].image.url, next(reversed(self.uploads)))
+        self.available.assert_awaited_once()  # the expiring URL was rejected before a network check
+
+    async def test_a_deleted_hosted_attachment_is_regenerated_and_reuploaded(self):
+        j.write_trace(self.logged)
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
             await self.explain()
-        self.assertEqual(render.call_count, 3)
-        j.explanation_cache.clear()
-        with patch.object(j, "EXPLANATION_CACHE_BYTES", 80), \
-                patch.object(j.why_chart, "render", return_value=b"a" * 100) as render:
-            await self.explain()
+            self.available.return_value = False
             await self.explain()
         self.assertEqual(render.call_count, 2)
-        self.assertEqual([s[2] for s in self.sent[-2:]], [b"a" * 100] * 2)
+        self.assertEqual(len(self.uploads), 2)
+        self.assertEqual([s[2] for s in self.sent], [b"chart", b"chart"])
+
+    async def test_unknown_expiry_or_missing_attachments_do_not_cache_an_unsafe_url(self):
+        for url in (None, "https://cdn.discordapp.com/attachments/300/900/why-tea.png",
+                    "https://cdn.discordapp.com/attachments/300/900/why-tea.png?ex=invalid&hm=synthetic"):
+            with self.subTest(url=url), patch.object(j.why_chart, "render", return_value=b"chart") as render:
+                j.explanation_cache.clear()
+
+                async def send(*args, **kwargs):
+                    await self.capture(*args, **kwargs)
+                    return SimpleNamespace(attachments=[SimpleNamespace(url=url)] if url else [])
+
+                await j.send_explanation("why", 300, self.guild, self.logged, send)
+                await j.send_explanation("why", 300, self.guild, self.logged, send)
+                self.assertEqual(render.call_count, 2)
+                self.assertEqual(len(j.explanation_cache), 0)
+
+    async def test_attachment_availability_checks_the_full_url_and_handles_errors(self):
+        url = "https://cdn.discordapp.com/attachments/300/900/why-tea.png?ex=ffffffff&hm=synthetic"
+        for status in (200, 403, 404, 503):
+            with self.subTest(status=status):
+                session = MagicMock()
+                session.__aenter__.return_value = session
+                session.head.return_value.__aenter__.return_value = SimpleNamespace(status=status)
+                with patch.object(j.aiohttp, "ClientSession", return_value=session):
+                    self.assertEqual(await self.check_available(url), status == 200)
+                self.assertEqual(session.head.call_args.args[0], url)
+        for error in (j.aiohttp.ClientError("synthetic network failure"), asyncio.TimeoutError()):
+            session = MagicMock()
+            session.__aenter__.return_value = session
+            session.head.return_value.__aenter__.side_effect = error
+            with patch.object(j.aiohttp, "ClientSession", return_value=session):
+                self.assertFalse(await self.check_available(url))
 
     async def test_failed_render_is_retried(self):
         j.write_trace(self.logged)
@@ -253,34 +329,132 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
             await self.explain()
             await self.explain()
         self.assertEqual(render.call_count, 2)
-        self.assertEqual([s[2] for s in self.sent], [b"chart", b"chart"])
+        self.assertEqual([self.chart_bytes(s) for s in self.sent], [b"chart", b"chart"])
 
-    async def test_concurrent_requests_share_preparation_even_if_one_is_cancelled(self):
-        for cancel in (False, True):
-            with self.subTest(cancel=cancel):
+    async def test_failed_upload_is_retried_without_caching_bytes_or_a_url(self):
+        send = AsyncMock(side_effect=[RuntimeError("upload failed"), SimpleNamespace(attachments=[])])
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
+            with self.assertRaisesRegex(RuntimeError, "upload failed"):
+                await j.send_explanation("why", 300, self.guild, self.logged, send)
+            self.assertEqual(len(j.explanation_cache), 0)
+            await j.send_explanation("why", 300, self.guild, self.logged, self.capture)
+            await j.send_explanation("why", 300, self.guild, self.logged, self.capture)
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(len(self.uploads), 1)
+
+    async def test_rejected_embed_falls_back_to_a_fresh_attachment(self):
+        async def send(*args, **kwargs):
+            if kwargs.get("embed"):
+                raise discord.Forbidden(Mock(status=403, reason="Forbidden"), "synthetic embed rejection")
+            return await self.capture(*args, **kwargs)
+
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
+            await j.send_explanation("why", 300, self.guild, self.logged, send)
+            await j.send_explanation("why", 300, self.guild, self.logged, send)
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(len(self.uploads), 2)
+
+    async def test_a_concurrent_caller_with_rejected_embeds_gets_a_fresh_attachment(self):
+        for phase in ("upload", "validation"):
+            with self.subTest(phase=phase):
                 j.explanation_cache.clear()
+                self.uploads.clear()
+                self.sent.clear()
+                started, finish = asyncio.Event(), asyncio.Event()
+
+                async def wait_for_other_caller():
+                    started.set()
+                    await finish.wait()
+
+                async def send(*args, **kwargs):
+                    if phase == "upload" and kwargs.get("file"):
+                        await wait_for_other_caller()
+                    return await self.capture(*args, **kwargs)
+
+                async def check(url):
+                    await wait_for_other_caller()
+                    return True
+
+                async def reject_embed(*args, **kwargs):
+                    if kwargs.get("embed"):
+                        raise discord.Forbidden(Mock(status=403, reason="Forbidden"), "synthetic embed rejection")
+                    return await self.capture(*args, **kwargs)
+
+                with patch.object(j.why_chart, "render", return_value=b"chart") as render:
+                    if phase == "validation":
+                        await j.send_explanation("why", 300, self.guild, self.logged, self.capture)
+                        self.available.side_effect = check
+                    first = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, send))
+                    await asyncio.wait_for(started.wait(), 1)
+                    second = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, reject_embed))
+                    await asyncio.sleep(0)
+                    finish.set()
+                    await asyncio.gather(first, second)
+                    self.available.side_effect = None
+                    await j.send_explanation("why", 300, self.guild, self.logged, self.capture)
+                self.assertEqual(render.call_count, 2)
+                self.assertEqual(len(self.uploads), 2)
+                self.assertEqual(self.sent[-1][3]["embed"].image.url, next(reversed(self.uploads)))
+
+    async def test_concurrent_requests_share_render_and_upload_even_if_one_is_cancelled(self):
+        for phase, cancel in (("render", False), ("render", True), ("upload", False), ("upload", True)):
+            with self.subTest(phase=phase, cancel=cancel):
+                j.explanation_cache.clear()
+                self.uploads.clear()
+                self.sent.clear()
                 started, finish = asyncio.Event(), asyncio.Event()
 
                 async def prepare(*args):
-                    started.set()
-                    await finish.wait()
+                    if phase == "render":
+                        started.set()
+                        await finish.wait()
                     return None, b"chart", "why-tea.png"
 
+                async def send(*args, **kwargs):
+                    if phase == "upload" and kwargs.get("file"):
+                        started.set()
+                        await finish.wait()
+                    return await self.capture(*args, **kwargs)
+
                 with patch.object(j, "why_response", side_effect=prepare) as render:
-                    first = asyncio.create_task(j.cached_explanation("why", 300, self.guild, self.logged))
+                    first = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, send))
                     await asyncio.wait_for(started.wait(), 1)
-                    second = asyncio.create_task(j.cached_explanation("why", 300, self.guild, self.logged))
+                    second = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, send))
                     await asyncio.sleep(0)  # the second caller joins the work before it finishes
                     if cancel:
                         first.cancel()
                         with self.assertRaises(asyncio.CancelledError):
                             await first
                     finish.set()
-                    self.assertEqual(await second, (None, b"chart", "why-tea.png"))
+                    await second
                     if not cancel:
-                        self.assertEqual(await first, await second)
-                    self.assertEqual(await j.cached_explanation("why", 300, self.guild, self.logged), await second)
+                        await first
+                    await j.send_explanation("why", 300, self.guild, self.logged, send)
                 render.assert_awaited_once()
+                self.assertEqual(len(self.uploads), 1)
+                self.assertEqual(len(self.sent), 3)
+                self.assertTrue(all(self.chart_bytes(s) == b"chart" for s in self.sent))
+
+    async def test_concurrent_cache_hits_share_the_availability_check(self):
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def check(url):
+            started.set()
+            await finish.wait()
+            return True
+
+        with patch.object(j.why_chart, "render", return_value=b"chart") as render:
+            await j.send_explanation("why", 300, self.guild, self.logged, self.capture)
+            self.available.side_effect = check
+            first = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, self.capture))
+            await asyncio.wait_for(started.wait(), 1)
+            second = asyncio.create_task(j.send_explanation("why", 300, self.guild, self.logged, self.capture))
+            await asyncio.sleep(0)
+            finish.set()
+            await asyncio.gather(first, second)
+        render.assert_called_once()
+        self.available.assert_awaited_once()
+        self.assertEqual(len(self.uploads), 1)
 
 
 if __name__ == "__main__":

@@ -193,7 +193,8 @@ class ActionTests(_Discord):
 
     def interaction(self):
         return SimpleNamespace(channel_id=self.channel.id, guild=self.guild,
-                               response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
+                               response=SimpleNamespace(defer=AsyncMock()),
+                               followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(attachments=[]))))
 
     def test_actions_are_message_context_menus(self):
         menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
