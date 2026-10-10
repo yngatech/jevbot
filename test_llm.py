@@ -9,7 +9,7 @@ import unittest
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
 os.environ.setdefault("OPENROUTER_API_KEY", "test")
@@ -105,6 +105,22 @@ class ReplyTests(_Case):
         self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
         self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for Context
 
+    async def test_reply_logs_the_prompt_size_for_context(self):
+        j.model_name = "kimi"
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
+            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 3_100, "cost": 0.001}}))
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+            await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
+        messages = session.post.call_args.kwargs["json"]["messages"]
+        self.assertEqual(self.trace["llm_window"], 262_144)
+        self.assertEqual(self.trace["llm_prompt_tokens"], 3_100)
+        self.assertEqual(self.trace["llm_prompt_chars"], sum(len(m["content"]) for m in messages))
+        chat = self.trace["transcript"].rsplit("\n", 1)[0]
+        self.assertIn(chat, messages[1]["content"])
+        self.assertEqual(self.trace["llm_chat_chars"], len(chat))
+
     async def test_transcript_shows_the_local_time_when_the_minute_changes_and_a_line_per_day(self):
         j.model_name = "deepseek"
         utc = j.timezone.utc
@@ -186,13 +202,17 @@ class StatusTests(_Case):
         self.assertIn("kettle: my cat knocked my tea over", self.trace["transcript"])
         self.assertEqual(self.trace["llm"], "deepseek")
 
-    async def test_accepted_status_keeps_its_tokens_for_why(self):
+    async def test_accepted_status_keeps_its_tokens_for_why_and_its_prompt_size_for_context(self):
         j.model_name = "deepseek"
-        with patch.object(j, "llm", AsyncMock(return_value=("I feel cat is tiny disaster.", TOKENS))), \
-                patch.object(j, "status_score", AsyncMock(return_value=0.9)):
-            mood = await j.generate_filtered_status("rocky", ["i", "feel"])
+        sizes = iter([2_000, 3_000])
+        async def llm(name, messages):
+            j.note(llm_window=1, llm_prompt_tokens=next(sizes), llm_prompt_chars=1)
+            return "I feel cat is tiny disaster.", TOKENS
+        with patch.object(j, "llm", llm), patch.object(j, "status_score", AsyncMock(side_effect=[0.1, 0.9])):
+            mood = await j.generate_filtered_status("rocky", ["i", "feel"], "kettle: cat")
         self.assertEqual(mood, "I feel cat is tiny disaster.")
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
+        self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("kettle: cat")))
 
 
 class WhyTests(_Case):

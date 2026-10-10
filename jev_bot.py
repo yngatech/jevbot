@@ -668,7 +668,9 @@ async def generate_filtered_status(bot_name, start, chat=""):
             if attempt["accepted"]:
                 # !why and Context keep using the accepted generation, while the full retry history stays local.
                 if parent is not None:
-                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens")
+                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens",
+                                                           "llm_window", "llm_prompt_tokens", "llm_prompt_chars",
+                                                           "llm_chat_chars")
                                    if k in attempt})
                     parent["status_score"] = score
                 return mood
@@ -692,12 +694,13 @@ async def generate_filtered_status(bot_name, start, chat=""):
 #     it, and Haiku put it on 40 of 46 replies even when told to only use it for real questions
 #   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
 #   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
+#   window: its context length on OpenRouter, in tokens, for Context's usage
 LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLMS = {
-    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True},
+    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576},
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
-              "tail": " Like Rocky: a few words, one short sentence at most."},
-    "kimi": {"id": "moonshotai/kimi-k2-0905"},
+              "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000},
+    "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
 }
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
@@ -789,6 +792,9 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
             if (t := trace.get()) is not None:
                 t["cost"] += data.get("usage", {}).get("cost") or 0
                 t["requests"] += 1
+            # For Context: the prompt's exact size, and its length in characters to split it by
+            note(llm_window=spec["window"], llm_prompt_tokens=data.get("usage", {}).get("prompt_tokens"),
+                 llm_prompt_chars=sum(len(m["content"]) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
             return choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content"))
@@ -800,6 +806,7 @@ async def llm_reply(name, message, author, bot_name, history=None, at=None):
     state = transcript(message, author, bot_name, history, [], at=at or datetime.now(timezone.utc))
     note(transcript=state, llm=name, llm_model=spec["id"], history=history or [])  # what it saw, not Jev's share
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
+    note(llm_chat_chars=len(chat))
     # Says who it's answering: asked for "rocky's next message", Haiku kept opening with the name its earlier replies
     # did ("Binja, ...") when someone else asked. Not quoting the message — it echoed a name in it back.
     ask = (f"The chat so far, times in {TIMEZONE.key}:\n\n{chat}\n\n"
@@ -824,7 +831,7 @@ async def llm_status(name, bot_name, start, chat=""):
     spec = LLMS[name]
     opener = render(start)
     ask = (f"Recent chat in the server:\n{chat}\n\n" if chat else "") + LLM_STATUS.format(bot=bot_name, start=opener)
-    note(transcript=ask, llm=name, llm_model=spec["id"])
+    note(transcript=ask, llm=name, llm_model=spec["id"], llm_chat_chars=len(chat))
     text, tokens = await llm(name, [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
                               {"role": "user", "content": ask}])
     mood = " ".join(clean_llm(text, bot_name).split())  # one line
@@ -1696,6 +1703,25 @@ async def explain_context(channel_id, guild, target, send):
         return
     await send_explanation("context", channel_id, guild, t, send)
 
+# How much of an LLM's window the answer took: the exact total, split between the chat it saw and the rest of the prompt
+# by their share of its characters, since a request's usage only gives the total. A character of chat is worth
+# CHAT_TOKEN_WEIGHT of the prompt's — names, times and short words. Against exact counts with all three LLMs, the
+# chat came out within 2% for 220- and 378-line transcripts (10% low unweighted), and a few tokens off for one line.
+CHAT_TOKEN_WEIGHT = 1.25
+
+def window_usage(t):
+    if not (tokens := t.get("llm_prompt_tokens")) or not t.get("llm_prompt_chars"):
+        return ""
+    window = t["llm_window"]
+    chat_chars = CHAT_TOKEN_WEIGHT * t.get("llm_chat_chars", 0)
+    chat = round(tokens * chat_chars / (chat_chars + t["llm_prompt_chars"] - t.get("llm_chat_chars", 0)))
+    used = tokens / window
+    messages = f" ({len(t['history']) + 1} messages)" if "history" in t and "status" not in t else ""
+    return (f"**{t['llm']}**: {tokens:,} of {window:,} tokens in its window — "
+            f"{'<0.1%' if used < 0.001 else f'{used:.1%}'} used, {1 - used:.1%} free\n"
+            f"- prompt: ~{tokens - chat:,} tokens\n"
+            f"- chat: ~{chat:,} tokens{messages}\n")
+
 def context_response(t, bot_name):
     if "status" in t:
         what = "its status"
@@ -1705,11 +1731,12 @@ def context_response(t, bot_name):
         head = (f"What {bot_name} saw before {what} \"{unfence(t['message'][:80])}\""
                 + (" (!nocontext)" if t.get("no_context") else ""))
     text = logged_context(t)
-    body = f"{head}:\n```\n{unfence(text)}\n```"
+    usage = window_usage(t)
+    body = f"{head}:\n{usage}```\n{unfence(text)}\n```"
     log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
     if len(body) <= CONTEXT_LIMIT:
         return body, None, None
-    return head, text.encode(), "context.txt"
+    return (f"{head}:\n{usage}".rstrip() if usage else head), text.encode(), "context.txt"
 
 
 # Right-clicking a message for Why or Context: that message, as if !why were a Discord reply to it.

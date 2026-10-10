@@ -156,6 +156,35 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(self.sent[1][3]["ephemeral"])
                 self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
 
+    async def test_context_shows_how_much_of_an_llms_window_it_used(self):
+        usage = {"llm": "haiku", "llm_window": 1_000_000, "llm_prompt_tokens": 9_800, "llm_prompt_chars": 30_000,
+                 "llm_chat_chars": 20_000, "history": [{"author": "Speaker", "content": "hi"}] * 199}
+        with patch.object(j, "STATUS_CHANNEL", self.channel.id):
+            for name, t, chat in [
+                    ("reply", dict(self.logged, **usage), "~7,000 tokens (200 messages)"),
+                    ("long reply", dict(self.logged, **usage, transcript="Speaker: " + "tea " * 600),
+                     "~7,000 tokens (200 messages)"),
+                    ("status", {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40,
+                                "bot_name": "Testbot", "transcript": "Recent chat", **usage}, "~7,000 tokens\n")]:
+                with self.subTest(name):
+                    self.sent.clear()
+                    j.write_trace(t)
+                    await j.context_action.callback(self.interaction(), self.target(t))
+                    content = self.sent[0][0]
+                    # chat's 20,000 characters count 1.25 times against the prompt's other 10,000: 7,000 of 9,800
+                    self.assertIn("**haiku**: 9,800 of 1,000,000 tokens in its window — 1.0% used, 99.0% free\n"
+                                  "- prompt: ~2,800 tokens\n- chat: " + chat, content + "\n")
+                    self.assertLess(content.index("free"), content.index("```") if "```" in content else len(content))
+
+    async def test_context_for_jev_or_an_older_log_has_no_window_usage(self):
+        for t in (self.logged, dict(self.logged, llm="haiku")):
+            with self.subTest(llm=t.get("llm")):
+                self.sent.clear()
+                j.write_trace(t)
+                await j.context_action.callback(self.interaction(), self.target(t))
+                self.assertTrue(self.sent[0][0].startswith('What Testbot saw before replying to "tea?":\n```'))
+                self.assertNotIn("window", self.sent[0][0])
+
     async def test_a_private_upload_is_reused_with_all_signing_parameters(self):
         j.write_trace(self.logged)
         with patch.object(j.why_chart, "render", return_value=b"chart") as render:
