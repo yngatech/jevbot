@@ -934,23 +934,10 @@ async def wait_for_credit():
 def bot_role(m):
     return m.guild.self_role if m.guild else None
 
-# A mention used as a name ("@rocky's seeing…") becomes the bot's name — dropped, it left "'s" behind, which jev
-# then picked as a word
+# Ignore bot mentions when parsing commands.
 def strip_mention(m):
     mention = rf"<@!?{bot.user.id}>" + (f"|{re.escape(role.mention)}" if (role := bot_role(m)) else "")
-    c = re.sub(rf"(?:{mention})(?=')", (m.guild.me if m.guild else bot.user).display_name, m.content)
-    return re.sub(mention, "", c).strip()
-
-# Discord sends mentions as IDs. Show the names people see, keeping each mention where it was written.
-def mention_text(m):
-    users = {u.id: u.display_name for u in m.mentions}
-    roles = {r.id: r.name for r in m.role_mentions}
-    def replace(match):
-        names = roles if match[1] == "&" else users
-        name = names.get(int(match[2]))
-        return f"@{name}" if name is not None else match[0]
-
-    return re.sub(r"<@([!&]?)(\d+)>", replace, m.content)
+    return re.sub(mention, "", m.content).strip()
 
 # Links, e.g. a GIF from Discord's picker (https://klipy.com/gifs/azumanga-daioh-sakai) — shown as a tag with the
 # embed's title (a tweet's has none, so its author and the start of its text), or the link's site and path words while there's no embed.
@@ -1063,7 +1050,7 @@ async def side_root(m):
 # m as jev sees it: mentions as readable names, without !nocontext if it's to jev, links as tags, and a tag for each attachment
 # and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
 def message_text(m):
-    text = mention_text(m)
+    text = m.clean_content
     if should_respond(m):
         text = NO_CONTEXT.sub("", text)
     only = len(LINK.findall(text)) == 1

@@ -19,11 +19,18 @@ import discord
 import jev_bot as j
 
 
+class _Message(SimpleNamespace):
+    # Exercise discord.py's real formatter rather than mocking its output.
+    clean_content = property(discord.Message.clean_content.function)
+
+
 class _Discord(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.user = SimpleNamespace(id=100, bot=True, display_name="Testbot")
-        self.role = SimpleNamespace(id=200, mention="<@&200>", name="Testbot")
-        self.guild = SimpleNamespace(self_role=self.role, me=self.user, threads=[])
+        self.user = SimpleNamespace(id=100000000000000001, bot=True, display_name="Testbot")
+        self.role = SimpleNamespace(id=200000000000000001, mention="<@&200000000000000001>", name="Testbot")
+        self.guild = SimpleNamespace(self_role=self.role, me=self.user, threads=[],
+                                     get_member=lambda _: None, get_role=lambda _: None,
+                                     _resolve_channel=lambda _: None)
         self.channel = Mock(id=300)
         self.channel.permissions_for.return_value = SimpleNamespace(read_messages=True, read_message_history=True)
         self.guild.text_channels = [self.channel]
@@ -46,7 +53,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
 
 class MentionTests(_Discord):
     def message(self, *, content="hello", ping=False, role=False, reply=True, dm=False, author_bot=False):
-        return SimpleNamespace(
+        return _Message(
             id=600, content=content, guild=None if dm else self.guild, channel=self.channel,
             author=SimpleNamespace(id=500, bot=author_bot, display_name="Speaker"),
             mentions=[self.user] if ping else [], role_mentions=[self.role] if role else [],
@@ -55,8 +62,8 @@ class MentionTests(_Discord):
         )
 
     async def test_mentions_stay_in_place_in_reply_and_reaction_context(self):
-        for mention, options in (("<@100>", {"ping": True}), ("<@!100>", {"ping": True}),
-                                 ("<@&200>", {"role": True})):
+        for mention, options in (("<@100000000000000001>", {"ping": True}), ("<@!100000000000000001>", {"ping": True}),
+                                 ("<@&200000000000000001>", {"role": True})):
             with self.subTest(mention=mention):
                 m = self.message(content=f"think {mention} is drunk?", **options)
                 text = j.message_text(m)
@@ -68,9 +75,9 @@ class MentionTests(_Discord):
                                            "Speaker: think @Testbot is drunk?\nTestbot: ")
 
     async def test_other_mentions_and_possessives_are_preserved(self):
-        m = self.message(content="<@100>'s friend <@!101> likes <@&201>", ping=True)
-        m.mentions.append(SimpleNamespace(id=101, display_name="Friend"))
-        m.role_mentions.append(SimpleNamespace(id=201, name="Readers"))
+        m = self.message(content="<@100000000000000001>'s friend <@!100000000000000002> likes <@&200000000000000002>", ping=True)
+        m.mentions.append(SimpleNamespace(id=100000000000000002, display_name="Friend"))
+        m.role_mentions.append(SimpleNamespace(id=200000000000000002, name="Readers"))
         self.assertEqual(j.message_text(m), "@Testbot's friend @Friend likes @Readers")
 
     async def test_question_check_still_marks_pinged_reply_without_textual_mention(self):
@@ -81,8 +88,24 @@ class MentionTests(_Discord):
                          "Speaker: @Testbot is drunk?\nTestbot: ")
 
     async def test_commands_still_ignore_bot_mentions(self):
-        m = self.message(content="<@100> !context", ping=True)
-        self.assertEqual(j.command(m), "!context")
+        for mention in ("<@100000000000000001>", "<@!100000000000000001>", self.role.mention):
+            m = self.message(content=f"{mention} !context", ping=True)
+            self.assertEqual(j.command(m), "!context")
+            m.content = f"{mention}'s !context"
+            self.assertIsNone(j.command(m))
+
+    async def test_discord_formatter_handles_channels_and_deleted_mentions(self):
+        self.guild._resolve_channel = lambda id: SimpleNamespace(name="general") if id == 300000000000000001 else None
+        m = self.message(content="<@100000000000000001> see <#300000000000000001>", ping=True)
+        self.assertEqual(j.message_text(m), "@Testbot see #general")
+        m.content = "<@100000000000000099> <@&200000000000000099> <#300000000000000099>"
+        self.assertEqual(j.message_text(m), "@deleted-user @deleted-role #deleted-channel")
+        m.content = "@everyone @here"
+        self.assertEqual(j.message_text(m), "@\u200beveryone @\u200bhere")
+
+    async def test_dm_mentions_keep_readable_names(self):
+        m = self.message(content="<@100000000000000001>'s friend", ping=True, dm=True)
+        self.assertEqual(j.message_text(m), "@Testbot's friend")
 
     async def test_unpinged_reply_is_chatter_without_a_response(self):
         m = self.message()
@@ -247,6 +270,7 @@ class _Handling(_Discord):
                  guild=self.guild, channel=self.channel, mentions=[self.user] if ping and not bot else [],
                  role_mentions=[], created_at=datetime.now(timezone.utc), reactions=[], attachments=[], stickers=[],
                  embeds=[], author=self.user if bot else SimpleNamespace(id=500, bot=False, display_name=name))
+        m.clean_content = discord.Message.clean_content.function(m)
         # Discord only resolves the message m replies to, not the ones above it
         m.reference = to and SimpleNamespace(message_id=to.id, resolved=None)
         self.by_id[m.id] = m
