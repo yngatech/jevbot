@@ -799,6 +799,13 @@ LLMS = {
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
               "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000, "cache_marks": True},
     "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
+    # Newer ones to try live against the two above. On jev_eval's chats V4.1 Flash wrote as good a Rocky as Pro ("Is
+    # thief with paper.") for a fraction of the price; K3 had the best lines but drifts longer and into space talk.
+    # Both pinned to the cheapest provider taking all their parameters: Wafer for Flash (DeepSeek's own is barred by
+    # the account's no-training setting); Morph for K3, the same price cached or not, where others charge
+    # 2.55-3.00 $/M uncached.
+    "flash": {"id": "deepseek/deepseek-v4.1-flash", "logprobs": True, "window": 1_048_576, "providers": ["wafer"]},
+    "k3": {"id": "moonshotai/kimi-k3", "logprobs": True, "window": 1_048_576, "providers": ["morph"]},
 }
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
