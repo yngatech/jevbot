@@ -16,6 +16,7 @@ import logging
 import random
 import signal
 import contextvars
+import copy
 import hashlib
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
@@ -37,6 +38,8 @@ TOKEN = os.environ["DISCORD_TOKEN_JEV"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 STATUS_CHANNEL = int(os.environ.get("STATUS_CHANNEL_ID") or 0)  # where each new status is also posted — unset for nowhere
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE") or "UTC")  # the clock an LLM's transcript shows times on (IANA name)
+# Channels where an LLM sees a long chat, kept in pages it can cache (see "Long chats" below) — comma-separated IDs
+LONG_CHAT_CHANNELS = {int(c) for c in (os.environ.get("LONG_CONTEXT_CHANNEL_IDS") or "").split(",") if c.strip()}
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
 END = "<END>"
@@ -50,6 +53,8 @@ HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged repl
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 LLM_HISTORY = 200               # earlier channel messages, any kind, in an LLM's transcript (see !model) — ~300 lines with rocky's replies
 HISTORY_SCAN = 400              # recent messages read to rebuild a channel's history after a restart
+LONG_CHAT_PAGE = 50             # messages per page of a long chat — a page is frozen once its newest is this many old
+LONG_CHAT_CHARS = 44_000        # a long chat's size before it drops its oldest half — ~20K Haiku tokens (2.2 characters a token in our chat; DeepSeek's 3.3)
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
 CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on — and messages kept per side conversation
 SIDE_TALKS = 50                 # side conversations (!nocontext and the replies under it) kept, the latest
@@ -157,6 +162,7 @@ def add_history(ch_id, entry):
     h = channel_history[ch_id]
     h.append(entry)
     channel_history[ch_id] = kept(h)
+    settle(ch_id)
     return entry
 
 # Side conversations: "@jev !nocontext ..." and every Discord reply under it, on any branch, by the !nocontext
@@ -185,6 +191,81 @@ def add_side(root, entry):
 def entries_with(ch_id, message_id):
     root = side_of.get(message_id)
     return side_talk.get(root, []) if root is not None else channel_history.get(ch_id, [])
+
+# Long chats: in LONG_CHAT_CHANNELS an LLM sees up to LONG_CHAT_CHARS of the channel, not LLM_HISTORY messages, as
+# pages of LONG_CHAT_PAGE messages. Once its newest message is LONG_CHAT_PAGE messages old, a page is frozen: copied,
+# so later edits and reactions don't change it, and its text never changes. The model can then cache the chat up to
+# the last frozen page (llm_reply) and only read the newest messages at full price. A rolling window would change
+# the chat's start on every message, and nothing would cache. Past LONG_CHAT_CHARS the oldest pages go in one jump,
+# down to half, so the cache is rewritten once per jump. Kept in LONG_CHAT_PATH (gitignored) so a restart shows the
+# same pages, and the cache still hits.
+LONG_CHAT_PATH = Path(__file__).parent / "long_chat.json"
+long_chats: dict[int, dict] = {}  # channel id: {"pages": [[entry, ...], ...], "since": the last frozen message's time}
+
+def entry_chars(e):  # its length in the transcript, roughly — names, times and jev's reply under it
+    return 10 + len(e["name"]) + len(e["content"]) + (20 + len(e["reply"]) if "reply" in e else 0)
+
+def unfrozen(ch_id):
+    since = long_chats.get(ch_id, {}).get("since")
+    return [e for e in channel_history[ch_id] if since is None or e["at"] > since]
+
+# Freezes pages and makes the jump. After each message added, and after the history loads.
+def settle(ch_id):
+    if ch_id not in LONG_CHAT_CHANNELS:
+        return
+    chat = long_chats.setdefault(ch_id, {"pages": [], "since": None})
+    changed = False
+    while len(live := unfrozen(ch_id)) >= 2 * LONG_CHAT_PAGE:
+        page = live[:LONG_CHAT_PAGE]
+        h = channel_history[ch_id]
+        seen = {id(e) for e in shown(h, len(h))}  # left out like messages to jev it never answered
+        chat["pages"].append([{k: v for k, v in copy.deepcopy(e).items() if k != "pending"} for e in page
+                              if id(e) in seen])
+        chat["since"] = page[-1]["at"]
+        changed = True
+    size = lambda: sum(entry_chars(e) for p in chat["pages"] for e in p) + sum(entry_chars(e) for e in unfrozen(ch_id))
+    if size() > LONG_CHAT_CHARS:
+        while chat["pages"] and size() > LONG_CHAT_CHARS // 2:
+            del chat["pages"][0]
+        log.info(f"[LONG CHAT] {ch_id} jumped to {len(chat['pages'])} pages")
+        changed = True
+    if changed:
+        save_long_chats()
+
+def save_long_chats():
+    def plain(v):
+        return v.isoformat() if isinstance(v, datetime) else v
+    saved = {str(ch): {"since": plain(c["since"]), "pages": [[{k: plain(v) for k, v in e.items()} for e in p]
+                                                              for p in c["pages"]]}
+             for ch, c in long_chats.items()}
+    try:
+        tmp = LONG_CHAT_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(saved, ensure_ascii=False) + "\n")
+        tmp.replace(LONG_CHAT_PATH)  # a crash mid-write leaves the last one whole
+    except OSError as e:
+        log.warning(f"Writing {LONG_CHAT_PATH.name} failed: {e}")
+
+def load_long_chats():
+    def when(v):
+        return datetime.fromisoformat(v) if v else None
+    try:
+        saved = json.loads(LONG_CHAT_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # unreadable — start the pages again
+        log.warning(f"Loading {LONG_CHAT_PATH.name} failed: {e}")
+        return {}
+    return {int(ch): {"since": when(c["since"]),
+                      "pages": [[e | {k: when(e[k]) for k in ("at", "reply_at") if k in e} for e in p] for p in c["pages"]]}
+            for ch, c in saved.items() if int(ch) in LONG_CHAT_CHANNELS}
+
+long_chats.update(load_long_chats())
+
+# A frozen page as the LLM reads it: with its own times, so it's the same text wherever it's shown
+def page_text(page, bot_name):
+    turns, turn = chat_turns(timed=True)
+    history_turns(turns, turn, bot_name, page)
+    return "\n".join(turns)
 
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
@@ -398,32 +479,43 @@ def reacted(counts, reactors=None):
 # at: when the message was sent, to show each turn's time — for an LLM only: Jev would pick the times as words
 def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None, at=None,
                reactors=True):
-    their_reactions = reactions if their_reactions is None else their_reactions
-    def addressed(text, to_bot=True):
-        mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
-        return f"@{bot_name} {text}" if marked and to_bot and not mentioned else text
-    turns, day, minute = [], None, None
-    # Like an IRC log: "14:32 pip: ..." when the minute changes, after a "--- Sat 10 Oct" line when the day does.
-    # Turns in the same minute go without — a time on every line made a 300-line transcript a third longer. A turn
-    # without a time (a reply of jev's from before replies kept theirs) goes in as it is.
+    turns, turn = chat_turns(timed=bool(at))
+    history_turns(turns, turn, bot_name, history, reactions, marked, their_reactions, reactors)
+    turn(f"{author}: {addressed(unrender(message), bot_name, marked)}", at)
+    turns.append(f"{bot_name}: {unrender(render(words))}")
+    return "\n".join(turns)
+
+def addressed(text, bot_name, marked, to_bot=True):
+    mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
+    return f"@{bot_name} {text}" if marked and to_bot and not mentioned else text
+
+# Like an IRC log: "14:32 pip: ..." when the minute changes, after a "--- Sat 10 Oct" line when the day does.
+# Turns in the same minute go without — a time on every line made a 300-line transcript a third longer. A turn
+# without a time (a reply of jev's from before replies kept theirs) goes in as it is. Each list of turns starts its
+# own clock, so a page of a long chat (below) reads the same wherever it's shown.
+def chat_turns(timed):
+    turns, clock = [], {"day": None, "minute": None}
     def turn(line, when):
-        nonlocal day, minute
-        if at and when:
+        if timed and when:
             local = when.astimezone(TIMEZONE)
-            if local.date() != day:
-                day = local.date()
+            if local.date() != clock["day"]:
+                clock["day"] = local.date()
                 turns.append(f"--- {local:%a} {local.day} {local:%b}")
-            if f"{local:%H:%M}" != minute:
-                minute = f"{local:%H:%M}"
-                line = f"{minute} {line}"
+            if f"{local:%H:%M}" != clock["minute"]:
+                clock["minute"] = f"{local:%H:%M}"
+                line = f"{clock['minute']} {line}"
         turns.append(line)
+    return turns, turn
+
+def history_turns(turns, turn, bot_name, history, reactions=True, marked=False, their_reactions=None, reactors=True):
+    their_reactions = reactions if their_reactions is None else their_reactions
     if history:
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
             if h["role"] == "assistant" and their_reactions:
                 text += reacted(h.get("reactions"), reactors and h.get("reactors"))
-            turn(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}", h.get("at"))
+            turn(f"{name}: {addressed(text, bot_name, marked, h['role'] == 'user' and h.get('to_bot', True))}", h.get("at"))
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
@@ -433,9 +525,6 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
                      h.get("reply_at"))
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
-    turn(f"{author}: {addressed(unrender(message))}", at)
-    turns.append(f"{bot_name}: {unrender(render(words))}")
-    return "\n".join(turns)
 
 
 HEADERS = {"Authorization": f"Bearer {OPENROUTER_KEY}", "Content-Type": "application/json"}
@@ -566,10 +655,12 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
     return words
 
 
-# llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times
-async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None):
+# llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times;
+# pages: a long chat's frozen pages, before llm_history
+async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None):
     if (name := model_name) != "jev":
-        return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at)
+        return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at,
+                               pages)
     # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
@@ -695,11 +786,13 @@ async def generate_filtered_status(bot_name, start, chat=""):
 #   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
 #   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
 #   window: its context length on OpenRouter, in tokens, for Context's usage
+#   cache_marks: mark where a long chat's cache ends (LLM_CACHE) — Claude only caches what's marked; DeepSeek and Kimi
+#     cache the same start of a request by themselves
 LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLMS = {
     "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576},
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
-              "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000},
+              "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000, "cache_marks": True},
     "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
 }
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
@@ -707,6 +800,10 @@ LLM_TEMPERATURE = 1.0
 LLM_FREQUENCY_PENALTY = 0.5
 LLM_TOP_LOGPROBS = 5
 LLM_ATTEMPTS = 2                # tries for a reply that isn't empty (Kimi sometimes says nothing)
+# How long Claude keeps a long chat's cache. An hour costs 2× to write, where 5 minutes costs 1.25×, but in the bot
+# spam channel 18% of replies came over 5 minutes after the last, and half of those within the hour. On its replies
+# since LLMs could write them, an hour came out ~40% cheaper per reply.
+LLM_CACHE = {"type": "ephemeral", "ttl": "1h"}
 
 # Real lines of Rocky's from the book and film, one per line ("#" comments), shown to the LLM as examples. Gitignored:
 # they're quotes from copyrighted works, so they stay out of this public repo. Without the file it goes by the rules.
@@ -764,6 +861,9 @@ def llm_tokens(content):
         tokens.pop()
     return tokens
 
+def text_of(content):  # a message's content: a string, or a long chat's blocks
+    return content if isinstance(content, str) else "".join(b["text"] for b in content)
+
 async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
     spec = LLMS[name]
     body = {"model": spec["id"], "messages": messages, "max_tokens": max_tokens, "temperature": LLM_TEMPERATURE,
@@ -792,30 +892,44 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
             if (t := trace.get()) is not None:
                 t["cost"] += data.get("usage", {}).get("cost") or 0
                 t["requests"] += 1
-            # For Context: the prompt's exact size, and its length in characters to split it by
-            note(llm_window=spec["window"], llm_prompt_tokens=data.get("usage", {}).get("prompt_tokens"),
-                 llm_prompt_chars=sum(len(m["content"]) for m in messages))
+            # For Context: the prompt's exact size, how much was read from the cache, and its length in characters
+            # to split it by
+            usage = data.get("usage") or {}
+            note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
+                 llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+                 llm_prompt_chars=sum(len(text_of(m["content"])) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
             return choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content"))
     return "", []
 
-# name: one of LLMS — passed in, since !model can switch while a reply is being written
-async def llm_reply(name, message, author, bot_name, history=None, at=None):
+# name: one of LLMS — passed in, since !model can switch while a reply is being written. pages: a long chat's frozen
+# pages, before `history` — in LONG_CHAT_CHANNELS, else None.
+async def llm_reply(name, message, author, bot_name, history=None, at=None, pages=None):
     spec = LLMS[name]
     state = transcript(message, author, bot_name, history, [], at=at or datetime.now(timezone.utc))
-    note(transcript=state, llm=name, llm_model=spec["id"], history=history or [])  # what it saw, not Jev's share
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
-    note(llm_chat_chars=len(chat))
+    texts = [page_text(p, bot_name) for p in pages or []]
+    # What it saw, not Jev's share
+    note(transcript="\n".join([*texts, state]), llm=name, llm_model=spec["id"], history=history or [],
+         llm_chat_chars=len("\n".join([*texts, chat])), llm_messages=sum(map(len, pages or [])) + len(history or []) + 1)
     # Says who it's answering: asked for "rocky's next message", Haiku kept opening with the name its earlier replies
     # did ("Binja, ...") when someone else asked. Not quoting the message — it echoed a name in it back.
-    ask = (f"The chat so far, times in {TIMEZONE.key}:\n\n{chat}\n\n"
-           f"Write {bot_name}'s reply to {author}'s last message. Output only the message."
-           + spec.get("tail", ""))
+    ask = (f"\n\nWrite {bot_name}'s reply to {author}'s last message. Output only the message." + spec.get("tail", ""))
     if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
         ask += ' This time, no ", question?" tag.'
-    messages = [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
-                {"role": "user", "content": ask}]
+    # A long chat's pages come first and never change, so the cache can end after the last; the newest messages and
+    # the request after it are read in full. The lines aren't shuffled there either, or nothing would match.
+    blocks = [f"The chat so far, times in {TIMEZONE.key}:\n\n", *[t + "\n" for t in texts], chat + ask]
+    system = rocky_prompt(bot_name, spec.get("shuffle") and pages is None)
+    if pages is not None and spec.get("cache_marks"):
+        blocks = [{"type": "text", "text": t} for t in blocks]
+        if texts:
+            blocks[-2]["cache_control"] = LLM_CACHE  # the last page
+        system = [{"type": "text", "text": system, "cache_control": LLM_CACHE}]
+    else:
+        blocks = "".join(blocks)
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": blocks}]
     for _ in range(LLM_ATTEMPTS):
         text, tokens = await llm(name, messages)
         if reply := clean_llm(text, bot_name):
@@ -1234,6 +1348,7 @@ async def load_history(first):
             add_side(root, entry)
     await asyncio.gather(*reacting)  # all at once: someone is waiting on the reply this history is for
     channel_history[ch] = kept(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
+    settle(ch)
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
 @bot.event
@@ -1731,11 +1846,13 @@ def window_usage(t):
     chat_chars = CHAT_TOKEN_WEIGHT * t.get("llm_chat_chars", 0)
     chat = round(tokens * chat_chars / (chat_chars + t["llm_prompt_chars"] - t.get("llm_chat_chars", 0)))
     used = tokens / window
-    messages = f" ({len(t['history']) + 1} messages)" if "history" in t and "status" not in t else ""
+    count = t.get("llm_messages") or ("history" in t and "status" not in t and len(t["history"]) + 1)
+    messages = f" ({count} messages)" if count else ""
     return (f"**{t['llm']}**: {tokens:,} of {window:,} tokens in its window — "
             f"{'<0.1%' if used < 0.001 else f'{used:.1%}'} used, {1 - used:.1%} free\n"
             f"- prompt: ~{tokens - chat:,} tokens\n"
-            f"- chat: ~{chat:,} tokens{messages}\n")
+            f"- chat: ~{chat:,} tokens{messages}\n"
+            + (f"- read from the cache: {cached:,} tokens\n" if (cached := t.get("llm_cached_tokens")) else ""))
 
 def context_response(t, bot_name):
     if "status" in t:
@@ -1829,9 +1946,13 @@ async def handle(m, c):
     await history_loaded[m.channel.id]
     root = await side_root(m)
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
+    pages = None
     if root is None:
         entry = add_history(m.channel.id, history_entry(m))
         h, long = shown(channel_history[m.channel.id][:-1]), shown(channel_history[m.channel.id][:-1], LLM_HISTORY)
+        if m.channel.id in LONG_CHAT_CHANNELS:
+            pages = list(long_chats[m.channel.id]["pages"])
+            long = shown(unfrozen(m.channel.id)[:-1], LONG_CHAT_PAGE * 2)
     else:
         h = list(side_talk.get(root, []))  # nothing yet for a !nocontext message
         long = list(h)
@@ -1844,7 +1965,8 @@ async def handle(m, c):
     if not no_context(m) and (r := replied_to_bot(m)) and r.content:
         reply_entry = None
         for x in (h, long):
-            if all(e.get("reply_id") != r.id for e in x):
+            frozen = [e for p in pages or [] for e in p] if x is long else []
+            if all(e.get("reply_id") != r.id for e in x + frozen):
                 if reply_entry is None:
                     reply_entry = {"role": "assistant", "name": bot_name, "content": r.content, "at": r.created_at}
                     await attach_reactions(reply_entry, r, prefix="")
@@ -1872,7 +1994,7 @@ async def handle(m, c):
         async with m.channel.typing():
             async with gen_lock:
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long,
-                                         at=m.created_at)
+                                         at=m.created_at, pages=pages)
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)

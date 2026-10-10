@@ -110,12 +110,14 @@ class ReplyTests(_Case):
         session = MagicMock()
         session.__aenter__.return_value = session
         session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
-            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 3_100, "cost": 0.001}}))
+            "choices": [{"message": {"content": "Is Biscuit."}}],
+            "usage": {"prompt_tokens": 3_100, "cost": 0.001, "prompt_tokens_details": {"cached_tokens": 2_900}}}))
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
             await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
         messages = session.post.call_args.kwargs["json"]["messages"]
         self.assertEqual(self.trace["llm_window"], 262_144)
         self.assertEqual(self.trace["llm_prompt_tokens"], 3_100)
+        self.assertEqual(self.trace["llm_cached_tokens"], 2_900)
         self.assertEqual(self.trace["llm_prompt_chars"], sum(len(m["content"]) for m in messages))
         chat = self.trace["transcript"].rsplit("\n", 1)[0]
         self.assertIn(chat, messages[1]["content"])

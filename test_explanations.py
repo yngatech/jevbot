@@ -176,6 +176,13 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                                   "- prompt: ~2,800 tokens\n- chat: " + chat, content + "\n")
                     self.assertLess(content.index("free"), content.index("```") if "```" in content else len(content))
 
+    async def test_context_shows_a_long_chats_cache_and_all_its_messages(self):
+        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=9_800, llm_prompt_chars=30_000,
+                 llm_chat_chars=20_000, llm_cached_tokens=8_000, llm_messages=420)
+        j.write_trace(t)
+        await j.context_action.callback(self.interaction(), self.target(t))
+        self.assertIn("- chat: ~7,000 tokens (420 messages)\n- read from the cache: 8,000 tokens\n", self.sent[0][0])
+
     async def test_context_for_jev_or_an_older_log_has_no_window_usage(self):
         for t in (self.logged, dict(self.logged, llm="haiku")):
             with self.subTest(llm=t.get("llm")):
