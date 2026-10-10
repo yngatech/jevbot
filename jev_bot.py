@@ -1017,7 +1017,10 @@ log.info(f"Loaded {len(DM_USERS)} DM user(s)")
 # Discord
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+# Idle until on_ready has caught up (below) — Discord shows a bot online the moment it connects
+WAKING = discord.CustomActivity("waking up")
+waking = True
+bot = commands.Bot(command_prefix="!", intents=intents, status=discord.Status.idle, activity=WAKING)
 gen_lock = asyncio.Lock()
 
 # The Why and Context actions (below) are registered with Discord each start, so a change to them shows up. If that
@@ -1064,7 +1067,7 @@ async def set_credit(ok):
         credit_check = asyncio.create_task(wait_for_credit())
 
 async def show_credit():
-    if not bot.is_ready():
+    if not bot.is_ready() or waking:
         return  # on_ready shows it
     try:
         if has_credit is False:
@@ -1419,11 +1422,22 @@ async def load_history(first):
 
 @bot.event
 async def on_ready():
+    global waking
     log.info(f"jev online as {bot.user} | vocab {len(BASE_VOCAB)} | {NEXT_WORD!r}")
+    waking = True
+    # Idle while it catches up on what it missed (~20s, slow to answer meanwhile), then online with its status — a
+    # reconnect starts over without it, so the latest is put back
+    try:
+        await bot.change_presence(status=discord.Status.idle, activity=WAKING)
+    except Exception as e:
+        log.warning(f"Changing status failed: {e}")
     if has_credit is None and (left := await credit_left()) is not None:
         await set_credit(left > 0)
-    await show_credit()  # a reconnect starts over as online, with no status — put the latest back
-    await catch_up()
+    try:
+        await catch_up()
+    finally:
+        waking = False
+        await show_credit()
     # on_ready runs again after a reconnect, so only start it the first time
     if STATUS_EVERY and not update_status.is_running():
         update_status.start()
