@@ -462,6 +462,31 @@ class ActionTests(_Discord):
         self.assertTrue(i.followup.send.call_args.kwargs["ephemeral"])
 
 
+class WakingTests(_Discord):
+    """Discord shows a bot online as soon as it connects; jev stays idle until it has caught up."""
+
+    async def test_idle_until_caught_up_then_online_with_its_status(self):
+        presence = AsyncMock()
+        seen_while_catching_up = []
+
+        async def catch_up():
+            await j.set_credit(True)  # credit coming back mid-catch-up mustn't put it online early
+            seen_while_catching_up.extend(presence.call_args_list)
+
+        for attr, value in [("change_presence", presence), ("is_ready", lambda: True)]:
+            p = patch.object(j.bot, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        with patch.object(j, "has_credit", None), patch.object(j, "credit_left", AsyncMock(return_value=5.0)), \
+                patch.object(j, "catch_up", catch_up), patch.object(j, "STATUS_EVERY", 0), \
+                patch.object(j, "status", discord.CustomActivity("I feel tea")), patch.object(j, "waking", True):
+            self.assertEqual((j.bot.status, j.bot.activity), (discord.Status.idle, j.WAKING))  # from the first connect
+            await j.on_ready()
+            self.assertEqual([c.kwargs["status"] for c in seen_while_catching_up], [discord.Status.idle])
+            self.assertEqual(presence.call_args.kwargs, {"status": discord.Status.online, "activity": j.status})
+            self.assertFalse(j.waking)
+
+
 class _Handling(_Discord):
     """handle() end to end, with what jev would say patched in."""
 
