@@ -720,7 +720,8 @@ def rocky_prompt(bot_name, shuffle=False):
     prompt = ROCKY.format(bot=bot_name)
     if ROCKY_LINES:
         lines = random.sample(ROCKY_LINES, len(ROCKY_LINES)) if shuffle else ROCKY_LINES
-        prompt += "\n\nReal Rocky lines from the book and film:\n\n" + "\n".join(lines)
+        prompt += ("\n\nReal Rocky lines from the book and film. A note in brackets before a line says what had just "
+                   "happened; it isn't part of what he said, so never write one yourself:\n\n" + "\n".join(lines))
     return prompt
 
 # The reply on its own: no "rocky:" in front, no quotes around it, and only the first paragraph — an LLM sometimes
