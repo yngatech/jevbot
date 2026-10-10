@@ -1564,36 +1564,42 @@ async def send_explanation(kind, channel_id, guild, t, send):
     if kind == "why" and candidates and not isinstance(candidates[0], str):
         urls = tuple(emoji_url(row[0], guild) for row in candidates)
     key = (kind, channel_id, bot_name, urls, hashlib.sha256(json.dumps(t, sort_keys=True).encode()).digest())
-    async def prepare_and_send():
+    previous = explanation_pending.get(key)
+    async def deliver():
         try:
-            cached = explanation_cache.get(key)
-            if cached and (cached.url is None or cached.expires > time.time() + EXPLANATION_EXPIRY_MARGIN
-                           and await explanation_attachment_available(cached.url)):
+            cached = None
+            if previous:
+                try:
+                    cached = await asyncio.shield(previous)
+                except Exception:
+                    pass  # this caller can still deliver if the previous caller failed
+            validate = cached is None
+            cached = cached or explanation_cache.get(key)
+            if cached and cached.url and (cached.expires <= time.time() + EXPLANATION_EXPIRY_MARGIN
+                                          or validate and not await explanation_attachment_available(cached.url)):
+                cached = None
+            if cached:
                 try:
                     await send_cached_explanation(send, cached)
                 except discord.HTTPException:
-                    # A channel may allow attachments but not embeds. Fall back to sending a fresh attachment.
-                    pass
+                    if cached.url is None:
+                        raise
                 else:
                     keep_explanation(key, cached)
                     return cached
             explanation_cache.pop(key, None)
-            if kind == "why":
-                response = await why_response(t, guild, bot_name)
-            else:
-                response = context_response(t, bot_name)
-            content, data, filename = response
+            content, data, filename = (await why_response(t, guild, bot_name) if kind == "why"
+                                       else context_response(t, bot_name))
             cached = CachedExplanation(content)
             if data is None:
                 await send(content)
             else:
-                stream = io.BytesIO(data)
-                file = discord.File(stream, filename)
-                try:
-                    sent = await send(content, file=file)
-                finally:
-                    file.close()
-                    stream.close()
+                with io.BytesIO(data) as stream:
+                    file = discord.File(stream, filename)
+                    try:
+                        sent = await send(content, file=file)
+                    finally:
+                        file.close()
                 attachments = getattr(sent, "attachments", ())
                 if not attachments:
                     return None  # delivered, but without a URL to reuse
@@ -1605,23 +1611,12 @@ async def send_explanation(kind, channel_id, guild, t, send):
             keep_explanation(key, cached)
             return cached
         finally:
-            explanation_pending.pop(key, None)
+            if explanation_pending.get(key) is asyncio.current_task():
+                explanation_pending.pop(key, None)
 
-    if task := explanation_pending.get(key):
-        cached = await asyncio.shield(task)
-        if cached is None:
-            await send_explanation(kind, channel_id, guild, t, send)
-        else:
-            try:
-                await send_cached_explanation(send, cached)
-            except discord.HTTPException:
-                if explanation_cache.get(key) is cached:
-                    explanation_cache.pop(key, None)
-                await send_explanation(kind, channel_id, guild, t, send)
-        return
-    explanation_pending[key] = asyncio.create_task(prepare_and_send())
-    # A cancelled interaction mustn't cancel work for other people waiting on the same answer.
-    await asyncio.shield(explanation_pending[key])
+    explanation_pending[key] = task = asyncio.create_task(deliver())
+    # A cancelled caller mustn't cancel work for others waiting on the same answer.
+    await asyncio.shield(task)
 
 async def why(m):
     if (target := await command_target(m)) is not False:
