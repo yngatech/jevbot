@@ -828,6 +828,26 @@ class LongChatTests(_Handling):
         with patch.object(j, "LONG_CHAT_CHANNELS", set()):
             self.assertEqual(j.load_long_chats(), {})  # a channel taken out of .env is forgotten
 
+    async def test_a_rebuild_freezes_pages_from_everything_it_read(self):
+        j.channel_history[self.channel.id], j.long_chats = [], {}
+        scanned = []
+        for i in range(j.HISTORY_SCAN):
+            m = self.said(f"old {i}", name="kettle", ping=False)
+            m.created_at = self.start - timedelta(hours=2) + timedelta(seconds=i)
+            scanned.append(m)
+
+        async def history(**kwargs):
+            for m in reversed(scanned):  # newest first, like Discord
+                yield m
+
+        self.channel.history = history
+        await self.load_history(SimpleNamespace(channel=self.channel))
+        pages = j.long_chats[self.channel.id]["pages"]
+        frozen = [e["content"] for p in pages for e in p]
+        self.assertEqual(frozen[0], "old 0")  # not just the latest LLM_HISTORY
+        self.assertEqual(frozen + self.contents(j.unfrozen(self.channel.id)), [f"old {i}" for i in range(j.HISTORY_SCAN)])
+        self.assertEqual(len(j.channel_history[self.channel.id]), j.LLM_HISTORY + 1)  # the store is still trimmed
+
     async def test_a_message_to_jev_it_never_answered_is_left_out_of_its_page(self):
         j.channel_history[self.channel.id], j.long_chats[self.channel.id] = [], {"pages": [], "since": None}
         for i in range(100):

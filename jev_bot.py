@@ -1405,8 +1405,11 @@ async def load_history(first):
         else:
             add_side(root, entry)
     await asyncio.gather(*reacting)  # all at once: someone is waiting on the reply this history is for
-    channel_history[ch] = kept(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
+    # A long chat freezes its pages from everything read before the store keeps only its latest — else half of
+    # HISTORY_SCAN would be thrown away, and the chat would start no longer than LLM_HISTORY
+    channel_history[ch] = sorted(channel_history[ch] + talk, key=lambda e: e["at"])
     settle(ch)
+    channel_history[ch] = kept(channel_history[ch])
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
 @bot.event
