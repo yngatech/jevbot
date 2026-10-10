@@ -500,6 +500,8 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
 
 
 async def generate_reply(message, author, bot_name, history=None):
+    if (name := model_name) != "jev":
+        return await llm_reply(name, message, author, bot_name, history)
     # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
@@ -532,6 +534,8 @@ def status_state(bot_name, start, chat, words):
 
 
 async def generate_status(bot_name, start, chat=""):
+    if (name := model_name) != "jev":
+        return await llm_status(name, bot_name, start, chat)
     vocab = [w for w in vocabulary(chat) if w != NEWLINE]  # a status is one line
     note(transcript=status_state(bot_name, start, chat, []))
     words = await loom(lambda words: status_state(bot_name, start, chat, words), vocab, NEXT_WORD,
@@ -594,7 +598,8 @@ async def generate_filtered_status(bot_name, start, chat=""):
             if attempt["accepted"]:
                 # !why and !context keep using the accepted generation, while the full retry history stays local.
                 if parent is not None:
-                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop") if k in attempt})
+                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_tokens")
+                                   if k in attempt})
                     parent["status_score"] = score
                 return mood
         finally:
@@ -605,6 +610,181 @@ async def generate_filtered_status(bot_name, start, chat=""):
                 if "error" in attempt:
                     parent["error"] = attempt["error"]
     return None
+
+
+# Instead of Jev, an ordinary LLM can write the replies and statuses, told to talk like Rocky, the Eridian engineer
+# from Project Hail Mary who the bot is named after — !model switches. Jev still decides between replying and
+# reacting, and picks the emoji. Tried on jev_eval's conversations: DeepSeek V4 Pro gave the best Rocky ("Is called
+# Biscuit. Small predator, no respect for hot liquid.") for ~$0.0005 a reply, against Jev's ~$0.014.
+#   shuffle: the example lines in a fresh order every call — Claude ignores temperature, so the same chat got the same
+#     reply word for word; DeepSeek is prompt-cached, which a shuffle would break (4.7× the cost)
+#   question_dice: the chance a reply may end a question with ", question?" — a model can't count how often it said
+#     it, and Haiku put it on 40 of 46 replies even when told to only use it for real questions
+#   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
+#   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
+LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
+LLMS = {
+    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True},
+    "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
+              "tail": " Like Rocky: a few words, one short sentence at most."},
+    "kimi": {"id": "moonshotai/kimi-k2-0905"},
+}
+LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
+LLM_TEMPERATURE = 1.0
+LLM_FREQUENCY_PENALTY = 0.5
+LLM_TOP_LOGPROBS = 5
+LLM_ATTEMPTS = 2                # tries for a reply that isn't empty (Kimi sometimes says nothing)
+
+# Real lines of Rocky's from the book and film, one per line ("#" comments), shown to the LLM as examples. Gitignored:
+# they're quotes from copyrighted works, so they stay out of this public repo. Without the file it goes by the rules.
+ROCKY_LINES_PATH = Path(__file__).parent / "rocky_lines.txt"
+ROCKY_LINES = ([l.strip() for l in ROCKY_LINES_PATH.read_text().split("\n") if l.strip() and not l.startswith("#")]
+               if ROCKY_LINES_PATH.exists() else [])
+log.info(f"Loaded {len(ROCKY_LINES)} Rocky lines")
+
+# Each rule answers something the first tries got wrong: "What is scone, question?" in a third of replies (he was
+# learning English in the book), ", question?" on everything, replies to everyone in the chat at once
+ROCKY = """You are {bot}, a bot in a Discord server of friends. You talk like Rocky, the Eridian engineer from Project Hail Mary, who you're named after.
+
+How {bot} talks:
+- Compact, concrete sentences. Drops articles and helper verbs ("I make new one", "You are friend", "Is good"), but the thought is always clear: an observation, an opinion, a reason, a plan or a request.
+- A real question can end with ", question?": "Why stupid, question?". Only when he truly asks something — never filler like "Why you ask, question?" — and not if his own previous message used it. Very rarely a firm conclusion ends with ", statement.".
+- Repetition has a job — excitement, distress, urgency: "Amaze, amaze, amaze!", "Bad, bad, bad." Plain answers are said once.
+- Blunt, sometimes bossy, curious, competitive, teasing, now and then sarcastic. Earnest, practical warmth for his friends.
+- He has lived in this server a long time and knows everyday human things: food, films, music, games, weather, jobs. He only asks what a word means when it is truly strange slang or an idiom ("No understand word."), and takes idioms literally.
+- Answers what the friends actually said, with an opinion. If he truly doesn't know, "I not know." — rarely.
+- He's in a Discord chat, not on a spaceship: talks about whatever the chat is about. No Grace, Erid, Astrophage or space unless someone brings it up.
+- Says one thing, to the last message only — not a reply to everyone in the chat. Usually a few words or one short sentence, like the lines below; at most two short sentences.
+- Never emoji, never says he's a bot or AI. Don't copy the lines below word for word or repeat your earlier replies."""
+
+LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
+
+def rocky_prompt(bot_name, shuffle=False):
+    prompt = ROCKY.format(bot=bot_name)
+    if ROCKY_LINES:
+        lines = random.sample(ROCKY_LINES, len(ROCKY_LINES)) if shuffle else ROCKY_LINES
+        prompt += "\n\nReal Rocky lines from the book and film:\n\n" + "\n".join(lines)
+    return prompt
+
+# The reply on its own: no "rocky:" in front, no quotes around it, and only the first paragraph — an LLM sometimes
+# goes on to write the next turns of the chat
+def clean_llm(text, bot_name):
+    text = re.sub(rf"^{re.escape(bot_name)}:\s*", "", (text or "").strip(), flags=re.I)
+    return text.split(f"\n{bot_name}:")[0].split("\n\n")[0].strip().strip('"').strip()
+
+# The LLM's answer to messages, and its tokens with their top alternatives ([{"token", "p", "top": [[token, p]]}])
+# when the model gives them. Costs go on the trace like Jev's.
+# A response's logprobs as [{"token", "p", "top": [[token, p]]}]. Some providers give a token the previous one's
+# alternatives again ("ers" with "isk"'s list, after "Wh" "isk") — those show only the token itself. The end of the
+# reply comes as a token too ("<｜end▁of▁sentence｜>"), and isn't something rocky said.
+END_TOKEN = re.compile(r"<[^<>\s]*end[^<>\s]*>", re.IGNORECASE)
+
+def llm_tokens(content):
+    tokens = []
+    for x in content or []:
+        top = [[y["token"], round(math.exp(y["logprob"]), 4)] for y in x.get("top_logprobs", [])]
+        if tokens and x["token"] not in dict(top) and [w for w, _ in top] == [w for w, _ in tokens[-1]["top"]]:
+            top = []
+        tokens.append({"token": x["token"], "p": round(math.exp(x["logprob"]), 4), "top": top})
+    while tokens and END_TOKEN.fullmatch(tokens[-1]["token"]):
+        tokens.pop()
+    return tokens
+
+async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
+    spec = LLMS[name]
+    body = {"model": spec["id"], "messages": messages, "max_tokens": max_tokens, "temperature": LLM_TEMPERATURE,
+            "frequency_penalty": LLM_FREQUENCY_PENALTY, "reasoning": {"enabled": False}, "usage": {"include": True}}
+    if spec.get("logprobs"):
+        # Only to providers that give them — some of DeepSeek's don't
+        body |= {"logprobs": True, "top_logprobs": LLM_TOP_LOGPROBS, "provider": {"require_parameters": True}}
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
+        for attempt in range(3):
+            try:
+                async with session.post(LLM_URL, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    if r.status == 402:  # out of credit — retrying won't help
+                        log.warning(f"LLM 402: {(await r.text())[:300]}")
+                        note(error="out of credit")
+                        await set_credit(False)
+                        return "", []
+                    data = await r.json(content_type=None)
+                    if r.status >= 400 or "choices" not in data:
+                        log.warning(f"LLM {r.status} {attempt}: {str(data)[:300]}")
+                        await asyncio.sleep(1 + 2 * attempt)
+                        continue
+            except Exception as e:
+                log.warning(f"LLM err {attempt}: {e}")
+                await asyncio.sleep(1 + 2 * attempt)
+                continue
+            if (t := trace.get()) is not None:
+                t["cost"] += data.get("usage", {}).get("cost") or 0
+                t["requests"] += 1
+            await set_credit(True)
+            choice = data["choices"][0]
+            return choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content"))
+    return "", []
+
+# name: one of LLMS — passed in, since !model can switch while a reply is being written
+async def llm_reply(name, message, author, bot_name, history=None):
+    spec = LLMS[name]
+    state = transcript(message, author, bot_name, history, [])
+    note(transcript=state, llm=name)
+    chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
+    ask = f"The chat so far:\n\n{chat}\n\nWrite {bot_name}'s next message. Output only the message." + spec.get("tail", "")
+    if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
+        ask += ' This time, no ", question?" tag.'
+    messages = [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
+                {"role": "user", "content": ask}]
+    for _ in range(LLM_ATTEMPTS):
+        text, tokens = await llm(name, messages)
+        if reply := clean_llm(text, bot_name):
+            if tokens:
+                note(llm_tokens=tokens)
+            log.info(f"  {name}: {reply}")
+            return reply
+        if has_credit is False:
+            break
+    return "..."
+
+async def llm_status(name, bot_name, start, chat=""):
+    spec = LLMS[name]
+    opener = render(start)
+    ask = (f"Recent chat in the server:\n{chat}\n\n" if chat else "") + LLM_STATUS.format(bot=bot_name, start=opener)
+    note(transcript=ask, llm=name)
+    text, tokens = await llm(name, [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
+                              {"role": "user", "content": ask}])
+    mood = " ".join(clean_llm(text, bot_name).split())  # one line
+    if not mood:
+        return None
+    if tokens:
+        note(llm_tokens=tokens)
+    if not mood.lower().startswith(opener.lower()):
+        mood = f"{opener} {mood[0].lower()}{mood[1:]}"
+    return mood[:128]  # Discord's custom status limit
+
+# Which model writes: "jev" or one of LLMS. Kept in MODEL_PATH (gitignored), so a restart keeps what !model chose.
+MODEL_PATH = Path(__file__).parent / "model.json"
+
+def load_model():
+    try:
+        name = json.loads(MODEL_PATH.read_text())["model"]
+    except FileNotFoundError:
+        return "jev"
+    except Exception as e:
+        log.warning(f"Loading {MODEL_PATH.name} failed: {e}")
+        return "jev"
+    if name != "jev" and name not in LLMS:
+        log.warning(f"{MODEL_PATH.name}: unknown model {name!r}, using jev")
+        return "jev"
+    return name
+
+def save_model(name):
+    try:
+        MODEL_PATH.write_text(json.dumps({"model": name}) + "\n")
+    except OSError as e:
+        log.warning(f"Writing {MODEL_PATH.name} failed: {e}")
+
+model_name = load_model()
+log.info(f"Model: {model_name}")
 
 
 # DMs: only from the Discord user IDs in dm_users.txt (gitignored, one per line, "#" comments) — every reply costs
@@ -787,12 +967,16 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
-# !why and !context, on their own in a message — the command, or None
-COMMANDS = {"!why", "!context"}
+# !why and !context on their own in a message, and !model with or without a model's name — the command, or None
+COMMANDS = {"!why", "!context", "!model"}
 
 def command(m):
-    c = strip_mention(m).lower()
-    return c if not m.author.bot and c in COMMANDS else None
+    if m.author.bot:
+        return None
+    c = strip_mention(m).lower().split()
+    if c and c[0] in COMMANDS and (len(c) == 1 or c[0] == "!model" and len(c) == 2):
+        return c[0]
+    return None
 
 # m as a history entry, or None for messages that never go in one (bots, including jev itself, empty ones, and
 # commands — often a reply to jev, so after a restart one came back as a message jev never answered)
@@ -975,7 +1159,7 @@ async def on_message(m):
         heard = True
     if cmd := command(m):
         if not stopping.is_set():
-            await (why if cmd == "!why" else context)(m)
+            await {"!why": why, "!context": context, "!model": model_command}[cmd](m)
         return
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
@@ -1030,7 +1214,7 @@ def in_channel(t, channel_id):
 
 # The latest log entry in the channel that has(), or the one for `target` if given — by default an answer or status
 # with candidates to show
-def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("reaction_candidates")):
+def find_trace(channel_id, target=None, has=lambda t: t.get("steps") or t.get("reaction_candidates") or t.get("llm")):
     for path in sorted(LOG_DIR.glob("*.jsonl"), reverse=True)[:WHY_DAYS]:
         for line in reversed(path.read_text().splitlines()):
             try:
@@ -1073,6 +1257,19 @@ def why_panels(t):
             words.append(s["word"])
     return panels
 
+# One why_chart panel per token an LLM wrote (the first WHY_TOKENS), with the alternatives it gave, likeliest first
+WHY_TOKENS = 24
+
+def llm_why_panels(tokens):
+    panels, so_far = [], ""
+    for t in tokens[:WHY_TOKENS]:
+        top = dict(t["top"])
+        top.setdefault(t["token"], t["p"])  # sampled from outside its top few
+        rows = sorted(([w, p, p] for w, p in top.items()), key=lambda r: -r[1])
+        panels.append({"so_far": so_far, "picked": t["token"], "ends": False, "pooled": [], "rows": rows})
+        so_far += t["token"]
+    return panels
+
 # The message a command is a Discord reply to: None if it isn't a reply, False (having said so) if it can't be seen
 async def command_target(m):
     if not (m.reference and m.reference.message_id):
@@ -1102,7 +1299,20 @@ async def why(m):
         await m.reply("Nothing logged for that", mention_author=False)
         return
     bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
-    if t.get("steps"):
+    if t.get("llm") and not t.get("reaction"):
+        if not t.get("llm_tokens"):
+            await m.reply(f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
+                          " — !context shows what it saw", mention_author=False)
+            log.info(f"[WHY] no tokens from {t['llm']}")
+            return
+        said = t.get("reply") or t.get("status") or ""
+        n = len(t["llm_tokens"])
+        note = f"Written by {t['llm']}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
+        png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
+                                      tokens=True)
+        await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
+        log.info(f"[WHY] token chart for {said!r}")
+    elif t.get("steps"):
         said = t.get("reply") or t.get("status") or ""
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
         await m.reply(file=discord.File(io.BytesIO(png), "why.png"), mention_author=False)
@@ -1171,6 +1381,24 @@ async def context(m):
         await m.reply(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"), mention_author=False,
                       allowed_mentions=discord.AllowedMentions.none())
     log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
+
+
+# !model: which model writes the replies and statuses, or with a name, switch to it — for everyone, and kept
+# across restarts
+async def model_command(m):
+    global model_name
+    names = ["jev", *LLMS]
+    args = strip_mention(m).lower().split()[1:]
+    if not args:
+        text = f"Writing with **{model_name}**. `!model <name>` switches: {', '.join(names)}"
+    elif args[0] not in names:
+        text = f"No model called {args[0]!r} — {', '.join(names)}"
+    else:
+        model_name = args[0]
+        save_model(model_name)
+        text = f"Now writing with **{model_name}**" + (f" ({LLMS[model_name]['id']})" if model_name in LLMS else "")
+        log.info(f"[MODEL] {m.author} switched to {model_name}")
+    await m.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
 async def respond(m, **extra):
@@ -1243,7 +1471,8 @@ async def handle(m, c):
             r = random.choice(NO_MONEY)
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
-        sent = await m.reply(r, mention_author=False)
+        # No pings from whatever an LLM writes ("@everyone")
+        sent = await m.reply(r, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on

@@ -38,6 +38,8 @@ OPENROUTER_API_KEY_EVAL=another_openrouter_key
 STATUS_CHANNEL_ID=channel_to_post_statuses_in
 ```
 
+For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments): they're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes.
+
 `OPENROUTER_API_KEY` is the bot's; `jev_eval.py` uses `OPENROUTER_API_KEY_EVAL` instead, so each key can have its own credit limit on OpenRouter and their usage shows up separately.
 
 Enable **Message Content Intent** in Discord developer portal.
@@ -54,7 +56,11 @@ Mention jev or reply to jev's messages with the reply ping enabled. A reply with
 
 `!why` posts a chart of what jev weighed for its latest reply in the channel: for each word, the candidates, how likely the model thought each was, and their scores after the repeat penalties. Send it as a Discord reply to one of jev's replies to chart that one instead, or to a message jev reacted to for a chart of the emoji it weighed. In the status channel (`STATUS_CHANNEL_ID`) it works the same for the statuses jev posted there: on its own it charts the latest, or send it as a reply to one; the words after the opener ("I feel") are charted. The chart's font has no emoji, so those are drawn from images: [Twemoji](https://github.com/jdecked/twemoji)'s, the set Discord uses, and the server's own emoji from Discord; one that can't be fetched is shown by name. It reads `logs/` (the last `WHY_DAYS`, 7, days) and costs nothing.
 
+For a reply or status an LLM wrote (see `!model`), `!why` charts its tokens instead — the pieces of words an LLM writes in — each with the few alternatives it weighed and how likely it thought them, the one it said in gold. It's sampled, so not always the likeliest. Only DeepSeek gives these (only some of its providers do, so requests go to those); for Haiku or Kimi it says there's nothing to chart.
+
 `!context` posts what jev had in view for its latest answer in the channel: the transcript it was given, history and all, ending in its own empty turn. Send it as a Discord reply to one of jev's replies, or to a message jev reacted to, for that one. For a reply it's the transcript jev picked words from; for a reaction, the one the question check saw when it chose to react (messages to jev marked `@jev`, no past reactions). In the status channel it's the same for a status: its diary entry, with the recent chat it had in view if it was given any. A long one comes as `context.txt`. Like `!why`, it reads `logs/` and costs nothing.
+
+`!model` says which model is writing jev's replies and statuses; `!model <name>` switches, for everyone: `jev` (the default), `deepseek`, `haiku` or `kimi`. The three are ordinary LLMs on OpenRouter, told to talk like Rocky, the Eridian engineer from *Project Hail Mary* who the bot is named after ("Is called Biscuit. Small predator, no respect for hot liquid."), with real lines of his from `rocky_lines.txt` as examples. Jev still decides whether to reply or react, and picks the emoji. The choice is kept in `model.json` (gitignored), so a restart keeps it. Like `!why`, it works without a ping.
 
 Put `!nocontext` in a message to jev (`@jev !nocontext what's your favourite colour?`) and it answers with none of the channel's history in view, just that message. The message still goes into the history for later replies, without the `!nocontext`.
 
@@ -67,6 +73,8 @@ Messages sent while jev is offline (say, during a restart) never reach it, so on
 ## Cost
 
 Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042 per million input tokens (output is free), which comes to ~$0.003 per word with the 10K vocab, so ~$0.01-0.10 per reply depending on length.
+
+With `!model`, a reply costs ~$0.0003-0.0005 with DeepSeek (its prompt is cached after the first) or Haiku, ~$0.001 with Kimi, plus Jev's reply-or-react check (~$0.0001). A status is about the same, plus Jev's meaning check.
 
 ## Logs
 
