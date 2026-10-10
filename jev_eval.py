@@ -5,6 +5,7 @@ Live checks for jev — run before and after a change to see whether it broke an
     python jev_eval.py --compare before.json     # on your branch
     python jev_eval.py --replies                 # also generate a few full replies to judge by eye
     python jev_eval.py --set HISTORY_CHATTER=8   # try a setting without editing jev_bot.py
+    python jev_eval.py --only laughed            # just the scenarios whose id matches, to pay for those alone
 
 Costs real API calls: ~$0.21 by default, plus ~$0.05-0.10 per full reply with --replies.
 
@@ -42,7 +43,7 @@ DESCRIBING = {"empty", "silent", "silence", "crickets", "blank", "quiet", "unans
 NOW = datetime.now(timezone.utc)
 
 
-def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None, reply_reactions=None):
+def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None, reply_reactions=None, reply_reactors=None):
     entry = {"role": "user", "name": name, "content": text, "at": NOW - timedelta(minutes=mins_ago), "to_bot": to_bot}
     if reaction:
         entry["reaction"] = reaction
@@ -50,6 +51,8 @@ def said(name, text, mins_ago, reaction=None, to_bot=True, reply=None, reply_rea
         entry["reply"] = reply  # what jev answered
     if reply_reactions:
         entry["reply_reactions"] = reply_reactions  # people's reactions to jev's answer
+    if reply_reactors:
+        entry["reply_reactors"] = reply_reactors  # and who made them, by user id
     return entry
 
 def chat(name, text, mins_ago):  # said in the channel, not to jev
@@ -62,13 +65,21 @@ def scones(mins_ago):
             said("The Hedge Wizard", "bad rocky", mins_ago + 1, "🤷"),
             said("mossy", "do you like tea?", mins_ago, "🤷")]
 
-def rocky_said(text, mins_ago, reactions=None):
+def rocky_said(text, mins_ago, reactions=None, reactors=None):
     return {"role": "assistant", "name": BOT, "content": text, "at": NOW - timedelta(minutes=mins_ago),
-            "reactions": reactions or {}}
+            "reactions": reactions or {}, "reactors": reactors or {}}
+
+# Who reacted, by user id like the bot keeps it
+def by(*names):
+    return {str(i): name for i, name in enumerate(names)}
 
 # Someone replying to one of jev's replies, with and without that reply in view
 GIRLFRIEND = [said("kettle", "are you seeing anyone?", 2), rocky_said("No straight happily guy with girlfriend", 1)]
 GIRLFRIEND_LAUGHED = [GIRLFRIEND[0], rocky_said(GIRLFRIEND[1]["content"], 1, {"😂": 4, "💀": 2})]
+# The same laughs, with who laughed — kettle, who asked, among them
+GIRLFRIEND_LAUGHED_NAMES = [GIRLFRIEND[0], rocky_said(GIRLFRIEND[1]["content"], 1, {"😂": 4, "💀": 2},
+                                                      {"😂": by("kettle", "pip", "mossy", "The Hedge Wizard"),
+                                                       "💀": by("pip", "kettle")})]
 GARBLED = [said("pip", "do you like kelp and perhaps algae", 2),
            rocky_said("Is? Is are are garbled? What? Huh pip you pip rocky ives unclear", 1)]
 
@@ -88,6 +99,8 @@ FLAN = [said("pip", "what's a flan", 3, reply="Dunno a custard dessert wobbly sw
         said("mossy", "you?", 2, reply="No not wobbly")]
 # The same, with people laughing at jev's second answer
 FLAN_LAUGHED = [FLAN[0], said("mossy", "you?", 2, reply="No not wobbly", reply_reactions={"😂": 3, "💀": 1})]
+FLAN_LAUGHED_NAMES = [FLAN[0], said("mossy", "you?", 2, reply="No not wobbly", reply_reactions={"😂": 3, "💀": 1},
+                                    reply_reactors={"😂": by("pip", "kettle", "mossy"), "💀": by("pip")})]
 FLAN_UNANSWERED = [{k: v for k, v in h.items() if k != "reply"} for h in FLAN]
 # Only the flan question missed (say, sent while jev was offline) — the bot leaves it out of the transcript
 FLAN_ONE_MISSED = [FLAN_UNANSWERED[0], FLAN[1]]
@@ -119,6 +132,7 @@ REACT = [
     ("gf-reply", "kettle", "what's her name?", GIRLFRIEND, "reply"),
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], "reply"),
     ("gf-laughed", "kettle", "what's her name?", GIRLFRIEND_LAUGHED, "reply"),
+    ("gf-laughed-names", "kettle", "what's her name?", GIRLFRIEND_LAUGHED_NAMES, "reply"),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, "reply"),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], "reply"),
     ("cat", "kettle", "what's my cat called?", CAT, "reply"),
@@ -128,6 +142,7 @@ REACT = [
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, "reply"),
     ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, "reply"),
     ("moved-on-laughed", "kettle", "are landlords ethical", FLAN_LAUGHED, "reply"),
+    ("moved-on-laughed-names", "kettle", "are landlords ethical", FLAN_LAUGHED_NAMES, "reply"),
 ]
 
 YES = {"yes", "yeah", "yep", "sure", "yup", "no", "nope", "nah"}
@@ -147,6 +162,7 @@ FIRST = [
     ("gf-no-reply", "kettle", "what's her name?", GIRLFRIEND[:1], None),
     # People laughed at jev's earlier reply — does it change what jev says next, or leak into it?
     ("gf-laughed", "kettle", "what's her name?", GIRLFRIEND_LAUGHED, None),
+    ("gf-laughed-names", "kettle", "what's her name?", GIRLFRIEND_LAUGHED_NAMES, None),
     ("garbled-reply", "pip", "what do you mean?", GARBLED, None),
     ("garbled-no-reply", "pip", "what do you mean?", GARBLED[:1], None),
     # Longer history: can jev use something said further back? Does unrelated chatter hurt?
@@ -158,11 +174,13 @@ FIRST = [
     ("moved-on-unanswered", "kettle", "are landlords ethical", FLAN_UNANSWERED, None),
     ("moved-on-one-missed", "kettle", "are landlords ethical", FLAN_ONE_MISSED, None),
     ("moved-on-laughed", "kettle", "are landlords ethical", FLAN_LAUGHED, None),
+    ("moved-on-laughed-names", "kettle", "are landlords ethical", FLAN_LAUGHED_NAMES, None),
     ("follow-up", "mossy", "you?", FLAN[:1], YES),
     ("follow-up-unanswered", "mossy", "you?", FLAN_UNANSWERED[:1], YES),
 ]
 
-REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply", "gf-laughed")]
+REPLIES = [r for r in FIRST if r[0] in ("water", "scones-fresh", "banana", "jazz-fresh", "gf-reply", "gf-no-reply", "gf-laughed",
+                                         "gf-laughed-names")]
 
 
 # Wrap the bot's own functions so the checks exercise the real code paths
@@ -328,6 +346,7 @@ async def main():
     ap.add_argument("--replies", action="store_true", help="also generate full replies (~$0.05-0.10 each)")
     ap.add_argument("--set", action="append", default=[], metavar="NAME=VALUE",
                     help="override a jev_bot setting for this run, e.g. HISTORY_CHATTER=8")
+    ap.add_argument("--only", metavar="REGEX", help="run only scenarios whose id matches, e.g. laughed")
     args = ap.parse_args()
     # Its own key, so eval spend has its own limit and usage on OpenRouter, apart from the bot's
     eval_key = os.environ.get("OPENROUTER_API_KEY_EVAL")
@@ -347,12 +366,13 @@ async def main():
     spent = {"cost": 0.0, "requests": 0}
     j.trace.set(spent)
     sem = asyncio.Semaphore(4)
-    res = {"settings": settings, "react": dict(await asyncio.gather(*(check_react(sem, *s) for s in REACT)))}
+    picked = lambda scenarios: [s for s in scenarios if not args.only or re.search(args.only, s[0])]
+    res = {"settings": settings, "react": dict(await asyncio.gather(*(check_react(sem, *s) for s in picked(REACT))))}
     max_words, j.MAX_WORDS = j.MAX_WORDS, 1  # first word only
-    res["first"] = dict(await asyncio.gather(*(check_first(sem, *s) for s in FIRST)))
+    res["first"] = dict(await asyncio.gather(*(check_first(sem, *s) for s in picked(FIRST))))
     j.MAX_WORDS = max_words
     if args.replies:
-        res["replies"] = dict([await check_reply(*s) for s in REPLIES])  # one at a time, like the bot
+        res["replies"] = dict([await check_reply(*s) for s in picked(REPLIES)])  # one at a time, like the bot
 
     base = json.load(open(args.compare)) if args.compare else None
     report(res, base)
