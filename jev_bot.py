@@ -46,7 +46,8 @@ HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged repl
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
-CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on
+CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on — and messages kept per side conversation
+SIDE_TALKS = 50                 # side conversations (!nocontext and the replies under it) kept, the latest
 STOP_THRESHOLD = 0.5            # let jev stop earlier — the good part is always the first half
 REPEAT_PENALTY = 1.5
 REPEAT_WINDOW = 8
@@ -145,6 +146,33 @@ def add_history(ch_id, entry):
     h.append(entry)
     channel_history[ch_id] = recent(h, HISTORY_TO_BOT + 1, HISTORY_CHATTER)  # +1: the message being answered
     return entry
+
+# Side conversations: "@jev !nocontext ..." and every Discord reply under it, on any branch, by the !nocontext
+# message's id. A reply in one sees all of it and nothing else, and they're never in channel_history, so the rest of
+# the channel (and statuses) never see them.
+side_talk: dict[int, list[dict]] = {}
+side_of: dict[int, int] = {}  # id of each message in one, people's and jev's — to the one it's under
+
+def add_side(root, entry):
+    talk = side_talk.setdefault(root, [])
+    if all(e["id"] != entry["id"] for e in talk):
+        talk.append(entry)
+        talk.sort(key=lambda e: e["at"])  # a chain followed back after a restart comes in late
+        del talk[:-CHAIN_DEPTH]
+    side_of[entry["id"]] = root
+    if "reply_id" in entry:
+        side_of[entry["reply_id"]] = root
+    while len(side_talk) > SIDE_TALKS:
+        gone = next(iter(side_talk))
+        del side_talk[gone]
+        for i in [i for i, r in side_of.items() if r == gone]:
+            del side_of[i]
+    return entry
+
+# The history entries a message would be in: its side conversation's, or else the channel's
+def entries_with(ch_id, message_id):
+    root = side_of.get(message_id)
+    return side_talk.get(root, []) if root is not None else channel_history.get(ch_id, [])
 
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
@@ -960,25 +988,43 @@ async def reply_chain(m):
         cur = r
     return chain[::-1]
 
-# Replying in a chain that started with "@jev !nocontext ..." carries on that conversation, so it's all jev sees: the
-# chain from the latest !nocontext in it, jev's replies under what they answered. None if there's no !nocontext above.
-async def no_context_chain(m):
-    chain = await reply_chain(m)
-    start = next((i for i in reversed(range(len(chain))) if no_context(chain[i])), None)
-    if start is None:
-        return None
+# History entries for a reply chain, jev's replies under what they answered. Its other messages in it (a !why chart)
+# are left out.
+def chain_entries(chain):
     entries = []
-    for x in chain[start:]:
+    for x in chain:
         if x.author.id != bot.user.id:
             if entry := history_entry(x):
                 entries.append(entry)
-        # jev's other messages in it (a !why chart) are left out; the one m answers is added like any reply of jev's
         elif (entries and x.reference and entries[-1]["id"] == x.reference.message_id and "reply" not in entries[-1]
               and x.content and x.content not in NO_MONEY):
             entries[-1]["reply"], entries[-1]["reply_id"] = x.content, x.id
             if counts := reactions_to(x):
                 entries[-1]["reply_reactions"] = counts
     return entries
+
+# The side conversation m is in, by the id of its !nocontext message — m's own, if it has one — or None. One jev
+# hasn't seen (from before a restart, say) is found by following m's replies back, and starts with that chain.
+async def side_root(m):
+    if no_context(m):
+        return m.id
+    if not (m.reference and m.reference.message_id):
+        return None
+    parent = m.reference.message_id
+    if (root := side_of.get(parent)) is not None:
+        return root
+    if any(parent in (e["id"], e.get("reply_id")) for e in channel_history.get(m.channel.id, [])):
+        return None  # a reply to the channel's conversation
+    chain = await reply_chain(m)
+    start = next((i for i in reversed(range(len(chain))) if no_context(chain[i])), None)
+    if start is None:
+        return None
+    root = chain[start].id
+    for x in chain[start:]:
+        side_of[x.id] = root
+    for entry in chain_entries(chain[start:]):
+        add_side(root, entry)
+    return root
 
 # m as jev sees it: without the mention (and !nocontext) if it's to jev, links as tags, and a tag for each attachment
 # and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
@@ -1037,21 +1083,31 @@ def reactions_to(m):
 async def load_history(first):
     ch = first.channel.id
     known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
-    found, replies = [], {}
+    known |= side_of.keys()
+    scanned, found, replies = [], [], {}
     try:
         async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
-            if m.author.id == bot.user.id and m.reference and m.content and m.content not in NO_MONEY:
-                replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
-            elif m.id not in known and (entry := history_entry(m)):
-                found.append(entry)
+            scanned.append(m)
     except Exception as e:  # no Read Message History permission — start empty, like before
         log.warning(f"Loading history for {ch} failed: {e}")
-    for entry in found:
+    for m in reversed(scanned):  # oldest first, so a side conversation's !nocontext comes before the replies under it
+        if (root := m.id if no_context(m) else m.reference and side_of.get(m.reference.message_id)) is not None:
+            side_of[m.id] = root
+        if m.author.id == bot.user.id and m.reference and m.content and m.content not in NO_MONEY:
+            replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
+        elif m.id not in known and (entry := history_entry(m)):
+            found.append((entry, root))
+    talk = []
+    for entry, root in found:
         if r := replies.get(entry["id"]):
             entry["reply"], entry["reply_id"] = r.content, r.id
             if counts := reactions_to(r):
                 entry["reply_reactions"] = counts
-    channel_history[ch] = recent(sorted(channel_history[ch] + found, key=lambda e: e["at"]))
+        if root is None:
+            talk.append(entry)
+        else:
+            add_side(root, entry)
+    channel_history[ch] = recent(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
 @bot.event
@@ -1201,7 +1257,10 @@ async def on_message(m):
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
         if HISTORY_CHATTER and (entry := history_entry(m)):
-            add_history(m.channel.id, entry)
+            if (root := await side_root(m)) is not None:
+                add_side(root, entry)
+            else:
+                add_history(m.channel.id, entry)
         return
     if stopping.is_set():
         return
@@ -1211,7 +1270,7 @@ async def on_message(m):
 # Discord often adds a link's embed just after the message arrives, as an edit — and people fix typos
 @bot.event
 async def on_message_edit(before, after):
-    entry = next((e for e in channel_history.get(after.channel.id, []) if e.get("id") == after.id), None)
+    entry = next((e for e in entries_with(after.channel.id, after.id) if e.get("id") == after.id), None)
     if entry and (content := message_text(after)):
         entry["content"] = content
 
@@ -1477,22 +1536,21 @@ async def handle(m, c):
     if m.channel.id not in history_loaded:
         history_loaded[m.channel.id] = asyncio.create_task(load_history(m))
     await history_loaded[m.channel.id]
-    entry = add_history(m.channel.id, history_entry(m))
+    root = await side_root(m)
+    # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
+    if root is None:
+        entry = add_history(m.channel.id, history_entry(m))
+        h = shown(channel_history[m.channel.id][:-1])
+    else:
+        h = list(side_talk.get(root, []))  # nothing yet for a !nocontext message
+        entry = add_side(root, history_entry(m))
+        note(no_context=True)
     entry["pending"] = True
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
-    # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
-    h = shown(channel_history[m.channel.id][:-1])
-    if no_context(m):
-        h = []  # still in the history above, for the messages after it
-        note(no_context=True)
-    else:
-        if (chain := await no_context_chain(m)) is not None:
-            h = chain
-            note(no_context=True)
-        # The reply of jev's someone is answering, if it isn't already shown under the message it answered
-        if (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
-            h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
+    # The reply of jev's someone is answering, if it isn't already shown under the message it answered
+    if not no_context(m) and (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
+        h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
@@ -1525,6 +1583,8 @@ async def handle(m, c):
         note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
+            if root is not None:
+                side_of[sent.id] = root  # replies to it carry on the side conversation
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         note(error=repr(e))
@@ -1537,7 +1597,7 @@ async def handle(m, c):
 async def on_reaction_change(p, change):
     if p.user_id == bot.user.id:
         return
-    entry = next((e for e in channel_history.get(p.channel_id, []) if e.get("reply_id") == p.message_id), None)
+    entry = next((e for e in entries_with(p.channel_id, p.message_id) if e.get("reply_id") == p.message_id), None)
     if entry is None:
         return
     counts = entry.setdefault("reply_reactions", {})
@@ -1556,13 +1616,13 @@ async def on_raw_reaction_remove(p):
 
 @bot.event
 async def on_raw_reaction_clear(p):
-    for e in channel_history.get(p.channel_id, []):
+    for e in entries_with(p.channel_id, p.message_id):
         if e.get("reply_id") == p.message_id:
             e.pop("reply_reactions", None)
 
 @bot.event
 async def on_raw_reaction_clear_emoji(p):
-    for e in channel_history.get(p.channel_id, []):
+    for e in entries_with(p.channel_id, p.message_id):
         if e.get("reply_id") == p.message_id:
             e.get("reply_reactions", {}).pop(emoji_text(p.emoji), None)
 
