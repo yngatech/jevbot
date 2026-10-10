@@ -101,7 +101,7 @@ class ReplyTests(_Case):
         self.assertIn("Write rocky's reply to kettle's last message.", messages[1]["content"])  # who it answers
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
         self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
-        self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for !context
+        self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for Context
 
     async def test_jev_still_looms(self):
         with patch.object(j, "llm", new_callable=AsyncMock) as llm, \
