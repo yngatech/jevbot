@@ -82,6 +82,18 @@ With `!model`, a reply costs ~$0.0003-0.0005 with DeepSeek (its prompt is cached
 
 Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, the reaction or each word it picked (with its top candidates, each with its probability and its score after penalties, and the done score), and what the API calls actually cost. Status entries also keep each candidate in `status_attempts`, with its judgement score, acceptance, generation trace and cost; the top-level word steps and transcript belong to the accepted candidate so `!why` and Context still show what was posted. The total cost includes all attempts and judgements, including when no new status was accepted. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
 
+## Reactions
+
+`reactions.py` reports how people reacted to what jev posted. It reads `logs/` for jev's replies and statuses, then fetches the reactions on them from Discord as they are now, because reactions aren't logged and people keep adding them after jev moves on. Replies are broken down by who wrote them (Jev, or the LLM picked with `!model`) and Jev's by length, with statuses in a table of their own and the most-reacted posts listed at the end. 👎 is a Rocky meme as often as a complaint, so it's counted apart: "besides 👎" is the share of posts with some other reaction. "audience" is how many people other than jev spoke in the channel in the 30 minutes after a post (`AUDIENCE_MINUTES`), so a quiet evening can be told apart from a flop.
+
+```bash
+python reactions.py                 # everything in logs/
+python reactions.py --days 7 --top 20
+python reactions.py --logs ../jevbot/logs   # another checkout's logs
+```
+
+It reads one page of channel history per 100 messages over the stretch the posts cover, through Discord's API only, so it runs alongside the bot on the same token. It costs nothing. Posts that have since been deleted are left out. The most-reacted list prints what jev said, so keep its output local, like `logs/`.
+
 ## Testing changes
 
 `jev_eval.py` runs a fixed set of conversations against the live Jev API and reports what's measurable: whether the question check sends questions to a reply and chatter to a reaction, and how jev's first-word candidates split between real answers, `<END>`, words that describe the reply ("silent", "crickets"), and words that only the transcript's formatting contains. Save a run on master, then compare your branch against it:
@@ -96,6 +108,8 @@ A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter bil
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
 `test_status.py` exercises status generation, judging, retries and publishing with synthetic API results and Discord writes (`python -m unittest test_status`). It checks that rejected or unscored candidates keep the previous status, that accepted candidates retain their original wording and diagnostic trace, and that quiet and out-of-credit periods make no attempts.
+
+`test_reactions.py` checks `reactions.py` offline: which log entries count as posts, matching them to synthetic Discord messages, leaving out jev's own reactions, and keeping 👎 apart (`python -m unittest test_reactions`).
 
 `test_mentions.py` exercises live message routing and startup catch-up with synthetic Discord messages (`python -m unittest test_mentions`). It checks that unpinged replies stay as chatter, mentions and allowed DMs still trigger responses, diagnostic commands work without a ping, and the Why and Context actions answer only whoever asked.
 
