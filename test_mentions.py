@@ -28,6 +28,8 @@ class _Message(SimpleNamespace):
 
 class _Discord(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.reactors_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.reactors_dir.cleanup)
         self.user = SimpleNamespace(id=100000000000000001, bot=True, display_name="Testbot")
         self.role = SimpleNamespace(id=200000000000000001, mention="<@&200000000000000001>", name="Testbot")
         self.guild = SimpleNamespace(id=400, self_role=self.role, me=self.user, threads=[],
@@ -50,6 +52,9 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "reactor_names", {}),
             (j, "LONG_CHAT_CHANNELS", set()),  # not whatever .env sets
             (j, "long_chats", {}),
+            (j, "reactor_cache", {}),
+            (j, "reactors_save", None),
+            (j, "REACTORS_PATH", Path(self.reactors_dir.name) / "reactors.json"),
         ]:
             p = patch.object(obj, attr, value)
             p.start()
@@ -130,6 +135,7 @@ class ReactionContextTests(_Discord):
         reply = SimpleNamespace(id=700, reactions=[self.reaction(fail=True)])
         await j.attach_reactions(self.entry, reply)
         self.assertIn("Hello (😂×2)", self.transcript())
+        self.assertNotIn("700", j.reactor_cache)  # asked again next time
         self.assertEqual(j.reacted({"😂": 3}), " (😂×3)")
         p = self.payload()
         p.member, p.guild_id = None, None
@@ -138,6 +144,32 @@ class ReactionContextTests(_Discord):
         ):
             await j.on_raw_reaction_add(p)
         self.assertIn("😂×3 by @Moss", self.transcript())
+
+    async def test_a_rebuild_reuses_saved_names_without_asking_discord(self):
+        j.reactor_cache["700"] = {"counts": {"😂": 2}, "reactors": {"😂": {"501": "Moss", "502": "Pip"}}}
+        unasked = SimpleNamespace(emoji="😂", count=3, me=True, users=Mock(side_effect=AssertionError("asked Discord")))
+        await j.attach_reactions(self.entry, SimpleNamespace(id=700, reactions=[unasked]))
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
+
+    async def test_only_an_emoji_whose_count_changed_is_asked_about(self):
+        j.reactor_cache["700"] = {"counts": {"😂": 2, "💀": 1}, "reactors": {"😂": {"501": "Moss", "502": "Pip"},
+                                                                           "💀": {"503": "Fern"}}}
+        unasked = SimpleNamespace(emoji="😂", count=3, me=True, users=Mock(side_effect=AssertionError("asked Discord")))
+        await j.attach_reactions(self.entry, SimpleNamespace(id=700, reactions=[unasked, self.reaction("💀")]))
+        self.assertEqual(self.entry["reply_reactors"], {"😂": {"501": "Moss", "502": "Pip"},
+                                                        "💀": {"501": "Moss", "502": "Pip"}})
+        self.assertEqual(j.reactor_cache["700"]["counts"], {"😂": 2, "💀": 2})
+
+    async def test_live_reactions_keep_the_saved_names_current(self):
+        await j.on_raw_reaction_add(self.payload())
+        await j.on_raw_reaction_add(self.payload(502, "Pip", "💀"))
+        await j.on_raw_reaction_remove(self.payload())
+        self.assertEqual(j.reactor_cache["700"], {"counts": {"💀": 1}, "reactors": {"💀": {"502": "Pip"}}})
+        self.assertIsNotNone(j.reactors_save)  # written a moment later, once
+        j.save_reactors()
+        self.assertEqual(j.load_reactors(), j.reactor_cache)
+        await j.on_raw_reaction_clear(self.payload())
+        self.assertNotIn("700", j.reactor_cache)
 
     async def test_history_names_are_server_nicknames(self):
         # Reaction users come back as plain users with global names; the member lookup gives the nickname,
