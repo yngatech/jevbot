@@ -56,7 +56,9 @@ def render(bot_name, reply, panels, reacted_to=None, images=None, note=None, tok
     top = max(r[1] for p in panels for r in p["rows"])
     xmax = max(top * 100 * 1.55, 10)  # room for the "23% → 2.9%" labels
 
-    header, panel_h = 1.25 if reacted_to is None else 1.55, 1.0 + 0.4 * bars  # one panel wraps the key to 3 lines
+    # A panel's bars, then the gap under them for their axis labels and the next row's two-line titles
+    axes_h, gap = 0.375 * bars, 0.8
+    header, panel_h = 1.25 if reacted_to is None else 1.55, axes_h + gap  # one panel wraps the key to 3 lines
     below = 0.4 if note else 0  # the key moves down for the note
     header += below
     fig = Figure(figsize=(4 * cols, header + panel_h * grid_rows + 0.3), facecolor=BG)
@@ -76,7 +78,7 @@ def render(bot_name, reply, panels, reacted_to=None, images=None, note=None, tok
                 else "The best score wins (gold)."),
              fontsize=10.5, color=INK2, va="top", family=FONT, wrap=True)
     fig.subplots_adjust(left=0.1 if cols > 1 else 0.3, right=0.98, bottom=0.3 / fig.get_figheight(),
-                        top=1 - (header + 0.55) / fig.get_figheight(), wspace=0.6, hspace=0.9 / panel_h * 2)
+                        top=1 - (header + 0.55) / fig.get_figheight(), wspace=0.6, hspace=gap / axes_h)
 
     for i, p in enumerate(panels):
         ax = fig.add_subplot(grid_rows, cols, i + 1)

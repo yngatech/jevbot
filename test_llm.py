@@ -99,6 +99,7 @@ class ReplyTests(_Case):
         self.assertTrue(messages[1]["content"].startswith("The chat so far:\n\nkettle: what's my cat called?\n\n"))
         self.assertNotIn("rocky: \n", messages[1]["content"])  # its empty turn is asked for, not shown
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
+        self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
         self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for !context
 
     async def test_jev_still_looms(self):
@@ -185,6 +186,13 @@ class WhyTests(_Case):
             await j.why(m)
         self.assertTrue(render.call_args.kwargs["tokens"])
         self.assertEqual(len(render.call_args.args[2]), 2)
+        self.assertEqual(render.call_args.kwargs["note"], "Model: deepseek/deepseek-v4-pro")  # logged before llm_model
+
+        logged["llm_model"] = "deepseek/deepseek-v4-flash"
+        with patch.object(j, "find_trace", return_value=logged), \
+                patch.object(j.why_chart, "render", return_value=b"png") as render:
+            await j.why(m)
+        self.assertEqual(render.call_args.kwargs["note"], "Model: deepseek/deepseek-v4-flash")
 
     def test_repeated_alternatives_and_the_end_token_are_dropped(self):
         lp = lambda p: __import__("math").log(p)
