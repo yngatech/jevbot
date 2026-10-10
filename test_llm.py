@@ -123,6 +123,17 @@ class ReplyTests(_Case):
         self.assertIn(chat, messages[1]["content"])
         self.assertEqual(self.trace["llm_chat_chars"], len(chat))
 
+    async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
+            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+            for name, provider in [("deepseek", {"require_parameters": True, "order": ["parasail"]}),
+                                   ("kimi", None)]:
+                await j.llm(name, [{"role": "user", "content": "cat?"}])
+                self.assertEqual(session.post.call_args.kwargs["json"].get("provider"), provider)
+
     async def test_transcript_shows_the_local_time_when_the_minute_changes_and_a_line_per_day(self):
         j.model_name = "deepseek"
         utc = j.timezone.utc
