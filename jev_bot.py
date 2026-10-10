@@ -844,6 +844,12 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
+# The Why and Context actions (below) are registered with Discord each start, so a change to them shows up
+async def setup_hook():
+    synced = await bot.tree.sync()
+    log.info(f"Synced {len(synced)} app command(s)")
+bot.setup_hook = setup_hook
+
 # Stopping: the first Ctrl-C (or SIGINT/SIGTERM) takes no new messages and lets the ones being answered finish —
 # catch_up() answers what came in meanwhile on the next start. Another Ctrl-C quits at once. A signal sent to the
 # whole process group (a service manager stopping it, say) reaches Python twice under `uv run` — directly and
@@ -1390,6 +1396,19 @@ def asked_note(t, bot_name):
     # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
     return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
 
+# How !why and !context answer: a text command with a Discord reply to it, the Why and Context actions (right-click
+# a message, Apps) with a message only whoever asked can see. Both quote what people said, so no pings from mentions.
+def reply_to(m):
+    async def send(content=None, file=None):
+        await m.reply(content, file=file, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+    return send
+
+def answer_privately(interaction):
+    async def send(content=None, file=None):
+        await interaction.followup.send(content or discord.utils.MISSING, file=file or discord.utils.MISSING,
+                                        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    return send
+
 # The chart's file name, from what it's about, so saved charts don't all overwrite why.png:
 # "why-day-good-rain-make-race.png", "why-reacted-to-lol-that-cat.png"
 def why_filename(text, reacted=False):
@@ -1397,17 +1416,20 @@ def why_filename(text, reacted=False):
     return "-".join(["why"] + (["reacted", "to"] if reacted else []) + words)[:60] + ".png"
 
 async def why(m):
-    if (target := await command_target(m)) is False:
-        return
-    t = await asyncio.to_thread(find_trace, m.channel.id, target)
+    if (target := await command_target(m)) is not False:
+        await explain_why(m.channel.id, m.guild, target, reply_to(m))
+
+# !why's answer for `target` (None: the latest in the channel), through send(content=None, file=None)
+async def explain_why(channel_id, guild, target, send):
+    t = await asyncio.to_thread(find_trace, channel_id, target)
     if t is None:
-        await m.reply("Nothing logged for that", mention_author=False)
+        await send("Nothing logged for that")
         return
-    bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
+    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
     if t.get("llm") and not t.get("reaction"):
         if not t.get("llm_tokens"):
-            await m.reply(f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
-                          " — !context shows what it saw", mention_author=False)
+            await send(f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
+                       " — !context shows what it saw")
             log.info(f"[WHY] no tokens from {t['llm']}")
             return
         said = t.get("reply") or t.get("status") or ""
@@ -1416,29 +1438,26 @@ async def why(m):
         note = f"Model: {model}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
         png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
                                       tokens=True)
-        await m.reply(file=discord.File(io.BytesIO(png), why_filename(said)), mention_author=False)
+        await send(file=discord.File(io.BytesIO(png), why_filename(said)))
         log.info(f"[WHY] token chart for {said!r}")
     elif t.get("steps"):
         said = t.get("reply") or t.get("status") or ""
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
-        await m.reply(file=discord.File(io.BytesIO(png), why_filename(said)), mention_author=False)
+        await send(file=discord.File(io.BytesIO(png), why_filename(said)))
         log.info(f"[WHY] chart for {t.get('reply') or t.get('status')!r}")
     elif isinstance(t["reaction_candidates"][0], str):
         # Entries from before their probabilities were logged: just the emoji, likeliest first
-        # Quotes what someone said, so no pings from mentions in it
-        await m.reply(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {' '.join(t['reaction_candidates'])}",
-                      mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        await send(f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {' '.join(t['reaction_candidates'])}")
         log.info(f"[WHY] reaction {t.get('reaction')}")
     else:
         rows = sorted(t["reaction_candidates"], key=lambda r: -r[2])  # [emoji, probability, score], best score first
         async with aiohttp.ClientSession() as session:
-            images = await asyncio.gather(*(emoji_image(session, e, m.guild) for e, _, _ in rows))
+            images = await asyncio.gather(*(emoji_image(session, e, guild) for e, _, _ in rows))
         panel = {"so_far": t.get("author") or "", "picked": t.get("reaction"), "ends": False, "rows": rows}
         png = await asyncio.to_thread(why_chart.render, bot_name, "", [panel], reacted_to=t["message"],
                                       images={e: img for (e, _, _), img in zip(rows, images) if img},
                                       note=asked_note(t, bot_name))
-        await m.reply(file=discord.File(io.BytesIO(png), why_filename(t["message"], reacted=True)),
-                      mention_author=False)
+        await send(file=discord.File(io.BytesIO(png), why_filename(t["message"], reacted=True)))
         log.info(f"[WHY] chart for reaction {t.get('reaction')}")
 
 
@@ -1462,16 +1481,19 @@ def logged_context(t):
     return t.get("transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [])
 
 async def context(m):
-    if (target := await command_target(m)) is False:
-        return
-    t = await asyncio.to_thread(find_trace, m.channel.id, target,
+    if (target := await command_target(m)) is not False:
+        await explain_context(m.channel.id, m.guild, target, reply_to(m))
+
+# !context's answer for `target` (None: the latest in the channel), through send(content=None, file=None)
+async def explain_context(channel_id, guild, target, send):
+    t = await asyncio.to_thread(find_trace, channel_id, target,
                                 lambda t: "history" in t and (t.get("reply") or t.get("reaction"))
                                 or t.get("status") and "transcript" in t)
     if t is None:
-        await m.reply("Nothing logged for that", mention_author=False)
+        await send("Nothing logged for that")
         return
     # Statuses from before bot_name was logged: the name now
-    bot_name = t.get("bot_name") or (m.guild.me if m.guild else bot.user).display_name
+    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
     if "status" in t:
         what = "its status"
         head = f"What {bot_name} saw before the status \"{unfence(t['status'])}\""
@@ -1481,13 +1503,24 @@ async def context(m):
                 + (" (!nocontext)" if t.get("no_context") else ""))
     text = logged_context(t)
     body = f"{head}:\n```\n{unfence(text)}\n```"
-    # Quotes what people said, so no pings from mentions in it
     if len(body) <= CONTEXT_LIMIT:
-        await m.reply(body, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        await send(body)
     else:
-        await m.reply(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"), mention_author=False,
-                      allowed_mentions=discord.AllowedMentions.none())
+        await send(head, file=discord.File(io.BytesIO(text.encode()), "context.txt"))
     log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
+
+
+# Right-clicking a message for Why or Context: that message, as if !why or !context were a Discord reply to it.
+# Charts can take longer than the 3s Discord waits for an answer, so it's deferred ("jev is thinking...") first.
+@bot.tree.context_menu(name="Why")
+async def why_action(interaction: discord.Interaction, target: discord.Message):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await explain_why(interaction.channel_id, interaction.guild, target, answer_privately(interaction))
+
+@bot.tree.context_menu(name="Context")
+async def context_action(interaction: discord.Interaction, target: discord.Message):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await explain_context(interaction.channel_id, interaction.guild, target, answer_privately(interaction))
 
 
 # !model: which model writes the replies and statuses, or with a name, switch to it — for everyone, and kept

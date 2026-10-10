@@ -137,6 +137,52 @@ class MentionTests(_Discord):
             await j.respond(m, caught_up=True)  # and once it's answered, too
         traced.assert_awaited_once_with(m)
 
+class ActionTests(_Discord):
+    """Why and Context, from right-clicking a message: answered only to whoever asked."""
+
+    def interaction(self):
+        return SimpleNamespace(channel_id=self.channel.id, guild=self.guild,
+                               response=SimpleNamespace(defer=AsyncMock()), followup=SimpleNamespace(send=AsyncMock()))
+
+    def test_actions_are_message_context_menus(self):
+        menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
+        self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message})
+
+    async def test_context_answers_the_right_clicked_message_privately(self):
+        logged = {"message": "what's my cat called?", "author": "Speaker", "bot_name": "Testbot", "history": [],
+                  "reply": "Is called Biscuit.", "transcript": "Speaker: what's my cat called? @everyone"}
+        i = self.interaction()
+        with patch.object(j, "find_trace", return_value=logged) as find:
+            await j.context_action.callback(i, self.target)
+        i.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.assertEqual(find.call_args.args[:2], (self.channel.id, self.target))
+        sent = i.followup.send.call_args
+        self.assertTrue(sent.kwargs["ephemeral"])
+        self.assertIn("Speaker: what's my cat called?", sent.args[0])
+        self.assertEqual(sent.kwargs["allowed_mentions"].to_dict()["parse"], [])  # the quoted @everyone pings nobody
+        self.assertIs(sent.kwargs["file"], discord.utils.MISSING)
+
+    async def test_why_sends_its_chart_privately(self):
+        logged = {"llm": "deepseek", "reply": "Is called", "bot_name": "Testbot",
+                  "llm_tokens": [{"token": "Is", "p": 0.6, "top": [["Is", 0.6]]}]}
+        i = self.interaction()
+        with patch.object(j, "find_trace", return_value=logged), \
+                patch.object(j.why_chart, "render", return_value=b"png"):
+            await j.why_action.callback(i, self.target)
+        sent = i.followup.send.call_args
+        self.assertTrue(sent.kwargs["ephemeral"])
+        self.assertIs(sent.args[0], discord.utils.MISSING)
+        self.assertEqual(sent.kwargs["file"].filename, "why-is-called.png")
+
+    async def test_nothing_logged_says_so_privately(self):
+        i = self.interaction()
+        with patch.object(j, "find_trace", return_value=None):
+            await j.why_action.callback(i, self.target)
+        i.followup.send.assert_awaited_once()
+        self.assertEqual(i.followup.send.call_args.args[0], "Nothing logged for that")
+        self.assertTrue(i.followup.send.call_args.kwargs["ephemeral"])
+
+
 class NoContextChainTests(_Discord):
     """A "@jev !nocontext ..." message and the replies under it are a side conversation: they see all of it and
     nothing else, and the rest of the channel doesn't see them."""
