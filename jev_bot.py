@@ -896,12 +896,17 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                 log.warning(f"LLM err {attempt}: {e}")
                 await asyncio.sleep(1 + 2 * attempt)
                 continue
+            usage = data.get("usage") or {}
             if (t := trace.get()) is not None:
-                t["cost"] += data.get("usage", {}).get("cost") or 0
+                # On our own Anthropic key (OpenRouter's BYOK) OpenRouter charges nothing, up to its allowance, and
+                # the request is paid from the key's credit: counted in the cost too, and apart as byok_cost
+                byok = usage.get("is_byok") and (usage.get("cost_details") or {}).get("upstream_inference_cost") or 0
+                t["cost"] += (usage.get("cost") or 0) + byok
+                if byok:
+                    t["byok_cost"] = t.get("byok_cost", 0) + byok
                 t["requests"] += 1
             # For Context: the prompt's exact size, how much was read from the cache, and its length in characters
             # to split it by
-            usage = data.get("usage") or {}
             note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
                  llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                  llm_prompt_chars=sum(len(text_of(m["content"])) for m in messages))
