@@ -785,7 +785,7 @@ async def generate_filtered_status(bot_name, start, chat=""):
 #     it, and Haiku put it on 40 of 46 replies even when told to only use it for real questions
 #   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
 #   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
-#   providers: OpenRouter's providers to try first, in order (others if they're down) — a model's prompt cache is the
+#   providers: OpenRouter's providers to try, in order (others only on the last try, llm) — a model's prompt cache is the
 #     provider's, so sent to whichever OpenRouter picked, DeepSeek never hit one: 0.36-0.91¢ a reply on a 7.8K-token
 #     chat. Of the providers taking all of its parameters (Parasail, Cloudflare, Novita), Parasail is the cheapest, and
 #     a repeat read 7.7K of it from the cache for 0.085¢. StreamLake would be 0.026¢, but has no frequency_penalty.
@@ -887,8 +887,14 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
         body["provider"] = body.get("provider", {}) | {"order": providers}
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for attempt in range(3):
+            request = body
+            if providers:
+                # A pinned provider that's rate-limited or failing is tried again rather than left for another, which
+                # doesn't have its prompt cache: Parasail's rate limits sent DeepSeek replies to Cloudflare at full
+                # price. Only the last try lets OpenRouter go elsewhere, so a reply still comes.
+                request = body | {"provider": body["provider"] | {"allow_fallbacks": attempt == 2}}
             try:
-                async with session.post(LLM_URL, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                async with session.post(LLM_URL, json=request, timeout=aiohttp.ClientTimeout(total=60)) as r:
                     if r.status == 402:  # out of credit — retrying won't help
                         log.warning(f"LLM 402: {(await r.text())[:300]}")
                         note(error="out of credit")

@@ -140,13 +140,36 @@ class ReplyTests(_Case):
                 self.assertAlmostEqual(self.trace["cost"], cost)
                 self.assertEqual(self.trace.get("byok_cost"), byok)
 
+    async def test_a_rate_limited_pinned_provider_is_tried_again_before_any_other(self):
+        sent = []
+        replies = iter([SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
+                        SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value={
+                            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))])
+        session = MagicMock()
+        session.__aenter__.return_value = session
+
+        def post(url, json, **kwargs):
+            sent.append(json["provider"])
+            response = MagicMock()
+            response.__aenter__.return_value = next(replies)
+            return response
+
+        session.post.side_effect = post
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
+                patch.object(j.asyncio, "sleep", AsyncMock()):
+            text, _ = await j.llm("deepseek", [{"role": "user", "content": "cat?"}])
+        self.assertEqual(text, "Is Biscuit.")
+        self.assertEqual([p.get("allow_fallbacks") for p in sent], [False, False, True])
+        self.assertTrue(all(p["order"] == ["parasail"] and p["require_parameters"] for p in sent))
+
     async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
         session = MagicMock()
         session.__aenter__.return_value = session
         session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
             "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
-            for name, provider in [("deepseek", {"require_parameters": True, "order": ["parasail"]}),
+            for name, provider in [("deepseek", {"require_parameters": True, "order": ["parasail"], "allow_fallbacks": False}),
                                    ("kimi", None)]:
                 await j.llm(name, [{"role": "user", "content": "cat?"}])
                 self.assertEqual(session.post.call_args.kwargs["json"].get("provider"), provider)

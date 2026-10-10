@@ -84,7 +84,7 @@ Messages sent while jev is offline (say, during a restart) never reach it, so on
 
 Tournament sampling does ~4 API calls per word. Via OpenRouter, Jev costs $0.042 per million input tokens (output is free), which comes to ~$0.003 per word with the 10K vocab, so ~$0.01-0.10 per reply depending on length.
 
-With `!model`, a reply costs ~$0.0003-0.0005 with DeepSeek (its prompt is cached after the first) or Haiku, ~$0.00005 with Flash, ~$0.001 with Kimi K2, ~$0.001-0.002 with K3, plus Jev's reply-or-react check (~$0.0001). A status is about the same, plus Jev's meaning check.
+With `!model`, and the 200-message history, a reply costs ~$0.0015 with Haiku (its median since the history grew) — ~$0.0005 in a long chat, where most of it is read from the cache — and with DeepSeek ~$0.001-0.0015 when its provider's cache hits and ~$0.0045 when it doesn't (its replies before it was pinned to one provider had a median of ~$0.004), ~$0.00005 with Flash, ~$0.001 with Kimi K2, ~$0.001-0.002 with K3, plus Jev's reply-or-react check (~$0.0001). A status is about the same, plus Jev's meaning check.
 
 ## Logs
 
