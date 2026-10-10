@@ -381,15 +381,23 @@ async def next_word(session, state, vocab, rng, instructions, done_state=None):
     return probs, complete_noul
 
 
-# People's reactions to one of jev's replies, as " (😂×3 💀)" — a laugh jev can see, and maybe chase
-def reacted(counts):
-    return " (" + " ".join(e if n == 1 else f"{e}×{n}" for e, n in counts.items()) + ")" if counts else ""
+# People's reactions to one of jev's replies, with readable mentions of the reactors: " (😂 by @Moss, @Pip; 💀×3)".
+# The count is left out when every reactor is named, and kept when some names are missing.
+def reacted(counts, reactors=None):
+    parts, named = [], False
+    for e, n in (counts or {}).items():
+        names = [f"@{name}" for name in (reactors or {}).get(e, {}).values() if name]
+        text = e if n == 1 or len(names) >= n else f"{e}×{n}"
+        parts.append(text + (" by " + ", ".join(names) if names else ""))
+        named = named or bool(names)
+    return " (" + ("; " if named else " ").join(parts) + ")" if parts else ""  # "; " only to keep names apart
 
 # marked: mark messages addressed to jev for the question check, including pinged replies without a textual
 # mention. Keep existing mentions in place rather than adding a second one.
-# reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies
+# reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies; reactors: who made them
 # at: when the message was sent, to show each turn's time — for an LLM only: Jev would pick the times as words
-def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None, at=None):
+def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None, at=None,
+               reactors=True):
     their_reactions = reactions if their_reactions is None else their_reactions
     def addressed(text, to_bot=True):
         mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
@@ -414,13 +422,14 @@ def transcript(message, author, bot_name, history, words, reactions=True, marked
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
             if h["role"] == "assistant" and their_reactions:
-                text += reacted(h.get("reactions"))
+                text += reacted(h.get("reactions"), reactors and h.get("reactors"))
             turn(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}", h.get("at"))
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
             if "reply" in h:
-                turn(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if their_reactions else ''}",
+                turn(f"{bot_name}: {unrender(h['reply'])}"
+                     f"{reacted(h.get('reply_reactions'), reactors and h.get('reply_reactors')) if their_reactions else ''}",
                      h.get("reply_at"))
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
@@ -565,10 +574,12 @@ async def generate_reply(message, author, bot_name, history=None, llm_history=No
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
                                 + [f"{author} {message}"]))
-    note(transcript=transcript(message, author, bot_name, history, []))
+    # Who reacted is left to the LLMs: names didn't change what Jev said (jev_eval's *-laughed-names), and Jev sends
+    # the transcript with every word it asks for
+    note(transcript=transcript(message, author, bot_name, history, [], reactors=False))
     # People's reactions stay out of the "complete?" question: with 😂×4 on jev's last reply in view it read a
     # two-word reply as done, and jev stopped at "Dunno forgot" where it had gone on to "Dunno forgot liar bitch"
-    words = await loom(lambda words: transcript(message, author, bot_name, history, words),
+    words = await loom(lambda words: transcript(message, author, bot_name, history, words, reactors=False),
                        vocab, NEXT_WORD.format(bot_name=bot_name),
                        done_state=lambda words: transcript(message, author, bot_name, history, words,
                                                             their_reactions=False),
@@ -1033,7 +1044,7 @@ async def reply_chain(m):
 
 # History entries for a reply chain, jev's replies under what they answered. Its other messages in it (a !why chart)
 # are left out.
-def chain_entries(chain):
+async def chain_entries(chain):
     entries = []
     for x in chain:
         if x.author.id != bot.user.id:
@@ -1042,8 +1053,7 @@ def chain_entries(chain):
         elif (entries and x.reference and entries[-1]["id"] == x.reference.message_id and "reply" not in entries[-1]
               and x.content and x.content not in NO_MONEY):
             entries[-1]["reply"], entries[-1]["reply_id"], entries[-1]["reply_at"] = x.content, x.id, x.created_at
-            if counts := reactions_to(x):
-                entries[-1]["reply_reactions"] = counts
+            await attach_reactions(entries[-1], x)
     return entries
 
 # The side conversation m is in, by the id of its !nocontext message — m's own, if it has one — or None. One jev
@@ -1065,7 +1075,7 @@ async def side_root(m):
     root = chain[start].id
     for x in chain[start:]:
         side_of[x.id] = root
-    for entry in chain_entries(chain[start:]):
+    for entry in await chain_entries(chain[start:]):
         add_side(root, entry)
     return root
 
@@ -1125,6 +1135,55 @@ def history_entry(m):
 def reactions_to(m):
     return {emoji_text(r.emoji): n for r in m.reactions if (n := r.count - r.me)}
 
+
+# Server nickname lookups for reactors, by (guild id, user id). The lookup itself is kept, so a history rebuild
+# loading every reply's reactions at once asks Discord about each person once. A live reaction refreshes it.
+reactor_names = {}
+
+async def member_name(guild, user_id):
+    try:
+        return (guild.get_member(user_id) or await guild.fetch_member(user_id)).display_name
+    except discord.HTTPException:
+        return None  # left the server — their own name will do
+
+# A reactor's name as the server shows it, like the mentions elsewhere in the transcript. Without the members
+# intent Discord hands back plain users, whose display name is the global one, so the member is looked up.
+async def reactor_name(guild, user_id, user=None):
+    if isinstance(user, discord.Member):
+        reactor_names.pop((user.guild.id, user_id), None)
+        return user.display_name
+    if guild:
+        if (guild.id, user_id) not in reactor_names:
+            reactor_names[guild.id, user_id] = asyncio.ensure_future(member_name(guild, user_id))
+        if name := await reactor_names[guild.id, user_id]:
+            return name
+    try:
+        user = user or bot.get_user(user_id) or await bot.fetch_user(user_id)
+    except discord.HTTPException:
+        return None
+    return user.display_name
+
+# Loading history needs Discord's reaction-user endpoint; live events maintain the same map by user ID.
+# Keep counts even when Discord cannot return users, so the feedback is still visible.
+async def attach_reactions(entry, m, prefix="reply_"):
+    counts = reactions_to(m)
+    if not counts:
+        return
+    entry[prefix + "reactions"] = counts
+    reactors = entry[prefix + "reactors"] = {}
+    guild = getattr(m, "guild", None)
+
+    async def load(r):
+        users = reactors[emoji_text(r.emoji)] = {}
+        try:
+            async for user in r.users():
+                if user.id != bot.user.id:
+                    users[str(user.id)] = await reactor_name(guild, user.id, user)
+        except discord.HTTPException:
+            log.warning("Could not load reaction users for message %s", m.id)
+
+    await asyncio.gather(*(load(r) for r in m.reactions if emoji_text(r.emoji) in counts))
+
 async def load_history(first):
     ch = first.channel.id
     known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
@@ -1142,16 +1201,16 @@ async def load_history(first):
             replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
         elif m.id not in known and (entry := history_entry(m)):
             found.append((entry, root))
-    talk = []
+    talk, reacting = [], []
     for entry, root in found:
         if r := replies.get(entry["id"]):
             entry["reply"], entry["reply_id"], entry["reply_at"] = r.content, r.id, r.created_at
-            if counts := reactions_to(r):
-                entry["reply_reactions"] = counts
+            reacting.append(attach_reactions(entry, r))
         if root is None:
             talk.append(entry)
         else:
             add_side(root, entry)
+    await asyncio.gather(*reacting)  # all at once: someone is waiting on the reply this history is for
     channel_history[ch] = kept(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
@@ -1746,10 +1805,13 @@ async def handle(m, c):
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # The reply of jev's someone is answering, if it isn't already shown under the message it answered
     if not no_context(m) and (r := replied_to_bot(m)) and r.content:
+        reply_entry = None
         for x in (h, long):
             if all(e.get("reply_id") != r.id for e in x):
-                x.append({"role": "assistant", "name": bot_name, "content": r.content, "at": r.created_at,
-                          "reactions": reactions_to(r)})
+                if reply_entry is None:
+                    reply_entry = {"role": "assistant", "name": bot_name, "content": r.content, "at": r.created_at}
+                    await attach_reactions(reply_entry, r, prefix="")
+                x.append(reply_entry)
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
@@ -1802,9 +1864,21 @@ async def on_reaction_change(p, change):
         return
     counts = entry.setdefault("reply_reactions", {})
     e = emoji_text(p.emoji)
+    users = entry.setdefault("reply_reactors", {}).setdefault(e, {})
+    uid = str(p.user_id)
     counts[e] = counts.get(e, 0) + change
+    if change > 0:
+        users[uid] = None
+    else:
+        users.pop(uid, None)
     if counts[e] <= 0:
         del counts[e]
+        entry["reply_reactors"].pop(e, None)
+    if change > 0:
+        guild = bot.get_guild(p.guild_id) if p.guild_id else None
+        name = await reactor_name(guild, p.user_id, p.member)  # None if it can't be found — the count still shows
+        if uid in users:
+            users[uid] = name
 
 @bot.event
 async def on_raw_reaction_add(p):
@@ -1819,12 +1893,14 @@ async def on_raw_reaction_clear(p):
     for e in entries_with(p.channel_id, p.message_id):
         if e.get("reply_id") == p.message_id:
             e.pop("reply_reactions", None)
+            e.pop("reply_reactors", None)
 
 @bot.event
 async def on_raw_reaction_clear_emoji(p):
     for e in entries_with(p.channel_id, p.message_id):
         if e.get("reply_id") == p.message_id:
             e.get("reply_reactions", {}).pop(emoji_text(p.emoji), None)
+            e.get("reply_reactors", {}).pop(emoji_text(p.emoji), None)
 
 async def main():
     first_signal = None
