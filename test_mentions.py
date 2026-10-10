@@ -101,7 +101,7 @@ class ReactionContextTests(_Discord):
         question = MentionTests.message(self)
         question.id = 600
         reply = SimpleNamespace(id=700, author=self.user, reference=SimpleNamespace(message_id=600),
-                                content="Hello", reactions=[self.reaction()])
+                                content="Hello", reactions=[self.reaction()], created_at=question.created_at)
         async def history(**kwargs):
             for message in [reply, question]:
                 yield message
@@ -114,7 +114,7 @@ class ReactionContextTests(_Discord):
     async def test_side_chain_and_standalone_reply_names(self):
         question = MentionTests.message(self)
         reply = SimpleNamespace(id=700, author=self.user, reference=SimpleNamespace(message_id=question.id),
-                                content="Hello", reactions=[self.reaction()])
+                                content="Hello", reactions=[self.reaction()], created_at=question.created_at)
         entries = await j.chain_entries([question, reply])
         self.assertEqual(entries[0]["reply_reactors"]["😂"], {"501": "Moss", "502": "Pip"})
         standalone = {"role": "assistant", "content": "Hello"}
@@ -152,7 +152,7 @@ class ReactionContextTests(_Discord):
         async def loom(state, *args, **kwargs):
             seen.append(state([]))
             return ["Hi"]
-        async def llm(name, message, author, bot_name, history):
+        async def llm(name, message, author, bot_name, history, *args):
             return j.transcript(message, author, bot_name, history, [])
         with patch.object(j, "model_name", "jev"), patch.object(j, "loom", loom):
             await j.generate_reply("how are you?", "Speaker", "Testbot", [self.entry])
@@ -164,6 +164,7 @@ class ReactionContextTests(_Discord):
     def test_count_shown_only_when_names_are_missing(self):
         self.assertEqual(j.reacted({"😂": 2, "💀": 3}, {"😂": {"1": "Moss", "2": "Pip"}, "💀": {"3": "Fern"}}),
                          " (😂 by @Moss, @Pip; 💀×3 by @Fern)")
+        self.assertEqual(j.reacted({"😂": 3, "💀": 1}), " (😂×3 💀)")  # what Jev gets, as before names
 
 
 class MentionTests(_Discord):
