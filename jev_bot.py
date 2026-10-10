@@ -844,10 +844,14 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 gen_lock = asyncio.Lock()
 
-# The Why and Context actions (below) are registered with Discord each start, so a change to them shows up
+# The Why and Context actions (below) are registered with Discord each start, so a change to them shows up. If that
+# fails, the ones registered last time stay — no reason to keep jev offline.
 async def setup_hook():
-    synced = await bot.tree.sync()
-    log.info(f"Synced {len(synced)} app command(s)")
+    try:
+        synced = await bot.tree.sync()
+        log.info(f"Synced {len(synced)} app command(s)")
+    except discord.HTTPException as e:
+        log.warning(f"Registering app commands failed: {e}")
 bot.setup_hook = setup_hook
 
 # Stopping: the first Ctrl-C (or SIGINT/SIGTERM) takes no new messages and lets the ones being answered finish —

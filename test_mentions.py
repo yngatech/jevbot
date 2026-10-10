@@ -148,6 +148,12 @@ class ActionTests(_Discord):
         menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
         self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message})
 
+    async def test_failed_registration_doesnt_stop_startup(self):
+        error = discord.HTTPException(Mock(status=503, reason="Service Unavailable"), "unavailable")
+        with patch.object(j.bot.tree, "sync", AsyncMock(side_effect=error)), self.assertLogs(j.log, "WARNING") as logs:
+            await j.bot.setup_hook()
+        self.assertIn("Registering app commands failed", logs.output[0])
+
     async def test_context_answers_the_right_clicked_message_privately(self):
         logged = {"message": "what's my cat called?", "author": "Speaker", "bot_name": "Testbot", "history": [],
                   "reply": "Is called Biscuit.", "transcript": "Speaker: what's my cat called? @everyone"}
