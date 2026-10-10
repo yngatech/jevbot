@@ -3,6 +3,7 @@
     uv run --with-requirements requirements.txt python -m unittest test_mentions
 """
 
+import asyncio
 import contextlib
 import os
 import unittest
@@ -112,6 +113,29 @@ class MentionTests(_Discord):
                 else:
                     respond.assert_not_awaited()
 
+
+    async def test_catch_up_skips_message_already_being_answered(self):
+        # Just after a restart: on_message is answering m when catch_up() finds it, its reply not sent yet
+        m = self.message(ping=True, reply=False)
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def answering(m, **extra):
+            started.set()
+            await finish.wait()
+
+        async def history(**kwargs):
+            yield m
+
+        self.channel.history.side_effect = history
+        with patch.object(j, "DM_USERS", set()), patch.object(j, "taken", {}), \
+                patch.object(j, "respond_traced", side_effect=answering) as traced:
+            live = asyncio.create_task(j.on_message(m))
+            await started.wait()
+            await asyncio.wait_for(j.catch_up(), 1)  # a second answer would wait on finish too
+            finish.set()
+            await live
+            await j.respond(m, caught_up=True)  # and once it's answered, too
+        traced.assert_awaited_once_with(m)
 
 class NoContextChainTests(_Discord):
     """A "@jev !nocontext ..." message and the replies under it are a side conversation: they see all of it and
@@ -251,7 +275,6 @@ class NoContextChainTests(_Discord):
         self.channel.fetch_message.side_effect = discord.NotFound(Mock(status=404), "gone")
         history = await self.answer(self.said("geology", to=a))
         self.assertIn(("kettle", "the toaster is on fire again", None), history)
-
 
 if __name__ == "__main__":
     unittest.main()

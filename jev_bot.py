@@ -1505,7 +1505,18 @@ async def model_command(m):
     await m.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
+# Messages jev has taken on, so each is answered once: at startup, catch_up() can find one on_message is already
+# answering (its reply not sent yet, so it looks missed), or the other way round. The latest only — catch_up() looks
+# back CATCH_UP_WINDOW minutes.
+taken: dict[int, None] = {}
+
 async def respond(m, **extra):
+    if m.id in taken:
+        log.info(f"[SKIP] already answering {m.id}")
+        return
+    taken[m.id] = None
+    if len(taken) > 1000:
+        del taken[next(iter(taken))]
     handling.add(task := asyncio.current_task())
     try:
         await respond_traced(m, **extra)
