@@ -44,7 +44,8 @@ MAX_WORDS = 30
 MIN_WORDS = 2
 HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged replies) in the transcript
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
-HISTORY_SCAN = 100              # recent messages read to rebuild a channel's history after a restart
+LLM_HISTORY = 200               # earlier channel messages, any kind, in an LLM's transcript (see !model) — ~300 lines with rocky's replies
+HISTORY_SCAN = 400              # recent messages read to rebuild a channel's history after a restart
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
 CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on — and messages kept per side conversation
 SIDE_TALKS = 50                 # side conversations (!nocontext and the replies under it) kept, the latest
@@ -127,10 +128,11 @@ def recent(entries, to_bot=None, chatter=None):
             keep.append(e)
     return keep[::-1]
 
-# What the transcript shows: recent() of the channel, minus messages to jev it never answered but has answered
-# something after since — left behind (sent while it was offline, say), they pull jev back to their topic.
-# One being answered right now is "pending", so a quick reaction to a later message doesn't hide it.
-def shown(entries):
+# What the transcript shows: recent() of the channel — or for an LLM, its last `limit` messages — minus messages to
+# jev it never answered but has answered something after since — left behind (sent while it was offline, say), they
+# pull jev back to their topic. One being answered right now is "pending", so a quick reaction to a later message
+# doesn't hide it.
+def shown(entries, limit=None):
     keep, answered_since = [], False
     for e in reversed(entries):
         if e.get("to_bot", True):
@@ -139,12 +141,18 @@ def shown(entries):
             elif answered_since and not e.get("pending"):
                 continue
         keep.append(e)
-    return recent(keep[::-1])
+    return recent(keep[::-1]) if limit is None else keep[::-1][-limit:]
+
+# What a channel's history keeps: enough for both transcripts — Jev's can reach further back for messages to jev
+# when there's a lot of chatter. +1: the message being answered.
+def kept(entries):
+    keep = {id(e) for e in recent(entries, HISTORY_TO_BOT + 1, HISTORY_CHATTER)} | {id(e) for e in entries[-(LLM_HISTORY + 1):]}
+    return [e for e in entries if id(e) in keep]
 
 def add_history(ch_id, entry):
     h = channel_history[ch_id]
     h.append(entry)
-    channel_history[ch_id] = recent(h, HISTORY_TO_BOT + 1, HISTORY_CHATTER)  # +1: the message being answered
+    channel_history[ch_id] = kept(h)
     return entry
 
 # Side conversations: "@jev !nocontext ..." and every Discord reply under it, on any branch, by the !nocontext
@@ -528,9 +536,10 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
     return words
 
 
-async def generate_reply(message, author, bot_name, history=None):
+# llm_history: the longer history an LLM gets, if it isn't `history`
+async def generate_reply(message, author, bot_name, history=None, llm_history=None):
     if (name := model_name) != "jev":
-        return await llm_reply(name, message, author, bot_name, history)
+        return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history)
     # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
@@ -756,7 +765,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
 async def llm_reply(name, message, author, bot_name, history=None):
     spec = LLMS[name]
     state = transcript(message, author, bot_name, history, [])
-    note(transcript=state, llm=name, llm_model=spec["id"])
+    note(transcript=state, llm=name, llm_model=spec["id"], history=history or [])  # what it saw, not Jev's share
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
     # Says who it's answering: asked for "rocky's next message", Haiku kept opening with the name its earlier replies
     # did ("Binja, ...") when someone else asked. Not quoting the message — it echoed a name in it back.
@@ -1116,7 +1125,7 @@ async def load_history(first):
             talk.append(entry)
         else:
             add_side(root, entry)
-    channel_history[ch] = recent(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
+    channel_history[ch] = kept(sorted(channel_history[ch] + talk, key=lambda e: e["at"]))
     log.info(f"Loaded {len(channel_history[ch])} history entries for {ch}")
 
 @bot.event
@@ -1587,17 +1596,20 @@ async def handle(m, c):
     # Snapshot before waiting on gen_lock — messages that arrive meanwhile must not shift this one's history
     if root is None:
         entry = add_history(m.channel.id, history_entry(m))
-        h = shown(channel_history[m.channel.id][:-1])
+        h, long = shown(channel_history[m.channel.id][:-1]), shown(channel_history[m.channel.id][:-1], LLM_HISTORY)
     else:
         h = list(side_talk.get(root, []))  # nothing yet for a !nocontext message
+        long = list(h)
         entry = add_side(root, history_entry(m))
         note(no_context=True)
     entry["pending"] = True
     # Server nickname, so the transcript uses the name people call the bot by
     bot_name = (m.guild.me if m.guild else bot.user).display_name
     # The reply of jev's someone is answering, if it isn't already shown under the message it answered
-    if not no_context(m) and (r := replied_to_bot(m)) and r.content and all(x.get("reply_id") != r.id for x in h):
-        h.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
+    if not no_context(m) and (r := replied_to_bot(m)) and r.content:
+        for x in (h, long):
+            if all(e.get("reply_id") != r.id for e in x):
+                x.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
@@ -1620,7 +1632,7 @@ async def handle(m, c):
                 log.warning(f"React {reaction} failed, replying instead: {e}")
         async with m.channel.typing():
             async with gen_lock:
-                r = await generate_reply(c, m.author.display_name, bot_name, history=h)
+                r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long)
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)
