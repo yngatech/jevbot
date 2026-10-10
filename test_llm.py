@@ -98,6 +98,7 @@ class ReplyTests(_Case):
         self.assertIn("talk like Rocky", messages[0]["content"])
         self.assertTrue(messages[1]["content"].startswith("The chat so far:\n\nkettle: what's my cat called?\n\n"))
         self.assertNotIn("rocky: \n", messages[1]["content"])  # its empty turn is asked for, not shown
+        self.assertIn("Write rocky's reply to kettle's last message.", messages[1]["content"])  # who it answers
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
         self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
         self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for !context
