@@ -46,8 +46,9 @@ EMOJI_PT = 16  # how tall an emoji's image is, in points
 # panels: one per word, {"so_far": the reply before it, "picked": word, "ends": bool, "pooled": the words
 # that voted with it, "rows": [[word, prob, score]]} with rows best score first. For a reaction, `reacted_to` is the
 # message and its one panel's so_far is who sent it. images: PNG bytes by emoji, shown in place of their labels.
-# note: a line under the title. Returns PNG bytes.
-def render(bot_name, reply, panels, reacted_to=None, images=None, note=None):
+# note: a line under the title. tokens: the panels are an LLM's tokens, with no penalties — each row's score is its
+# probability, and what was said was sampled from them, so not always the likeliest. Returns PNG bytes.
+def render(bot_name, reply, panels, reacted_to=None, images=None, note=None, tokens=False):
     images = {e: imread(io.BytesIO(png), format="png") for e, png in (images or {}).items()}
     cols = min(len(panels), COLUMNS)
     grid_rows = math.ceil(len(panels) / cols)
@@ -65,8 +66,10 @@ def render(bot_name, reply, panels, reacted_to=None, images=None, note=None):
              fontsize=18, fontweight="bold", color=INK, va="top", family=FONT)
     if note:
         fig.text(0.012, 1 - 0.8 / fig.get_figheight(), note, fontsize=12, color=INK, va="top", family=FONT)
-    noun = "word" if reacted_to is None else "emoji"
+    noun = "token" if tokens else "word" if reacted_to is None else "emoji"
     fig.text(0.012, 1 - (0.85 + below) / fig.get_figheight(),
+             "Bar: how likely the model thought each token was, from its top few. What it said is gold."
+             if tokens else
              f"Wide pale bar: how likely the model thought the {noun} was.   "
              "Thin bar: its score after the penalties for repeating itself.   "
              + ("The best score wins (gold), with similar words adding up." if reacted_to is None
@@ -116,7 +119,7 @@ def render(bot_name, reply, panels, reacted_to=None, images=None, note=None):
         pooled = p.get("pooled")
         note = ("  ·  stop + . ! ? pooled" if p["ends"] else
                 f"  ·  {clip(' + '.join(label(w) for w in [p['picked']] + pooled), 24)} pooled" if pooled else "")
-        ax.set_title(f"word {i + 1}{note}\n{so_far} ___", loc="left", fontsize=11, color=INK2, pad=8, family=FONT)
+        ax.set_title(f"{noun} {i + 1}{note}\n{so_far} ___", loc="left", fontsize=11, color=INK2, pad=8, family=FONT)
 
     out = io.BytesIO()
     fig.savefig(out, format="png", dpi=150, facecolor=BG)
