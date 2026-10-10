@@ -758,7 +758,10 @@ async def llm_reply(name, message, author, bot_name, history=None):
     state = transcript(message, author, bot_name, history, [])
     note(transcript=state, llm=name, llm_model=spec["id"])
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
-    ask = f"The chat so far:\n\n{chat}\n\nWrite {bot_name}'s next message. Output only the message." + spec.get("tail", "")
+    # Says who it's answering: asked for "rocky's next message", Haiku kept opening with the name its earlier replies
+    # did ("Binja, ...") when someone else asked. Not quoting the message — it echoed a name in it back.
+    ask = (f"The chat so far:\n\n{chat}\n\nWrite {bot_name}'s reply to {author}'s last message. Output only the message."
+           + spec.get("tail", ""))
     if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
         ask += ' This time, no ", question?" tag.'
     messages = [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
