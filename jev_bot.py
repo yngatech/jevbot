@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiohttp
 import discord
@@ -33,6 +34,7 @@ load_dotenv()
 TOKEN = os.environ["DISCORD_TOKEN_JEV"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 STATUS_CHANNEL = int(os.environ.get("STATUS_CHANNEL_ID") or 0)  # where each new status is also posted — unset for nowhere
+TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE") or "UTC")  # the clock an LLM's transcript shows times on (IANA name)
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
 END = "<END>"
@@ -384,27 +386,43 @@ def reacted(counts):
 # marked: mark messages addressed to jev for the question check, including pinged replies without a textual
 # mention. Keep existing mentions in place rather than adding a second one.
 # reactions: jev's own past reactions; their_reactions: people's reactions to jev's replies
-def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None):
+# at: when the message was sent, to show each turn's time — for an LLM only: Jev would pick the times as words
+def transcript(message, author, bot_name, history, words, reactions=True, marked=False, their_reactions=None, at=None):
     their_reactions = reactions if their_reactions is None else their_reactions
     def addressed(text, to_bot=True):
         mentioned = re.search(rf"(?<!\w)@{re.escape(bot_name)}(?!\w)", text)
         return f"@{bot_name} {text}" if marked and to_bot and not mentioned else text
-    turns = []
+    turns, day, minute = [], None, None
+    # Like an IRC log: "14:32 pip: ..." when the minute changes, after a "--- Sat 10 Oct" line when the day does.
+    # Turns in the same minute go without — a time on every line made a 300-line transcript a third longer. A turn
+    # without a time (a reply of jev's from before replies kept theirs) goes in as it is.
+    def turn(line, when):
+        nonlocal day, minute
+        if at and when:
+            local = when.astimezone(TIMEZONE)
+            if local.date() != day:
+                day = local.date()
+                turns.append(f"--- {local:%a} {local.day} {local:%b}")
+            if f"{local:%H:%M}" != minute:
+                minute = f"{local:%H:%M}"
+                line = f"{minute} {line}"
+        turns.append(line)
     if history:
         for h in history:
             name = bot_name if h["role"] == "assistant" else h["name"]
             text = unrender(h["content"])
             if h["role"] == "assistant" and their_reactions:
                 text += reacted(h.get("reactions"))
-            turns.append(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}")
+            turn(f"{name}: {addressed(text, h['role'] == 'user' and h.get('to_bot', True))}", h.get("at"))
             # jev's answer, if it gave one — without it every earlier question looks unanswered, and jev goes back
             # to them or describes the silence ("crickets"). Past reactions, jev's and people's to its replies,
             # stay out of the question check — jev copies emoji it sees there.
             if "reply" in h:
-                turns.append(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if their_reactions else ''}")
+                turn(f"{bot_name}: {unrender(h['reply'])}{reacted(h.get('reply_reactions')) if their_reactions else ''}",
+                     h.get("reply_at"))
             elif reactions and "reaction" in h:
                 turns.append(f"{bot_name}: {h['reaction']}")
-    turns.append(f"{author}: {addressed(unrender(message))}")
+    turn(f"{author}: {addressed(unrender(message))}", at)
     turns.append(f"{bot_name}: {unrender(render(words))}")
     return "\n".join(turns)
 
@@ -537,10 +555,10 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
     return words
 
 
-# llm_history: the longer history an LLM gets, if it isn't `history`
-async def generate_reply(message, author, bot_name, history=None, llm_history=None):
+# llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times
+async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None):
     if (name := model_name) != "jev":
-        return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history)
+        return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at)
     # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
@@ -763,14 +781,15 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
     return "", []
 
 # name: one of LLMS — passed in, since !model can switch while a reply is being written
-async def llm_reply(name, message, author, bot_name, history=None):
+async def llm_reply(name, message, author, bot_name, history=None, at=None):
     spec = LLMS[name]
-    state = transcript(message, author, bot_name, history, [])
+    state = transcript(message, author, bot_name, history, [], at=at or datetime.now(timezone.utc))
     note(transcript=state, llm=name, llm_model=spec["id"], history=history or [])  # what it saw, not Jev's share
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
     # Says who it's answering: asked for "rocky's next message", Haiku kept opening with the name its earlier replies
     # did ("Binja, ...") when someone else asked. Not quoting the message — it echoed a name in it back.
-    ask = (f"The chat so far:\n\n{chat}\n\nWrite {bot_name}'s reply to {author}'s last message. Output only the message."
+    ask = (f"The chat so far, times in {TIMEZONE.key}:\n\n{chat}\n\n"
+           f"Write {bot_name}'s reply to {author}'s last message. Output only the message."
            + spec.get("tail", ""))
     if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
         ask += ' This time, no ", question?" tag.'
@@ -1019,7 +1038,7 @@ def chain_entries(chain):
                 entries.append(entry)
         elif (entries and x.reference and entries[-1]["id"] == x.reference.message_id and "reply" not in entries[-1]
               and x.content and x.content not in NO_MONEY):
-            entries[-1]["reply"], entries[-1]["reply_id"] = x.content, x.id
+            entries[-1]["reply"], entries[-1]["reply_id"], entries[-1]["reply_at"] = x.content, x.id, x.created_at
             if counts := reactions_to(x):
                 entries[-1]["reply_reactions"] = counts
     return entries
@@ -1123,7 +1142,7 @@ async def load_history(first):
     talk = []
     for entry, root in found:
         if r := replies.get(entry["id"]):
-            entry["reply"], entry["reply_id"] = r.content, r.id
+            entry["reply"], entry["reply_id"], entry["reply_at"] = r.content, r.id, r.created_at
             if counts := reactions_to(r):
                 entry["reply_reactions"] = counts
         if root is None:
@@ -1610,7 +1629,8 @@ async def handle(m, c):
     if not no_context(m) and (r := replied_to_bot(m)) and r.content:
         for x in (h, long):
             if all(e.get("reply_id") != r.id for e in x):
-                x.append({"role": "assistant", "name": bot_name, "content": r.content, "reactions": reactions_to(r)})
+                x.append({"role": "assistant", "name": bot_name, "content": r.content, "at": r.created_at,
+                          "reactions": reactions_to(r)})
     note(bot_name=bot_name, history=h)
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
@@ -1633,7 +1653,8 @@ async def handle(m, c):
                 log.warning(f"React {reaction} failed, replying instead: {e}")
         async with m.channel.typing():
             async with gen_lock:
-                r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long)
+                r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long,
+                                         at=m.created_at)
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)
@@ -1642,7 +1663,7 @@ async def handle(m, c):
         sent = await m.reply(r, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
         note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
-            entry["reply"], entry["reply_id"] = r, sent.id  # shown under this message from now on
+            entry["reply"], entry["reply_id"], entry["reply_at"] = r, sent.id, sent.created_at  # shown under it from now on
             if root is not None:
                 side_of[sent.id] = root  # replies to it carry on the side conversation
     except Exception as e:
