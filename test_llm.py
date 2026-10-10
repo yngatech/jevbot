@@ -3,6 +3,7 @@
     uv run --with-requirements requirements.txt python -m unittest test_llm
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -29,7 +30,8 @@ class _Case(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(j.trace.reset, token)
         for obj, attr, value in [(j, "MODEL_PATH", Path(self.dir.name) / "model.json"), (j, "model_name", "jev"),
                                  (j, "has_credit", True), (j, "channel_history", defaultdict(list)),
-                                 (j, "TIMEZONE", j.ZoneInfo("UTC"))]:  # not whatever .env sets
+                                 (j, "TIMEZONE", j.ZoneInfo("UTC")),  # not whatever .env sets
+                                 (j, "memories", {}), (j, "MEMORY_PATH", Path(self.dir.name) / "memories.json")]:
             p = patch.object(obj, attr, value)
             p.start()
             self.addCleanup(p.stop)
@@ -266,6 +268,97 @@ class StatusTests(_Case):
         self.assertEqual(mood, "I feel cat is tiny disaster.")
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
         self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("kettle: cat")))
+
+
+def tool_call(name, args, n=1):
+    return {"id": f"call_{n}", "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+class MemoryTests(_Case):
+    """Haiku sees what's remembered in each reply; a keeper request after the reply keeps and drops facts."""
+
+    def setUp(self):
+        super().setUp()
+        self.mind = {"space": "400", "people": {"501": "Pip", "502": "kettle"}, "by": 501}
+
+    async def test_a_reply_sees_what_is_remembered_as_sentences_without_tools(self):
+        j.remember("400", "pip", "is vegetarian", 502, {"501": "pip"})
+        j.remember("400", "the geese", "chased pip in the park.", 501)
+        j.remember("dm-300", "pip", "is learning welsh", 501, {"501": "pip"})  # a DM's stays there
+        j.model_name = "haiku"
+        llm = AsyncMock(return_value=("Lentil curry.", []))
+        with patch.object(j, "llm", llm):
+            await j.generate_reply("dinner?", "Pip", "rocky", history=[], mind=self.mind)
+        (name, messages), kwargs = llm.call_args
+        self.assertEqual(kwargs, {})  # no tools while replying
+        self.assertTrue(messages[0]["content"].endswith(j.MEMORY_SEEN.format(bot="rocky")))
+        self.assertIn("Pip: dinner?\n\nWhat rocky knows from earlier chats:\n- Pip is vegetarian\n"
+                      "- the geese chased pip in the park\n\nWrite rocky's reply", messages[1]["content"])
+        self.assertNotIn("welsh", messages[1]["content"])
+        self.assertEqual(self.trace["memories_shown"], 2)
+
+        j.model_name = "deepseek"  # no memory there yet
+        with patch.object(j, "llm", llm):
+            await j.generate_reply("dinner?", "Pip", "rocky", history=[], mind=self.mind)
+        self.assertNotIn("knows from earlier", llm.call_args.args[1][1]["content"])
+
+    async def test_the_keeper_keeps_and_drops_facts_and_its_text_goes_nowhere(self):
+        llm = AsyncMock(side_effect=[("I'll save that first.", [], [tool_call("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
+                                     ("Done.", [], [])])
+        with patch.object(j, "llm", llm):
+            await j.keep_memories("haiku", "my cat is called biscuit", "Pip", "rocky", [], "Biscuit. Good name.", self.mind)
+        fact, = j.memories["400"]["facts"]
+        self.assertEqual((fact["about"], fact["uid"], fact["fact"], fact["by"]), ("pip", "501", "has a cat called Biscuit", "501"))
+        first, second = llm.call_args_list
+        self.assertEqual(first.kwargs, {"tools": j.MEMORY_TOOLS})
+        ask = first.args[1][1]["content"]
+        self.assertIn("Pip: my cat is called biscuit\nrocky: Biscuit. Good name.", ask)
+        self.assertIn("Nothing remembered here yet.", ask)
+        self.assertEqual(second.args[1][-1], {"role": "tool", "tool_call_id": "call_1", "content": "Remembered as [1]."})
+        self.assertIn("memory_cost", self.trace)
+
+        llm = AsyncMock(side_effect=[("", [], [tool_call("forget", {"number": 1}), tool_call("remember", {"about": "Pip", "fact": "has two cats"}, 2)]),
+                                     ("", [], [])])
+        with patch.object(j, "llm", llm):
+            await j.keep_memories("haiku", "biscuit has a sister now", "Pip", "rocky", [], "Two cats!", self.mind)
+        self.assertIn("[1] Pip: has a cat called Biscuit", llm.call_args_list[0].args[1][1]["content"])  # numbered, for forget
+        self.assertEqual(j.memory_lines("400", self.mind["people"]), ["[2] Pip: has two cats"])
+        self.assertEqual([c["result"] for c in self.trace["memory_calls"][-2:]], ["Forgot [1].", "Remembered as [2]."])
+
+    async def test_the_keeper_stops_after_its_rounds(self):
+        llm = AsyncMock(return_value=("", [], [tool_call("remember", {"about": "pip", "fact": "likes tea"})]))
+        with patch.object(j, "llm", llm):
+            await j.keep_memories("haiku", "tea", "Pip", "rocky", [], "Tea good.", self.mind)
+        self.assertEqual(llm.await_count, j.MEMORY_ROUNDS)
+
+    def test_a_bad_call_is_told_what_went_wrong(self):
+        self.assertIn("didn't work", j.use_memory({"id": "x", "function": {"name": "remember", "arguments": "{oops"}}, self.mind))
+        self.assertEqual(j.use_memory(tool_call("forget", {"number": 9}), self.mind), "No such memory.")
+        self.assertEqual(j.use_memory(tool_call("shout", {}), self.mind), "No tool called 'shout'.")
+
+    def test_memories_are_kept_per_server_and_dm_and_survive_a_restart(self):
+        j.remember("400", "@Pip", "Pip is vegetarian", 502, {"501": "pip"})
+        j.remember("dm-300", "kettle", "is learning welsh", 502)
+        self.assertEqual(j.memory_lines("400", {"501": "Pipsqueak"}), ["[1] Pipsqueak: is vegetarian"])  # renamed since
+        self.assertEqual(j.memory_lines("400", {"501": "Pipsqueak"}, numbered=False), ["- Pipsqueak is vegetarian"])
+        self.assertEqual(j.memory_lines("dm-300"), ["[1] kettle: is learning welsh"])
+        self.assertEqual(j.load_memories(), j.memories)
+        guild, dm = SimpleNamespace(guild=SimpleNamespace(id=400), channel=SimpleNamespace(id=1)), \
+            SimpleNamespace(guild=None, channel=SimpleNamespace(id=300))
+        self.assertEqual((j.space_of(guild), j.space_of(dm)), ("400", "dm-300"))
+
+    async def test_llm_offers_tools_and_hands_back_the_calls(self):
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        calls = [tool_call("remember", {"about": "pip", "fact": "likes tea"})]
+        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
+            "choices": [{"message": {"content": None, "tool_calls": calls}}], "usage": {"prompt_tokens": 10}}))
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+            self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "tea"}], tools=j.MEMORY_TOOLS),
+                             ("", [], calls))
+            body = session.post.call_args.kwargs["json"]
+            self.assertEqual((body["tools"], body["tool_choice"], body["max_tokens"]), (j.MEMORY_TOOLS, "auto", 200))
+            self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "tea"}]), ("", []))  # without, as before
 
 
 class WhyTests(_Case):
