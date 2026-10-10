@@ -123,6 +123,23 @@ class ReplyTests(_Case):
         self.assertIn(chat, messages[1]["content"])
         self.assertEqual(self.trace["llm_chat_chars"], len(chat))
 
+    async def test_a_request_on_our_own_anthropic_key_counts_what_it_cost_there(self):
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        for usage, cost, byok in [({"cost": 0.0002}, 0.0002, None),
+                                  ({"cost": 0, "is_byok": True, "cost_details": {"upstream_inference_cost": 0.0004}},
+                                   0.0004, 0.0004)]:
+            with self.subTest(byok=byok):
+                self.trace.clear()
+                self.trace.update(cost=0.0, requests=0)
+                session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(
+                    return_value={"choices": [{"message": {"content": "Is Biscuit."}}], "usage": usage}))
+                with patch.object(j.aiohttp, "ClientSession", return_value=session), \
+                        patch.object(j, "set_credit", AsyncMock()):
+                    await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+                self.assertAlmostEqual(self.trace["cost"], cost)
+                self.assertEqual(self.trace.get("byok_cost"), byok)
+
     async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
         session = MagicMock()
         session.__aenter__.return_value = session
