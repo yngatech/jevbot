@@ -317,7 +317,7 @@ def emoji_vocabulary(guild):
 
 
 def is_word(w):
-    return w.replace(" ", "").isalnum()
+    return (w.startswith("@") and len(w) > 1) or w.replace(" ", "").isalnum()
 
 
 def render(tokens):
@@ -386,7 +386,7 @@ def penalty(reply, word, recent=(), exempt=()):
     local = reply[-REPEAT_WINDOW:].count(word) + 2 * (reply[-1:] == [word])
     p = REPEAT_PENALTY ** local
     seen = reply.count(word)
-    alpha = word.replace(" ", "").isalpha()
+    alpha = word.startswith("@") or word.replace(" ", "").isalpha()
     if alpha and word.lower() not in STOPWORDS:
         p *= CONTENT_PENALTY ** min(seen, CONTENT_PENALTY_CAP)
     elif alpha:
@@ -657,7 +657,7 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
 
 # llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times;
 # pages: a long chat's frozen pages, before llm_history
-async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None):
+async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None, mention_names=()):
     if (name := model_name) != "jev":
         return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at,
                                pages)
@@ -665,6 +665,8 @@ async def generate_reply(message, author, bot_name, history=None, llm_history=No
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
                                 + [f"{author} {message}"]))
+    # A mention is one choice, including multi-word display names, rather than an @ followed by loose words.
+    vocab = vocab[:-1] + [f"@{name}" for name in mention_names if f"@{name}" not in vocab] + [END]
     # Who reacted is left to the LLMs: names didn't change what Jev said (jev_eval's *-laughed-names), and Jev sends
     # the transcript with every word it asks for
     note(transcript=transcript(message, author, bot_name, history, [], reactors=False))
@@ -837,6 +839,7 @@ How {bot} talks:
 - Answers what the friends actually said, with an opinion. If he truly doesn't know, "I not know." — rarely.
 - He's in a Discord chat, not on a spaceship: talks about whatever the chat is about. No Grace, Erid, Astrophage or space unless someone brings it up.
 - Says one thing, to the last message only — not a reply to everyone in the chat. Usually a few words or one short sentence, like the lines below; at most two short sentences.
+- To get someone's attention, use @ followed by their full name as shown in the chat. Bare names just talk about them; don't mention everyone you talk about.
 - Never emoji, never says he's a bot or AI. Don't copy the lines below word for word or repeat your earlier replies."""
 
 LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
@@ -1290,10 +1293,72 @@ def history_entry(m):
     if not content:
         return None
     entry = {"role": "user", "name": m.author.display_name, "content": content,
-             "at": m.created_at, "id": m.id, "to_bot": to_bot}
+             "at": m.created_at, "id": m.id, "to_bot": to_bot,
+             "users": message_users(m), "roles": [r.name for r in m.role_mentions]}
     if to_bot and (r := next((r for r in m.reactions if r.me), None)):
         entry["reaction"] = emoji_text(r.emoji)
     return entry
+
+
+# IDs stay beside the readable transcript, never in the model's vocabulary. Discord has already resolved these
+# users, so no server-wide member search or extra network request is needed.
+def message_users(m):
+    # mentions can also contain the author of a pinged reply, whose name isn't written in the transcript.
+    written = {int(uid) for uid in re.findall(r"<@!?(\d+)>", m.content)}
+    return {str(u.id): u.display_name for u in [m.author, *m.mentions] if u.id == m.author.id or u.id in written}
+
+
+# Only names in this writer's context are eligible. Keep ambiguous and unknown names too, so a longer unresolved
+# name cannot fall back to a shorter one ("@Moss Fern" must not ping "Moss"). Older frozen pages have no users map.
+def mention_targets(entries, bot_name, reactors=False):
+    people, labels = defaultdict(set), {}
+
+    def add(uid, name):
+        if not name or any(c in name for c in "\r\n"):
+            return
+        key = name.casefold()
+        labels.setdefault(key, name)
+        people[key].add(int(uid) if uid is not None else None)
+
+    add(None, bot_name)
+    add(None, "everyone")
+    add(None, "here")
+    for e in entries:
+        users = e.get("users", {})
+        if e["name"] not in users.values():
+            add(None, e["name"])
+        for source in (users, e.get("reply_users", {})):
+            for uid, name in source.items():
+                add(uid, name)
+        for name in e.get("roles", []):
+            add(None, name)
+        if reactors:
+            for field in ("reactors", "reply_reactors"):
+                for users in e.get(field, {}).values():
+                    for uid, name in users.items():
+                        add(uid, name)
+    return {labels[key]: next(iter(ids)) if len(ids) == 1 and bot.user.id not in ids else None
+            for key, ids in people.items()}
+
+
+# Expand explicit @names and allow only the IDs expanded here. Bare names, raw IDs, roles, @everyone, and reply
+# authors cannot create pings. Longest names match first, case-insensitively, with punctuation left intact.
+def resolve_mentions(text, targets):
+    lookup = {name.casefold(): uid for name, uid in targets.items()}
+    names = "|".join(re.escape(name) for name in sorted(targets, key=len, reverse=True))
+    allowed = set()
+
+    def replace(match):
+        uid = lookup.get(match[1].casefold())
+        if uid is None:
+            return match[0]
+        allowed.add(uid)
+        return f"<@{uid}>"
+
+    if names:
+        text = re.sub(rf"(?<![\w@])@({names})(?!\w)", replace, text, flags=re.I)
+    return text, discord.AllowedMentions(everyone=False, roles=False, replied_user=False,
+                                         users=[discord.Object(id=uid) for uid in sorted(allowed)])
 
 # People's reactions to a message of jev's, emoji to count — not jev's own
 def reactions_to(m):
@@ -1419,7 +1484,8 @@ async def load_history(first):
     talk, reacting = [], []
     for entry, root in found:
         if r := replies.get(entry["id"]):
-            entry["reply"], entry["reply_id"], entry["reply_at"] = r.content, r.id, r.created_at
+            entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(r), r.id, r.created_at
+            entry["reply_users"] = message_users(r)
             reacting.append(attach_reactions(entry, r))
         if root is None:
             talk.append(entry)
@@ -1607,6 +1673,9 @@ async def on_message_edit(before, after):
     entry = next((e for e in entries_with(after.channel.id, after.id) if e.get("id") == after.id), None)
     if entry and (content := message_text(after)):
         entry["content"] = content
+        entry["name"] = after.author.display_name
+        entry["users"] = message_users(after)
+        entry["roles"] = [r.name for r in after.role_mentions]
 
 
 # !why: what jev weighed for one of its answers, from the logs — the reply the !why is a Discord reply to (or the
@@ -2061,7 +2130,8 @@ async def handle(m, c):
             frozen = [e for p in pages or [] for e in p] if x is long else []
             if all(e.get("reply_id") != r.id for e in x + frozen):
                 if reply_entry is None:
-                    reply_entry = {"role": "assistant", "name": bot_name, "content": r.content, "at": r.created_at}
+                    reply_entry = {"role": "assistant", "name": bot_name, "content": message_text(r),
+                                   "at": r.created_at, "users": message_users(r)}
                     await attach_reactions(reply_entry, r, prefix="")
                 x.append(reply_entry)
     note(bot_name=bot_name, history=h)
@@ -2086,17 +2156,23 @@ async def handle(m, c):
                 log.warning(f"React {reaction} failed, replying instead: {e}")
         async with m.channel.typing():
             async with gen_lock:
+                using_llm = model_name != "jev"
+                visible = [e for p in pages or [] for e in p] + long if using_llm else h
+                targets = mention_targets([*visible, entry], bot_name, reactors=using_llm)
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long,
-                                         at=m.created_at, pages=pages)
+                                         at=m.created_at, pages=pages,
+                                         mention_names=[name for name, uid in targets.items() if uid is not None])
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)
         log.info(f"[OUT] {r} (${trace.get()['cost']:.5f})")
-        # No pings from whatever an LLM writes ("@everyone")
-        sent = await m.reply(r, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+        content, allowed = resolve_mentions(r, targets)
+        sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"], entry["reply_at"] = r, sent.id, sent.created_at  # shown under it from now on
+            pinged = {u.id for u in allowed.users}
+            entry["reply_users"] = {str(uid): name for name, uid in targets.items() if uid in pinged}
             if root is not None:
                 side_of[sent.id] = root  # replies to it carry on the side conversation
     except Exception as e:

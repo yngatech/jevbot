@@ -109,8 +109,9 @@ class ReactionContextTests(_Discord):
     async def test_names_restored_from_channel_history(self):
         question = MentionTests.message(self)
         question.id = 600
-        reply = SimpleNamespace(id=700, author=self.user, reference=SimpleNamespace(message_id=600),
-                                content="Hello", reactions=[self.reaction()], created_at=question.created_at)
+        reply = _Message(id=700, author=self.user, reference=SimpleNamespace(message_id=600), guild=None,
+                         content="Hello", reactions=[self.reaction()], created_at=question.created_at,
+                         mentions=[], role_mentions=[], embeds=[], attachments=[], stickers=[])
         async def history(**kwargs):
             for message in [reply, question]:
                 yield message
@@ -533,6 +534,186 @@ class _Handling(_Discord):
         return [(e["name"], e["content"], e.get("reply")) for e in gen.call_args.kwargs["history"]]
 
 
+class OutgoingMentionTests(_Handling):
+    def chatter(self, name, uid, content="hello"):
+        m = self.said(content, name=name, ping=False)
+        m.author.id = uid
+        j.add_history(self.channel.id, j.history_entry(m))
+        return m
+
+    async def test_explicit_names_ping_and_bare_names_do_not(self):
+        self.chatter("Moss", 501)
+        self.chatter("Pip Meadow", 502)
+        m = self.said("ask them", name="Fern")
+        await self.answer(m, "Moss agrees. @moss, ask @Pip Meadow's friend.")
+        self.assertEqual(m.reply.call_args.args[0], "Moss agrees. <@501>, ask <@502>'s friend.")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict(),
+                         {"parse": [], "users": [501, 502]})
+        self.assertFalse(m.reply.call_args.kwargs["mention_author"])
+        entry = j.channel_history[self.channel.id][-1]
+        self.assertEqual(entry["reply"], "Moss agrees. @moss, ask @Pip Meadow's friend.")
+        self.assertEqual(entry["reply_users"], {"501": "Moss", "502": "Pip Meadow"})
+
+    async def test_mentions_in_the_question_and_the_current_author_are_eligible(self):
+        uid = 100000000000000002
+        m = self.said(f"ask <@{uid}>", name="Fern")
+        m.mentions.append(SimpleNamespace(id=uid, display_name="Moss"))
+        m.clean_content = discord.Message.clean_content.function(m)
+        await self.answer(m, "@Moss ask @Fern.")
+        self.assertEqual(m.reply.call_args.args[0], f"<@{uid}> ask <@500>.")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [500, uid])
+
+    async def test_reply_ping_targets_absent_from_the_text_are_not_jev_choices(self):
+        m = self.said("hello", name="Fern")
+        m.mentions.append(SimpleNamespace(id=501, display_name="Moss"))
+        await self.answer(m, "@Moss ask @Fern.")
+        self.assertEqual(m.reply.call_args.args[0], "@Moss ask <@500>.")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [500])
+
+    async def test_ambiguous_names_are_left_as_text_including_longer_names(self):
+        self.chatter("Moss", 501)
+        self.chatter("Moss Fern", 502)
+        self.chatter("moss fern", 503)
+        m = self.said("ask them")
+        await self.answer(m, "@Moss Fern and @Moss")
+        self.assertEqual(m.reply.call_args.args[0], "@Moss Fern and <@501>")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [501])
+
+    async def test_unknown_names_raw_ids_roles_and_everyone_cannot_ping(self):
+        self.chatter("Moss", 501)
+        m = self.said("hello")
+        text = "@Unknown <@501> <@!999> <@&200000000000000001> @Testbot @everyone @here"
+        await self.answer(m, text)
+        self.assertEqual(m.reply.call_args.args[0], text)
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict(), {"parse": [], "users": []})
+
+    async def test_role_names_and_reserved_names_are_never_user_pings(self):
+        for name, uid in [("Readers", 501), ("everyone", 502), ("here", 503), ("Testbot", 504)]:
+            self.chatter(name, uid)
+        m = self.said("hello")
+        m.role_mentions.append(SimpleNamespace(name="Readers", id=600))
+        text = "@Readers @everyone @here @Testbot"
+        await self.answer(m, text)
+        self.assertEqual(m.reply.call_args.args[0], text)
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [])
+
+    async def test_repeated_names_same_user_and_name_boundaries(self):
+        self.chatter("Moss", 501)
+        self.chatter("Moss", 501)
+        self.chatter("Pip Meadow", 502)
+        m = self.said("hello")
+        await self.answer(m, "moss@example.com @Mossy @@Moss @Pip Meadow @Moss @Moss!")
+        self.assertEqual(m.reply.call_args.args[0], "moss@example.com @Mossy @@Moss <@502> <@501> <@501>!")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [501, 502])
+
+    async def test_jev_can_select_a_whole_multiword_mention_as_a_word(self):
+        self.chatter("Pip Meadow", 502)
+        m = self.said("ask your friend")
+        m.reply = AsyncMock(return_value=self.said("@Pip Meadow knows", to=m, bot=True))
+        decisions = [({"@Pip Meadow": 1.0}, 0.0), ({"knows": 1.0}, 0.0), ({j.END: 1.0}, 0.0)]
+        with patch.object(j, "model_name", "jev"), \
+                patch.object(j, "next_word", new_callable=AsyncMock, side_effect=decisions) as next_word:
+            await j.handle(m, j.message_text(m))
+        vocab = next_word.call_args.args[2]
+        self.assertIn("@Pip Meadow", vocab)
+        self.assertNotIn("@Testbot", vocab)
+        self.assertEqual(vocab[-1], j.END)
+        self.assertEqual(next_word.await_count, 3)  # the mention counts towards MIN_WORDS, so END can win
+        self.assertEqual([step["word"] for step in self.trace["steps"]], ["@Pip Meadow", "knows", j.END])
+        self.assertGreater(j.penalty(["@Pip Meadow"], "@Pip Meadow"), j.penalty([], "@Pip Meadow"))
+        self.assertEqual(m.reply.call_args.args[0], "<@502> knows")
+
+    async def test_names_with_unicode_and_regex_punctuation_are_literal(self):
+        self.chatter("Píp [Meadow]", 501)
+        m = self.said("hello")
+        await self.answer(m, "@PÍP [MEADOW], knows.")
+        self.assertEqual(m.reply.call_args.args[0], "<@501>, knows.")
+
+    async def test_other_mentions_stay_disabled_when_a_user_ping_is_allowed(self):
+        self.chatter("Moss", 501)
+        m = self.said("hello")
+        await self.answer(m, "@Moss <@999> <@&600> @everyone @here")
+        self.assertEqual(m.reply.call_args.args[0], "<@501> <@999> <@&600> @everyone @here")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict(), {"parse": [], "users": [501]})
+
+    async def test_ambiguous_names_are_not_jev_choices(self):
+        self.chatter("Moss", 501)
+        self.chatter("moss", 502)
+        m = self.said("hello")
+        m.reply = AsyncMock(return_value=self.said("Hello", to=m, bot=True))
+        with patch.object(j, "model_name", "jev"), \
+                patch.object(j, "loom", new_callable=AsyncMock, return_value=["hello"]) as loom:
+            await j.handle(m, j.message_text(m))
+        self.assertNotIn("@Moss", loom.call_args.args[1])
+        self.assertNotIn("@moss", loom.call_args.args[1])
+
+    async def test_only_the_selected_writers_history_can_be_mentioned(self):
+        self.chatter("Moss", 501)
+        for i in range(j.HISTORY_CHATTER):
+            self.chatter("Pip", 502, f"newer {i}")
+        for model, expected in [("jev", "@Moss knows"), ("haiku", "<@501> knows")]:
+            with self.subTest(model=model), patch.object(j, "model_name", model):
+                m = self.said("hello")
+                await self.answer(m, "@Moss knows")
+                self.assertEqual(m.reply.call_args.args[0], expected)
+
+    async def test_no_context_cannot_ping_people_from_the_channel(self):
+        self.chatter("Moss", 501)
+        m = self.said("!nocontext ask someone", name="Fern")
+        await self.answer(m, "@Moss ask @Fern")
+        self.assertEqual(m.reply.call_args.args[0], "@Moss ask <@500>")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [500])
+
+    async def test_only_llms_can_mention_the_reactors_they_see(self):
+        entry = j.channel_history[self.channel.id][0]
+        entry.update(reply="Hello", reply_reactions={"😂": 1}, reply_reactors={"😂": {"501": "Moss"}})
+        for model, expected in [("jev", "@Moss knows"), ("haiku", "<@501> knows")]:
+            with self.subTest(model=model), patch.object(j, "model_name", model):
+                m = self.said("hello")
+                await self.answer(m, "@Moss knows")
+                self.assertEqual(m.reply.call_args.args[0], expected)
+
+    async def test_live_edits_update_the_mentioned_users(self):
+        uid = 100000000000000002
+        m = self.chatter("Fern", 500)
+        m.content = f"ask <@{uid}>"
+        m.mentions = [SimpleNamespace(id=uid, display_name="Moss")]
+        m.clean_content = discord.Message.clean_content.function(m)
+        await j.on_message_edit(m, m)
+        question = self.said("hello")
+        await self.answer(question, "@Moss knows")
+        self.assertEqual(question.reply.call_args.args[0], f"<@{uid}> knows")
+
+    async def test_restart_rebuilds_readable_mentions_and_their_ids(self):
+        uid = 100000000000000002
+        m = self.said("ask someone", name="Fern")
+        r = self.said(f"<@{uid}> knows", to=m, bot=True)
+        r.mentions = [SimpleNamespace(id=uid, display_name="Moss")]
+        r.clean_content = discord.Message.clean_content.function(r)
+
+        async def history(**kwargs):
+            for message in (r, m):
+                yield message
+
+        j.channel_history[self.channel.id] = []
+        self.channel.history = history
+        await self.load_history(SimpleNamespace(channel=self.channel))
+        entry, = j.channel_history[self.channel.id]
+        self.assertEqual(entry["reply"], "@Moss knows")
+        self.assertEqual(entry["reply_users"][str(uid)], "Moss")
+        question = self.said("hello")
+        await self.answer(question, "@Moss knows")
+        self.assertEqual(question.reply.call_args.args[0], f"<@{uid}> knows")
+
+    async def test_old_entries_without_ids_are_not_guessed_from_elsewhere(self):
+        j.channel_history[self.channel.id][0]["name"] = "Moss"
+        self.chatter("Moss", 501)
+        m = self.said("hello")
+        await self.answer(m, "@Moss knows")
+        self.assertEqual(m.reply.call_args.args[0], "@Moss knows")
+        self.assertEqual(m.reply.call_args.kwargs["allowed_mentions"].to_dict()["users"], [])
+
+
 class AppHistoryTests(_Handling):
     def app_post(self):
         m = self.said("", name="Milestone App", ping=False)
@@ -852,6 +1033,18 @@ class LongChatTests(_Handling):
                          [j.page_text(p, "Testbot") for p in chat["pages"]])
         with patch.object(j, "LONG_CHAT_CHANNELS", set()):
             self.assertEqual(j.load_long_chats(), {})  # a channel taken out of .env is forgotten
+
+    async def test_frozen_page_mention_ids_survive_restart_and_are_only_for_llms(self):
+        entry = j.long_chats[self.channel.id]["pages"][0][0]
+        entry.update(name="Moss Meadow", users={"501": "Moss Meadow"})
+        j.save_long_chats()
+        j.long_chats = j.load_long_chats()
+        self.assertEqual(j.long_chats[self.channel.id]["pages"][0][0]["users"], {"501": "Moss Meadow"})
+        for model, expected in [("jev", "@Moss Meadow knows"), ("haiku", "<@501> knows")]:
+            with self.subTest(model=model), patch.object(j, "model_name", model):
+                m = self.said("ask someone")
+                await self.answer(m, "@Moss Meadow knows")
+                self.assertEqual(m.reply.call_args.args[0], expected)
 
     async def test_a_rebuild_freezes_pages_from_everything_it_read(self):
         j.channel_history[self.channel.id], j.long_chats = [], {}
