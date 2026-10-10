@@ -51,6 +51,90 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             self.addCleanup(p.stop)
 
 
+class ReactionContextTests(_Discord):
+    def setUp(self):
+        super().setUp()
+        self.entry = {"role": "user", "name": "Speaker", "content": "hello", "id": 600,
+                      "reply": "Hello", "reply_id": 700}
+        j.channel_history[self.channel.id] = [self.entry]
+
+    def payload(self, uid=501, name="Moss", emoji="😂"):
+        return SimpleNamespace(channel_id=self.channel.id, message_id=700, guild_id=400,
+                               user_id=uid, member=SimpleNamespace(id=uid, display_name=name), emoji=emoji)
+
+    def transcript(self, **kwargs):
+        return j.transcript("how are you?", "Speaker", "Testbot", [self.entry], [], **kwargs)
+
+    def reaction(self, emoji="😂", fail=False):
+        async def users():
+            if fail:
+                raise discord.HTTPException(SimpleNamespace(status=403, reason="Forbidden"), "denied")
+            for user in [self.user, SimpleNamespace(id=501, display_name="Moss"),
+                         SimpleNamespace(id=502, display_name="Pip")]:
+                yield user
+        return SimpleNamespace(emoji=emoji, count=3, me=True, users=users)
+
+    async def test_live_names_removal_and_question_check(self):
+        await j.on_raw_reaction_add(self.payload())
+        await j.on_raw_reaction_add(self.payload(502, "Pip"))
+        await j.on_raw_reaction_add(self.payload(self.user.id, "Testbot"))
+        self.assertIn("Hello (😂×2 by @Moss, @Pip)", self.transcript())
+        self.assertNotIn("😂", self.transcript(reactions=False, marked=True))
+        self.assertNotIn("@Moss", self.transcript(their_reactions=False))
+        await j.on_raw_reaction_remove(self.payload())
+        self.assertIn("Hello (😂 by @Pip)", self.transcript())
+        await j.on_raw_reaction_remove(self.payload(502, "Pip"))
+        self.assertNotIn("😂", self.transcript())
+
+    async def test_clear_one_and_all_reactions(self):
+        await j.on_raw_reaction_add(self.payload())
+        await j.on_raw_reaction_add(self.payload(502, "Pip", "💀"))
+        await j.on_raw_reaction_clear_emoji(self.payload())
+        self.assertNotIn("@Moss", self.transcript())
+        self.assertIn("💀 by @Pip", self.transcript())
+        await j.on_raw_reaction_clear(self.payload())
+        self.assertNotIn("reply_reactors", self.entry)
+        self.assertNotIn("💀", self.transcript())
+
+    async def test_names_restored_from_channel_history(self):
+        question = MentionTests.message(self)
+        question.id = 600
+        reply = SimpleNamespace(id=700, author=self.user, reference=SimpleNamespace(message_id=600),
+                                content="Hello", reactions=[self.reaction()])
+        async def history(**kwargs):
+            for message in [reply, question]:
+                yield message
+        self.channel.history = history
+        j.channel_history[self.channel.id] = []
+        await j.load_history(SimpleNamespace(channel=self.channel))
+        self.entry = j.channel_history[self.channel.id][0]
+        self.assertIn("Hello (😂×2 by @Moss, @Pip)", self.transcript())
+
+    async def test_side_chain_and_standalone_reply_names(self):
+        question = MentionTests.message(self)
+        reply = SimpleNamespace(id=700, author=self.user, reference=SimpleNamespace(message_id=question.id),
+                                content="Hello", reactions=[self.reaction()])
+        entries = await j.chain_entries([question, reply])
+        self.assertEqual(entries[0]["reply_reactors"]["😂"], {"501": "Moss", "502": "Pip"})
+        standalone = {"role": "assistant", "content": "Hello"}
+        await j.attach_reactions(standalone, reply, prefix="")
+        self.assertIn("Hello (😂×2 by @Moss, @Pip)",
+                      j.transcript("hi", "Speaker", "Testbot", [standalone], []))
+
+    async def test_http_failure_keeps_counts_and_old_logs_render(self):
+        reply = SimpleNamespace(id=700, reactions=[self.reaction(fail=True)])
+        await j.attach_reactions(self.entry, reply)
+        self.assertIn("Hello (😂×2)", self.transcript())
+        self.assertEqual(j.reacted({"😂": 3}), " (😂×3)")
+        p = self.payload()
+        p.member, p.guild_id = None, None
+        with patch.object(j.bot, "get_user", return_value=None), patch.object(
+            j.bot, "fetch_user", new_callable=AsyncMock, return_value=SimpleNamespace(display_name="Moss")
+        ):
+            await j.on_raw_reaction_add(p)
+        self.assertIn("😂×3 by @Moss", self.transcript())
+
+
 class MentionTests(_Discord):
     def message(self, *, content="hello", ping=False, role=False, reply=True, dm=False, author_bot=False):
         return _Message(
