@@ -70,7 +70,7 @@ def render(bot_name, reply, panels, reacted_to=None, images=None, note=None, tok
         fig.text(0.012, 1 - 0.8 / fig.get_figheight(), note, fontsize=12, color=INK, va="top", family=FONT)
     noun = "token" if tokens else "word" if reacted_to is None else "emoji"
     fig.text(0.012, 1 - (0.85 + below) / fig.get_figheight(),
-             "Bar: how likely the model thought each token was, from its top few. What it said is gold."
+             "Bar: how likely the model thought each token was, from its top few. Gold: the one it picked."
              if tokens else
              f"Wide pale bar: how likely the model thought the {noun} was.   "
              "Thin bar: its score after the penalties for repeating itself.   "
