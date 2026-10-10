@@ -252,7 +252,30 @@ class MentionTests(_Discord):
         with patch.object(j, "respond", new_callable=AsyncMock) as respond:
             await j.on_message(m)
         respond.assert_not_awaited()
+        entry, = j.channel_history[self.channel.id]
+        self.assertEqual(entry["content"], "hello")
+        self.assertFalse(entry["to_bot"])
+        self.assertFalse(j.heard)
+
+    async def test_own_posts_stay_out_of_history(self):
+        m = self.message(author_bot=True, reply=False)
+        m.author = self.user
+        with patch.object(j, "respond", new_callable=AsyncMock) as respond:
+            await j.on_message(m)
+        respond.assert_not_awaited()
         self.assertFalse(j.channel_history[self.channel.id])
+        self.assertFalse(j.heard)
+
+    async def test_catch_up_does_not_answer_other_apps(self):
+        m = self.message(ping=True, author_bot=True, reply=False)
+
+        async def history(**kwargs):
+            yield m
+
+        self.channel.history.side_effect = history
+        with patch.object(j, "DM_USERS", set()), patch.object(j, "respond", new_callable=AsyncMock) as respond:
+            await j.catch_up()
+        respond.assert_not_awaited()
 
     async def test_unpinged_diagnostic_reply_still_runs_command(self):
         m = self.message(content="!why")
@@ -303,6 +326,52 @@ class MentionTests(_Discord):
             await live
             await j.respond(m, caught_up=True)  # and once it's answered, too
         traced.assert_awaited_once_with(m)
+
+
+class EmbedTests(_Discord):
+    message = MentionTests.message
+
+    def test_standalone_embed_includes_title_and_description(self):
+        m = self.message(content="", author_bot=True, reply=False)
+        m.embeds = [discord.Embed(url="https://example.com/milestone", title="Contribution milestone", description=(
+            "[synthetic-user](https://example.com/synthetic-user) has passed **1,000 contributions** in 2026."))]
+        self.assertEqual(j.message_text(m),
+                         "[embed: Contribution milestone synthetic-user has passed 1,000 contributions in 2026.]")
+
+    def test_multiline_description_and_fields_share_one_word_limit(self):
+        m = self.message(content="", reply=False)
+        embed = discord.Embed(description="Build finished\nAll checks passed")
+        embed.set_author(name="Build App")
+        embed.add_field(name="Result", value=" ".join(f"word{i}" for i in range(30)))
+        m.embeds = [embed]
+        expected = "Build App Build finished All checks passed Result: " + " ".join(f"word{i}" for i in range(12))
+        self.assertEqual(j.message_text(m), f"[embed: {expected} ...]")
+
+    def test_link_preview_is_not_repeated_as_a_standalone_embed(self):
+        for url in ("https://example.com/post", "https://example.com/redirect"):
+            with self.subTest(url=url):
+                m = self.message(content=url, reply=False)
+                m.embeds = [discord.Embed(url="https://example.com/post", title="Release notes", description="Preview text")]
+                self.assertEqual(j.message_text(m), "[link: Release notes]")
+
+    def test_multiple_links_and_extra_embed(self):
+        m = self.message(content="https://example.com/first https://example.com/second", reply=False)
+        m.embeds = [discord.Embed(url="https://example.com/first", title="First article"),
+                    discord.Embed(url="https://example.com/second", title="Second article"),
+                    discord.Embed(title="Build", description="All checks passed")]
+        self.assertEqual(j.message_text(m), "[link: First article] [link: Second article] [embed: Build All checks passed]")
+
+    def test_gif_tweet_attachments_and_stickers_keep_their_tags(self):
+        m = self.message(content="https://tenor.com/view/happy-dance-gif https://example.com/post", reply=False)
+        gif = discord.Embed(url="https://tenor.com/view/happy-dance-gif", type="gifv", title="Happy dance")
+        tweet = discord.Embed(url="https://example.com/post", description="**Good news**\nOther text")
+        tweet.set_author(name="Synthetic User (@synthetic)")
+        m.embeds = [gif, tweet, discord.Embed().set_image(url="https://example.com/image.png")]
+        m.attachments = [SimpleNamespace(content_type="image/png")]
+        m.stickers = [SimpleNamespace(name="Wave")]
+        self.assertEqual(j.message_text(m),
+                         "[gif: Happy dance] [link: Synthetic User: Good news] [photo] [sticker: Wave]")
+
 
 class ActionTests(_Discord):
     """Why and Context, from right-clicking a message: answered only to whoever asked."""
@@ -402,6 +471,53 @@ class _Handling(_Discord):
             await j.handle(m, j.message_text(m))
         return [(e["name"], e["content"], e.get("reply")) for e in gen.call_args.kwargs["history"]]
 
+
+class AppHistoryTests(_Handling):
+    def app_post(self):
+        m = self.said("", name="Milestone App", ping=False)
+        m.author.bot = True
+        m.embeds = [discord.Embed(title="Contribution milestone", description="synthetic-user passed **1,000 contributions**.")]
+        return m
+
+    async def test_live_app_embed_is_seen_when_answering_a_human(self):
+        app = self.app_post()
+        with patch.object(j, "respond", new_callable=AsyncMock) as respond:
+            await j.on_message(app)
+        respond.assert_not_awaited()
+        question = self.said("say congrats")
+        question.reply = AsyncMock(return_value=self.said("Congrats, synthetic-user!", to=question, bot=True))
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", new_callable=AsyncMock,
+                                                              return_value=("Congrats, synthetic-user!", [])) as llm:
+            await j.handle(question, j.message_text(question))
+        chat = llm.call_args.args[1][1]["content"]
+        self.assertIn("Milestone App: [embed: Contribution milestone synthetic-user passed 1,000 contributions.]", chat)
+        self.assertIn("say congrats", chat)
+        self.assertIn("[embed: Contribution milestone synthetic-user passed 1,000 contributions.]", self.trace["transcript"])
+        self.assertEqual(question.reply.call_args.args[0], "Congrats, synthetic-user!")
+
+    async def test_app_posts_rebuilt_after_restart_and_own_status_excluded(self):
+        app = self.app_post()
+        own = self.said("I feel happy", bot=True)
+        j.channel_history[self.channel.id] = []
+
+        async def history(**kwargs):
+            for m in (own, app):
+                yield m
+
+        self.channel.history = history
+        with patch.object(j, "load_history", self.load_history):
+            seen = await self.answer(self.said("say congrats"))
+        self.assertEqual(seen, [("Milestone App", "[embed: Contribution milestone synthetic-user passed 1,000 contributions.]", None)])
+
+    async def test_app_embed_edits_update_context(self):
+        app = self.app_post()
+        await j.on_message(app)
+        after = self.app_post()
+        after.id = app.id
+        after.embeds = [discord.Embed(title="Contribution milestone", description="synthetic-user passed **2,000 contributions**.")]
+        await j.on_message_edit(app, after)
+        seen = await self.answer(self.said("say congrats"))
+        self.assertIn(("Milestone App", "[embed: Contribution milestone synthetic-user passed 2,000 contributions.]", None), seen)
 
 
 class NoContextChainTests(_Handling):

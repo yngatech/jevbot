@@ -990,7 +990,7 @@ EMBED_WORDS = 20
 def slug_words(text):
     return [w for w in re.split(r"[/\-_.+]", text) if w.isalpha()]
 
-# The start of a tweet's text: its first line, plain (the embed's is markdown), cut at EMBED_WORDS words
+# Plain embed text, cut at EMBED_WORDS words; link previews use just its first line
 def embed_text(description):
     line = (description or "").strip().split("\n")[0]
     line = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", line)  # [@someone](https://x.com/someone) -> @someone
@@ -1019,6 +1019,14 @@ def embed_for(url, m, only):
     path = urlsplit(url).path.rstrip("/")
     return (next((e for e in embeds if urlsplit(e.url).path.rstrip("/") == path), None)
             or (embeds[0] if only and len(embeds) == 1 else None))
+
+# App posts can be all embed, with no message text or link to replace. Keep their title, description and fields
+# in one short tag, including later lines, rather than treating them as empty messages.
+def embed_tag(embed):
+    parts = [embed.title or embed.author.name, embed.description]
+    parts.extend(f"{field.name}: {field.value}" for field in embed.fields)
+    text = embed_text(" ".join(part.replace("\n", " ") for part in parts if part))
+    return f"[embed: {text}]" if text else None
 
 def attachment_tag(a):
     if a.content_type == "image/gif":
@@ -1086,15 +1094,22 @@ async def side_root(m):
         add_side(root, entry)
     return root
 
-# m as jev sees it: mentions as readable names, without !nocontext if it's to jev, links as tags, and a tag for each attachment
-# and sticker — otherwise a photo on its own is an empty message, dropped or read as "hello"
+# m as jev sees it: mentions as readable names, without !nocontext if it's to jev, links as tags, and a tag for each
+# standalone embed, attachment and sticker — otherwise a post on its own is empty, dropped or read as "hello"
 def message_text(m):
     text = m.clean_content
     if should_respond(m):
         text = NO_CONTEXT.sub("", text)
     only = len(LINK.findall(text)) == 1
-    text = LINK.sub(lambda l: link_tag(l[1], embed_for(l[1], m, only)), text)
-    tags = [attachment_tag(a) for a in m.attachments] + [f"[sticker: {s.name}]" for s in m.stickers]
+    used = set()
+    def replace_link(match):
+        embed = embed_for(match[1], m, only)
+        if embed is not None:
+            used.add(id(embed))
+        return link_tag(match[1], embed)
+    text = LINK.sub(replace_link, text)
+    tags = [tag for embed in m.embeds if id(embed) not in used and (tag := embed_tag(embed))]
+    tags += [attachment_tag(a) for a in m.attachments] + [f"[sticker: {s.name}]" for s in m.stickers]
     return " ".join([text.strip(), *tags]).strip()
 
 # The message of jev's that m is a Discord reply to, if any
@@ -1123,10 +1138,10 @@ def command(m):
         return c[0]
     return None
 
-# m as a history entry, or None for messages that never go in one (bots, including jev itself, empty ones, and
+# m as a history entry, or None for messages that never go in one (jev itself, empty ones, and
 # commands — often a reply to jev, so after a restart one came back as a message jev never answered)
 def history_entry(m):
-    if m.author.bot or command(m):
+    if m.author.id == bot.user.id or command(m):
         return None
     to_bot = should_respond(m)
     content = message_text(m) or ("hello" if to_bot else "")
