@@ -31,7 +31,6 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import why_chart
-import context_chart
 
 load_dotenv()
 
@@ -2125,12 +2124,24 @@ def chat_message_count(t):
     return None
 
 
+def percentage(part, total):
+    fraction = part / total if total else 0
+    return "<0.1%" if 0 < fraction < .001 else f"{fraction:.1%}"
+
+
+# A bar drawn in text, so the embed needs no image: any share shows at least one cell, and only all of it fills every cell
+def text_bar(part, total, cells=20):
+    fraction = min(max(part / total if total else 0, 0), 1)
+    filled = min(max(round(fraction * cells), 1 if fraction else 0), cells if fraction == 1 else cells - 1)
+    return f"`{'▰' * filled}{'▱' * (cells - filled)}`"
+
+
 def context_usage(t):
     tokens, window = t.get("llm_prompt_tokens"), t.get("llm_window")
     if t.get("reaction") or tokens is None:
         return "Not recorded"
     if window:
-        return f"{tokens:,} / {window:,} tokens · {context_chart.percentage(tokens, window)} used"
+        return f"{tokens:,} / {window:,} tokens · {percentage(tokens, window)} used"
     return f"{tokens:,} tokens"
 
 
@@ -2138,7 +2149,7 @@ def money(cost):
     return f"${cost:.6f} USD" if cost is not None else "Not recorded"
 
 
-# One embed: the transcript, then the logged counts as fields, with a chart of them at the bottom. A long
+# One embed: the transcript, then the logged counts as fields, with text bars for the window and cache. A long
 # transcript is attached instead, which Discord shows above the embed and can open without downloading — so it's
 # uploaded again each time rather than cached as a link.
 def context_response(t, bot_name):
@@ -2157,14 +2168,17 @@ def context_response(t, bot_name):
     if not t.get("reaction") and tokens is not None:
         if (output := t.get("llm_completion_tokens")) is not None:
             embed.add_field(name="Output", value=f"{output:,} tokens")
-        embed.add_field(name="Context window", value=context_usage(t), inline=False)
-        if context_chart.cache_known(tokens, cached):
-            embed.add_field(name="Input cache", value=f"{cached:,} cached · {tokens - cached:,} uncached · "
-                                                      f"{context_chart.percentage(cached, tokens)} cached",
-                            inline=False)
         if window:
-            embed.set_image(url="attachment://context-usage.png")
-            files.insert(0, ("context-usage.png", context_chart.render(tokens, window, cached)))
+            usage = (f"{text_bar(tokens, window)} {percentage(tokens, window)} · "
+                     f"{tokens:,} / {window:,} tokens")
+        else:
+            usage = f"{tokens:,} tokens"
+        embed.add_field(name="Context window", value=usage, inline=False)
+        # Cached tokens are part of the input, rather than extra window usage
+        if cached is not None and 0 <= cached <= tokens:
+            embed.add_field(name="Input cache", value=f"{text_bar(cached, tokens)} {percentage(cached, tokens)} · "
+                                                      f"{cached:,} cached · {tokens - cached:,} uncached",
+                            inline=False)
     if t.get("no_context"):
         embed.set_footer(text="!nocontext · this side conversation")
     return Explanation(embeds=(embed,), files=tuple(files))

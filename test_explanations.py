@@ -174,17 +174,14 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 j.write_trace(t)
                 self.sent.clear()
                 self.uploads.clear()
-                with patch.object(j.context_chart, "render", wraps=j.context_chart.render) as render:
-                    await j.context_action.callback(self.interaction(), self.target(t))
-                render.assert_called_once_with(18_673, 1_000_000, 14_533)
+                await j.context_action.callback(self.interaction(), self.target(t))
                 embed, = self.embeds(self.sent[0])
                 self.assertEqual({f.name: f.value for f in embed.fields},
                                  {"Model": "Haiku", "Chat messages": "291", "Output": "24 tokens",
-                                  "Context window": "18,673 / 1,000,000 tokens · 1.9% used",
-                                  "Input cache": "14,533 cached · 4,140 uncached · 77.8% cached"})
-                self.assertEqual(embed.image.url, "attachment://context-usage.png")
+                                  "Context window": f"`▰{'▱' * 19}` 1.9% · 18,673 / 1,000,000 tokens",
+                                  "Input cache": f"`{'▰' * 16}{'▱' * 4}` 77.8% · 14,533 cached · 4,140 uncached"})
+                self.assertFalse(embed.image.url)
                 uploads = {url.split("/")[-1].split("?")[0]: data for url, data in self.uploads.items()}
-                self.assertTrue(uploads.pop("context-usage.png").startswith(b"\x89PNG\r\n\x1a\n"))
                 if long:
                     self.assertEqual(uploads, {"context.txt": t["transcript"].encode()})
                 else:
@@ -192,7 +189,11 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(t["transcript"], embed.description)
                 self.assertNotIn("estimated", json.dumps(embed.to_dict()))
 
-    async def test_context_for_jev_or_an_older_log_has_a_transcript_without_a_made_up_chart(self):
+    def test_text_bars_show_any_share_and_fill_only_when_full(self):
+        self.assertEqual([j.text_bar(part, 1000, cells=4) for part in (0, 1, 500, 999, 1000)],
+                         ["`▱▱▱▱`", "`▰▱▱▱`", "`▰▰▱▱`", "`▰▰▰▱`", "`▰▰▰▰`"])
+
+    async def test_context_for_jev_or_an_older_log_has_a_transcript_without_made_up_usage(self):
         for t in (self.logged, dict(self.logged, llm="haiku")):
             with self.subTest(llm=t.get("llm")):
                 j.write_trace(t)
