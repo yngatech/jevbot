@@ -413,7 +413,7 @@ class EmbedTests(_Discord):
 
 
 class ActionTests(_Discord):
-    """Why and Context, from right-clicking a message: answered only to whoever asked."""
+    """Diagnostic actions, from right-clicking a message: answered only to whoever asked."""
 
     def interaction(self):
         return SimpleNamespace(channel_id=self.channel.id, guild=self.guild,
@@ -422,7 +422,8 @@ class ActionTests(_Discord):
 
     def test_actions_are_message_context_menus(self):
         menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
-        self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message})
+        self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message,
+                                 "Stats": discord.AppCommandType.message})
 
     async def test_failed_registration_doesnt_stop_startup(self):
         error = discord.HTTPException(Mock(status=503, reason="Service Unavailable"), "unavailable")

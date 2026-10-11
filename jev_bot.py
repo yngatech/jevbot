@@ -757,11 +757,11 @@ async def generate_filtered_status(bot_name, start, chat=""):
             log.info(f"[STATUS] candidate {len(attempts)}/{STATUS_ATTEMPTS}: {mood} "
                      f"(meaning={score:.2f}, {'accepted' if attempt['accepted'] else 'rejected'})")
             if attempt["accepted"]:
-                # !why and Context keep using the accepted generation, while the full retry history stays local.
+                # Diagnostics use the accepted generation, while the full retry history stays local.
                 if parent is not None:
                     parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens",
-                                                           "llm_window", "llm_prompt_tokens", "llm_prompt_chars",
-                                                           "llm_chat_chars")
+                                                           "llm_window", "llm_prompt_tokens", "llm_completion_tokens",
+                                                           "llm_cached_tokens", "llm_prompt_chars", "llm_chat_chars")
                                    if k in attempt})
                     parent["status_score"] = score
                 return mood
@@ -770,6 +770,8 @@ async def generate_filtered_status(bot_name, start, chat=""):
             if parent is not None:
                 parent["cost"] += attempt["cost"]
                 parent["requests"] += attempt["requests"]
+                if byok := attempt.get("byok_cost"):
+                    parent["byok_cost"] = parent.get("byok_cost", 0) + byok
                 if "error" in attempt:
                     parent["error"] = attempt["error"]
     return None
@@ -919,9 +921,10 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                 if byok:
                     t["byok_cost"] = t.get("byok_cost", 0) + byok
                 t["requests"] += 1
-            # For Context: the prompt's exact size, how much was read from the cache, and its length in characters
-            # to split it by
+            # For Context and Stats: exact input/output counts, cache reads, and the prompt's character count
+            # to estimate its split between voice rules and chat
             note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
+                 llm_completion_tokens=usage.get("completion_tokens"),
                  llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
                  llm_prompt_chars=sum(len(text_of(m["content"])) for m in messages))
             await set_credit(True)
@@ -1037,7 +1040,7 @@ waking = True
 bot = commands.Bot(command_prefix="!", intents=intents, status=discord.Status.idle, activity=WAKING)
 gen_lock = asyncio.Lock()
 
-# The Why and Context actions (below) are registered with Discord each start, so a change to them shows up. If that
+# The diagnostic actions (below) are registered with Discord each start, so a change to them shows up. If that
 # fails, the ones registered last time stay — no reason to keep jev offline.
 async def setup_hook():
     try:
@@ -1837,8 +1840,8 @@ def asked_note(t, bot_name):
     # Rounded down, so 39.6% doesn't show as 40% on the reacting side of 40%
     return f"Question for {bot_name}? {math.floor(asked * 100)}%, {side}"
 
-# How !why and Context answer: the !why command with a Discord reply to it, the Why and Context actions (right-click
-# a message, Apps) with a message only whoever asked can see. Both quote what people said, so no pings from mentions.
+# How diagnostics answer: !why with a Discord reply to it, the actions (right-click a message, Apps) with a message
+# only whoever asked can see. They may quote what people said, so no pings from mentions.
 def reply_to(m):
     async def send(content=None, file=None, embed=None):
         return await m.reply(content, file=file, embed=embed, mention_author=False,
@@ -1922,8 +1925,12 @@ async def send_explanation(kind, channel_id, guild, t, send):
                     keep_explanation(key, cached)
                     return cached
             explanation_cache.pop(key, None)
-            content, data, filename = (await why_response(t, guild, bot_name) if kind == "why"
-                                       else context_response(t, bot_name))
+            if kind == "why":
+                content, data, filename = await why_response(t, guild, bot_name)
+            elif kind == "stats":
+                content, data, filename = stats_response(t), None, None
+            else:
+                content, data, filename = context_response(t, bot_name)
             cached = CachedExplanation(content)
             if data is None:
                 await send(content)
@@ -2037,19 +2044,20 @@ async def explain_context(channel_id, guild, target, send):
 CHAT_TOKEN_WEIGHT = 1.25
 
 def window_usage(t):
-    if not (tokens := t.get("llm_prompt_tokens")) or not t.get("llm_prompt_chars"):
+    if (tokens := t.get("llm_prompt_tokens")) is None or not (window := t.get("llm_window")):
         return ""
-    window = t["llm_window"]
-    chat_chars = CHAT_TOKEN_WEIGHT * t.get("llm_chat_chars", 0)
-    chat = round(tokens * chat_chars / (chat_chars + t["llm_prompt_chars"] - t.get("llm_chat_chars", 0)))
     used = tokens / window
+    usage = (f"**{t['llm']}**: {tokens:,} of {window:,} tokens in its window — "
+             f"{'<0.1%' if 0 < used < 0.001 else f'{used:.1%}'} used, {1 - used:.1%} free\n")
     count = t.get("llm_messages") or ("history" in t and "status" not in t and len(t["history"]) + 1)
     messages = f" ({count} messages)" if count else ""
-    return (f"**{t['llm']}**: {tokens:,} of {window:,} tokens in its window — "
-            f"{'<0.1%' if used < 0.001 else f'{used:.1%}'} used, {1 - used:.1%} free\n"
-            f"- prompt: ~{tokens - chat:,} tokens\n"
-            f"- chat: ~{chat:,} tokens{messages}\n"
-            + (f"- read from the cache: {cached:,} tokens\n" if (cached := t.get("llm_cached_tokens")) else ""))
+    if t.get("llm_prompt_chars"):
+        chat_chars = CHAT_TOKEN_WEIGHT * t.get("llm_chat_chars", 0)
+        chat = round(tokens * chat_chars / (chat_chars + t["llm_prompt_chars"] - t.get("llm_chat_chars", 0)))
+        usage += f"- prompt: ~{tokens - chat:,} tokens\n- chat: ~{chat:,} tokens{messages}\n"
+    if (cached := t.get("llm_cached_tokens")) is not None:
+        usage += f"- read from the cache: {cached:,} tokens\n"
+    return usage
 
 def context_response(t, bot_name):
     if "status" in t:
@@ -2068,7 +2076,47 @@ def context_response(t, bot_name):
     return (f"{head}:\n{usage}".rstrip() if usage else head), text.encode(), "context.txt"
 
 
-# Right-clicking a message for Why or Context: that message, as if !why were a Discord reply to it.
+# Stats use the same logs as Why and Context, without generating anything or quoting the transcript.
+async def explain_stats(channel_id, guild, target, send):
+    t = await asyncio.to_thread(find_trace, channel_id, target,
+                                lambda t: t.get("reply") or t.get("reaction") or t.get("status"))
+    if t is None:
+        await send("Nothing logged for that")
+        return
+    await send_explanation("stats", channel_id, guild, t, send)
+
+def stats_response(t):
+    name = "jev" if t.get("reaction") else t.get("llm") or "jev"
+    model = MODEL if name == "jev" else t.get("llm_model")
+    lines = [f"**Model:** **{name}**" + (f" (`{model}`)" if model else " (model ID not logged)")]
+    no_generation = t.get("requests") == 0 and t.get("reply") in NO_MONEY
+    if no_generation:
+        lines = ["**Model:** none (out of credit)"]
+    cost = t.get("cost")
+    lines.append(f"**Cost:** ${cost:.6f} USD" if cost is not None else "**Cost:** not logged")
+    if cost is not None and (byok := t.get("byok_cost")):
+        lines.extend([f"- OpenRouter: ${cost - byok:.6f} USD", f"- own API key: ${byok:.6f} USD"])
+    lines.append("Includes all logged API requests, checks and retries.")
+    if (requests := t.get("requests")) is not None:
+        lines.append(f"**API requests:** {requests:,}")
+    if (seconds := t.get("seconds")) is not None:
+        lines.append(f"**Time:** {seconds:.1f}s")
+    if no_generation:
+        lines.append("\nNo generation request was made.")
+    elif name != "jev":
+        lines.append("\n**Context usage (final generation request):**")
+        usage = window_usage(t)
+        lines.append(usage.rstrip() if usage else "Context token usage wasn't logged for this answer.")
+        if (output := t.get("llm_completion_tokens")) is not None:
+            lines.append(f"- output: {output:,} tokens")
+        if usage:
+            lines.append("Prompt/chat split is estimated; cached tokens are included in the input total.")
+    else:
+        lines.append("\nContext token usage wasn't logged for Jev's decision requests.")
+    return "\n".join(lines)
+
+
+# Right-clicking a message for a diagnostic action: that message, as if !why were a Discord reply to it.
 # Charts can take longer than the 3s Discord waits for an answer, so it's deferred ("jev is thinking...") first.
 @bot.tree.context_menu(name="Why")
 async def why_action(interaction: discord.Interaction, target: discord.Message):
@@ -2079,6 +2127,11 @@ async def why_action(interaction: discord.Interaction, target: discord.Message):
 async def context_action(interaction: discord.Interaction, target: discord.Message):
     await interaction.response.defer(ephemeral=True, thinking=True)
     await explain_context(interaction.channel_id, interaction.guild, target, answer_privately(interaction))
+
+@bot.tree.context_menu(name="Stats")
+async def stats_action(interaction: discord.Interaction, target: discord.Message):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await explain_stats(interaction.channel_id, interaction.guild, target, answer_privately(interaction))
 
 
 # !model: which model writes the replies and statuses, or with a name, switch to it — for everyone, and kept

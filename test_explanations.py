@@ -1,4 +1,4 @@
-"""Offline checks for cached Why and Context answers, using synthetic logs and Discord sends.
+"""Offline checks for Why, Context and Stats answers, using synthetic logs and Discord sends.
 
     uv run --with-requirements requirements.txt python -m unittest test_explanations
 """
@@ -191,6 +191,134 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 await j.context_action.callback(self.interaction(), self.target(t))
                 self.assertTrue(self.sent[0][0].startswith('What Testbot saw before replying to "tea?":\n```'))
                 self.assertNotIn("window", self.sent[0][0])
+
+    async def test_stats_privately_show_the_logged_model_cost_and_context_without_the_transcript(self):
+        t = dict(self.logged, llm="haiku", llm_model="synthetic/previous-haiku", cost=.0016, byok_cost=.0015,
+                 requests=2, seconds=1.2, llm_window=1_000_000, llm_prompt_tokens=9_800,
+                 llm_prompt_chars=30_000, llm_chat_chars=20_000, llm_cached_tokens=8_000,
+                 llm_messages=420, llm_completion_tokens=18, transcript="Synthetic chat that Stats should not quote")
+        j.write_trace(t)
+        interaction = self.interaction()
+        with patch.object(j, "model_name", "flash"), patch.object(j, "stats_response", wraps=j.stats_response) as stats, \
+                patch.object(j, "llm", new_callable=AsyncMock) as llm, \
+                patch.object(j, "post", new_callable=AsyncMock) as post:
+            await j.stats_action.callback(interaction, self.target(t))
+            await j.stats_action.callback(self.interaction(), self.target(t, original=True))
+        content = self.sent[0][0]
+        self.assertIn("**Model:** **haiku** (`synthetic/previous-haiku`)", content)
+        self.assertIn("**Cost:** $0.001600 USD\n- OpenRouter: $0.000100 USD\n- own API key: $0.001500 USD", content)
+        self.assertIn("Includes all logged API requests, checks and retries.", content)
+        self.assertIn("**API requests:** 2\n**Time:** 1.2s", content)
+        self.assertIn("9,800 of 1,000,000 tokens in its window — 1.0% used, 99.0% free", content)
+        self.assertIn("- prompt: ~2,800 tokens\n- chat: ~7,000 tokens (420 messages)", content)
+        self.assertIn("- read from the cache: 8,000 tokens\n- output: 18 tokens", content)
+        self.assertIn("split is estimated; cached tokens are included in the input total", content)
+        self.assertNotIn(t["transcript"], content)
+        self.assertEqual(content, self.sent[1][0])
+        self.assertLessEqual(len(content), j.CONTEXT_LIMIT)
+        self.assertEqual(len(self.uploads), 0)
+        stats.assert_called_once()
+        llm.assert_not_awaited()
+        post.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        self.assertTrue(self.sent[0][3]["ephemeral"])
+        self.assertEqual(self.sent[0][3]["allowed_mentions"].to_dict()["parse"], [])
+
+    async def test_stats_find_jev_replies_reactions_and_posted_statuses(self):
+        with patch.object(j, "STATUS_CHANNEL", self.channel.id), patch.object(j, "model_name", "haiku"):
+            for name, t, original in [
+                    ("reply", dict(self.logged, cost=.02, requests=8), False),
+                    ("reaction", dict(self.logged, reaction="👍", reply=None, cost=.00001, requests=2), True),
+                    ("status", {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40,
+                                "bot_name": "Testbot", "cost": .04008, "requests": 10}, False)]:
+                with self.subTest(name=name):
+                    j.write_trace(t)
+                    await j.stats_action.callback(self.interaction(), self.target(t, original=original))
+                    content = self.sent[-1][0]
+                    self.assertIn("**Model:** **jev** (`~typesafe/jev-latest`)", content)
+                    self.assertIn(f"**Cost:** ${t['cost']:.6f} USD", content)
+                    self.assertIn(f"**API requests:** {t['requests']}", content)
+                    self.assertIn("Context token usage wasn't logged for Jev's decision requests", content)
+
+    async def test_stats_for_an_llm_status_show_its_accepted_usage_and_total_retry_cost(self):
+        t = {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40, "bot_name": "Testbot",
+             "llm": "haiku", "llm_model": "synthetic/haiku", "cost": .00108, "byok_cost": .001,
+             "requests": 4, "llm_window": 1_000_000, "llm_prompt_tokens": 3_000, "llm_prompt_chars": 10_000,
+             "llm_chat_chars": 0, "llm_cached_tokens": 2_500, "llm_completion_tokens": 18,
+             "status_attempts": [{"accepted": False, "llm_prompt_tokens": 2_000, "llm_cached_tokens": 1_500},
+                                 {"accepted": True, "llm_prompt_tokens": 3_000, "llm_cached_tokens": 2_500}]}
+        with patch.object(j, "STATUS_CHANNEL", self.channel.id):
+            j.write_trace(t)
+            await j.stats_action.callback(self.interaction(), self.target(t))
+        content = self.sent[-1][0]
+        self.assertIn("**Model:** **haiku** (`synthetic/haiku`)", content)
+        self.assertIn("**Cost:** $0.001080 USD\n- OpenRouter: $0.000080 USD\n- own API key: $0.001000 USD", content)
+        self.assertIn("3,000 of 1,000,000 tokens", content)
+        self.assertIn("- read from the cache: 2,500 tokens\n- output: 18 tokens", content)
+        self.assertNotIn("2,000", content)
+        self.assertNotIn("1,500", content)
+
+    async def test_stats_handle_missing_usage_zero_cost_and_out_of_credit(self):
+        for name, fields, model, cost in [
+                ("old Jev log", {}, "**jev**", "not logged"),
+                ("old LLM log", {"llm": "haiku"}, "**haiku**", "not logged"),
+                ("free LLM request", {"llm": "kimi", "cost": 0, "llm_completion_tokens": 0},
+                 "**kimi**", "$0.000000 USD"),
+                ("out of credit", {"reply": j.NO_MONEY[0], "cost": 0, "requests": 0},
+                 "none (out of credit)", "$0.000000 USD"),
+                ("LLM out of credit", {"llm": "haiku", "reply": j.NO_MONEY[0], "cost": 0, "requests": 0},
+                 "none (out of credit)", "$0.000000 USD")]:
+            with self.subTest(name=name):
+                t = dict(self.logged, **fields)
+                j.write_trace(t)
+                await j.stats_action.callback(self.interaction(), self.target(t))
+                content = self.sent[-1][0]
+                self.assertIn(f"**Model:** {model}", content)
+                self.assertIn(f"**Cost:** {cost}", content)
+                if "out of credit" in name:
+                    self.assertIn("No generation request was made", content)
+                else:
+                    self.assertIn("Context token usage wasn't logged", content)
+                if name == "old LLM log":
+                    self.assertIn("(model ID not logged)", content)
+                    self.assertNotIn(j.LLMS["haiku"]["id"], content)
+                if name == "free LLM request":
+                    self.assertIn("- output: 0 tokens", content)
+
+    async def test_stats_show_exact_input_without_a_character_split_and_a_zero_cache_hit(self):
+        t = dict(self.logged, llm="kimi", llm_window=262_144, llm_prompt_tokens=100, llm_cached_tokens=0)
+        j.write_trace(t)
+        await j.stats_action.callback(self.interaction(), self.target(t))
+        content = self.sent[-1][0]
+        self.assertIn("100 of 262,144 tokens", content)
+        self.assertIn("- read from the cache: 0 tokens", content)
+        self.assertNotIn("- prompt:", content)
+        self.assertNotIn("- chat:", content)
+
+    async def test_stats_handle_zero_input_and_a_missing_window_in_partial_logs(self):
+        for window, expected in [(262_144, "0 of 262,144 tokens in its window — 0.0% used, 100.0% free"),
+                                 (None, "Context token usage wasn't logged for this answer")]:
+            with self.subTest(window=window):
+                t = dict(self.logged, llm="kimi", llm_window=window, llm_prompt_tokens=0, llm_prompt_chars=100)
+                j.write_trace(t)
+                await j.stats_action.callback(self.interaction(), self.target(t))
+                self.assertIn(expected, self.sent[-1][0])
+
+    async def test_stats_require_a_matching_target_in_the_same_channel_and_existing_logs(self):
+        j.write_trace(dict(self.logged, cost=.02))
+        await j.stats_action.callback(self.interaction(), self.target())
+        edited = self.target()
+        edited.content = "Changed reply"
+        await j.stats_action.callback(self.interaction(), edited)
+        wrong_id = self.target()
+        wrong_id.id = 99
+        await j.stats_action.callback(self.interaction(), wrong_id)
+        elsewhere = self.interaction()
+        elsewhere.channel_id = 301
+        await j.stats_action.callback(elsewhere, self.target())
+        next(j.LOG_DIR.glob("*.jsonl")).unlink()
+        await j.stats_action.callback(self.interaction(), self.target())
+        self.assertTrue(all(s[0] == "Nothing logged for that" for s in self.sent[1:]))
 
     async def test_a_private_upload_is_reused_with_all_signing_parameters(self):
         j.write_trace(self.logged)
