@@ -303,33 +303,33 @@ class MemoryTests(_Case):
         self.assertNotIn("knows from earlier", llm.call_args.args[1][1]["content"])
 
     async def test_the_keeper_keeps_and_drops_facts_and_its_text_goes_nowhere(self):
-        llm = AsyncMock(side_effect=[("I'll save that first.", [], [tool_call("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
-                                     ("Done.", [], [])])
+        llm = AsyncMock(return_value=("I'll save that first.", [], [tool_call("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]))
         with patch.object(j, "llm", llm):
             await j.keep_memories("haiku", "my cat is called biscuit", "Pip", "rocky", [], "Biscuit. Good name.", self.mind)
         fact, = j.memories["400"]["facts"]
         self.assertEqual((fact["about"], fact["uid"], fact["fact"], fact["by"]), ("pip", "501", "has a cat called Biscuit", "501"))
-        first, second = llm.call_args_list
+        first, = llm.call_args_list  # one request, not asked again after its calls
         self.assertEqual(first.kwargs, {"tools": j.MEMORY_TOOLS})
         ask = first.args[1][1]["content"]
         self.assertIn("Pip: my cat is called biscuit\nrocky: Biscuit. Good name.", ask)
         self.assertIn("Nothing remembered here yet.", ask)
-        self.assertEqual(second.args[1][-1], {"role": "tool", "tool_call_id": "call_1", "content": "Remembered as [1]."})
         self.assertIn("memory_cost", self.trace)
 
-        llm = AsyncMock(side_effect=[("", [], [tool_call("forget", {"number": 1}), tool_call("remember", {"about": "Pip", "fact": "has two cats"}, 2)]),
-                                     ("", [], [])])
+        llm = AsyncMock(return_value=("", [], [tool_call("forget", {"number": 1}), tool_call("remember", {"about": "Pip", "fact": "has two cats"}, 2)]))
         with patch.object(j, "llm", llm):
             await j.keep_memories("haiku", "biscuit has a sister now", "Pip", "rocky", [], "Two cats!", self.mind)
         self.assertIn("[1] Pip: has a cat called Biscuit", llm.call_args_list[0].args[1][1]["content"])  # numbered, for forget
         self.assertEqual(j.memory_lines("400", self.mind["people"]), ["[2] Pip: has two cats"])
         self.assertEqual([c["result"] for c in self.trace["memory_calls"][-2:]], ["Forgot [1].", "Remembered as [2]."])
 
-    async def test_the_keeper_stops_after_its_rounds(self):
-        llm = AsyncMock(return_value=("", [], [tool_call("remember", {"about": "pip", "fact": "likes tea"})]))
+    async def test_a_failed_call_is_logged_and_the_rest_still_happen(self):
+        llm = AsyncMock(return_value=("", [], [{"id": "x", "function": {"name": "remember", "arguments": '{"about": "pip"'}},
+                                               tool_call("remember", {"about": "pip", "fact": "likes tea"}, 2)]))
         with patch.object(j, "llm", llm):
             await j.keep_memories("haiku", "tea", "Pip", "rocky", [], "Tea good.", self.mind)
-        self.assertEqual(llm.await_count, j.MEMORY_ROUNDS)
+        llm.assert_awaited_once()
+        self.assertEqual(j.memory_lines("400", self.mind["people"]), ["[1] Pip: likes tea"])
+        self.assertIn("didn't work", self.trace["memory_calls"][0]["result"])
 
     def test_a_bad_call_is_told_what_went_wrong(self):
         self.assertIn("didn't work", j.use_memory({"id": "x", "function": {"name": "remember", "arguments": "{oops"}}, self.mind))

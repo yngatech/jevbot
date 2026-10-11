@@ -936,7 +936,6 @@ MEMORY_TOOLS = [
 # latest messages: ...") — told not to, it kept a third as much. At 200 it ran out in 13 of 27 requests and its calls
 # came back cut off ('{"about": "beeves"', '{}'); its longest since, 329.
 LLM_TOOL_MAX_TOKENS = 1000
-MEMORY_ROUNDS = 2          # the keeper's turns with the tools, after one reply
 
 LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
 
@@ -1037,7 +1036,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None):
 
 # name: one of LLMS — passed in, since !model can switch while a reply is being written. pages: a long chat's frozen
 # pages, before `history` — in LONG_CHAT_CHANNELS, else None.
-# A remember or forget call carried out, and what it's told came of it
+# A remember or forget call carried out, and what came of it, for the trace
 def use_memory(call, mind):
     f = call.get("function") or {}
     try:
@@ -1107,14 +1106,12 @@ async def keep_memories(name, message, author, bot_name, history, reply, mind, a
     ask = (f"The last few messages:\n\n{recent_chat}\n\n"
            + ("Remembered here:\n" + "\n".join(lines) if lines else "Nothing remembered here yet.")
            + f"\n\nAnything in {author}'s last message or {bot_name}'s reply to keep, or change?")
-    convo = [{"role": "system", "content": MEMORY_KEEPER.format(bot=bot_name)}, {"role": "user", "content": ask}]
     cost = (t := trace.get()) and t["cost"]
-    for turn in range(MEMORY_ROUNDS):
-        text, _, calls = await llm(name, convo, tools=MEMORY_TOOLS)
-        if not calls:
-            break
-        convo += [{"role": "assistant", "content": text or None, "tool_calls": calls},
-                  *[{"role": "tool", "tool_call_id": c["id"], "content": use_memory(c, mind)} for c in calls]]
+    # One request: it makes every call it needs at once, and isn't asked again — what came of them is only logged
+    _, _, calls = await llm(name, [{"role": "system", "content": MEMORY_KEEPER.format(bot=bot_name)},
+                                   {"role": "user", "content": ask}], tools=MEMORY_TOOLS)
+    for c in calls:
+        use_memory(c, mind)
     if t is not None:
         t["memory_cost"] = t["cost"] - cost
 
