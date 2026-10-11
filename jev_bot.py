@@ -1765,7 +1765,6 @@ class CachedExplanation:
     filename: str | None = None
     expires: float | None = None
     embeds: tuple[dict, ...] = ()
-    text_url: str | None = None
 
 @dataclass(frozen=True)
 class Explanation:
@@ -1939,13 +1938,6 @@ def keep_explanation(key, response):
 async def send_cached_explanation(send, response):
     if response.embeds:
         embeds = [discord.Embed.from_dict(copy.deepcopy(data)) for data in response.embeds]
-        text_url = response.text_url or (response.url if response.filename == "context.txt" else None)
-        for embed in embeds:
-            if embed.image.url and embed.image.url.startswith("attachment://"):
-                embed.set_image(url=response.url)
-            if text_url and embed.description:
-                embed.description = embed.description.replace(CONTEXT_ATTACHMENT_NOTICE,
-                                                               f"[Full transcript]({text_url})")
         await send(response.content, **embed_options(embeds))
     elif response.url is None:
         await send(response.content)
@@ -1981,11 +1973,8 @@ async def send_explanation(kind, channel_id, guild, t, send):
             if cached and cached.url:
                 if cached.expires <= time.time() + EXPLANATION_EXPIRY_MARGIN:
                     cached = None
-                elif validate:
-                    for url in (cached.url, cached.text_url):
-                        if url and not await explanation_attachment_available(url):
-                            cached = None
-                            break
+                elif validate and not await explanation_attachment_available(cached.url):
+                    cached = None
             if cached:
                 try:
                     await send_cached_explanation(send, cached)
@@ -2001,38 +1990,28 @@ async def send_explanation(kind, channel_id, guild, t, send):
                 response = Explanation(content, files=((filename, data),) if data is not None else ())
             elif kind == "stats":
                 response = Explanation(embeds=(stats_response(t),))
-            elif kind == "diagnostics":
-                response = Explanation(embeds=(diagnostics_response(t),))
             else:
-                response = await asyncio.to_thread(context_response, t, bot_name)
+                response = Explanation(embeds=(diagnostics_response(t),))
             embeds = tuple(embed.to_dict() for embed in response.embeds)
             cached = CachedExplanation(response.content, embeds=embeds)
             if not response.files:
                 await send(response.content, **embed_options(response.embeds))
             else:
-                files = [discord.File(io.BytesIO(data), filename) for filename, data in response.files]
+                (filename, data), = response.files
+                file = discord.File(io.BytesIO(data), filename)
                 try:
-                    options = {"file": files[0]} if len(files) == 1 else {"files": files}
-                    sent = await send(response.content, **options, **embed_options(response.embeds))
+                    sent = await send(response.content, file=file)
                 finally:
-                    for file in files:
-                        file.close()
-                        file.fp.close()
-                # Discord consumes an image used by attachment:// into the embed: it may no longer be listed
-                # under attachments in the response. Its signed image URL is still reusable.
-                attachments = {getattr(a, "filename", urlsplit(a.url).path.rsplit("/", 1)[-1]): a.url
-                               for a in getattr(sent, "attachments", ())}
-                for embed in getattr(sent, "embeds", ()):
-                    if url := embed.image.url:
-                        attachments.setdefault(urlsplit(url).path.rsplit("/", 1)[-1], url)
-                urls = [attachments.get(filename) for filename, _ in response.files]
-                if not all(urls):
-                    return None  # delivered, but without every URL to reuse
-                expires = min(map(explanation_expiry, urls))
+                    file.close()
+                    file.fp.close()
+                url = next((a.url for a in getattr(sent, "attachments", ())
+                            if getattr(a, "filename", urlsplit(a.url).path.rsplit("/", 1)[-1]) == filename), None)
+                if url is None:
+                    return None  # delivered, but without a URL to reuse
+                expires = explanation_expiry(url)
                 if expires <= time.time() + EXPLANATION_EXPIRY_MARGIN:
                     return None
-                cached = CachedExplanation(response.content, urls[0], response.files[0][0], expires, embeds,
-                                           urls[1] if len(urls) > 1 else None)
+                cached = CachedExplanation(response.content, url, filename, expires)
             keep_explanation(key, cached)
             return cached
         finally:
@@ -2119,10 +2098,17 @@ async def explain_context(channel_id, guild, target, send):
     if t is None:
         await send("Nothing logged for that")
         return
-    await send_explanation("context", channel_id, guild, t, send)
+    bot_name = t.get("bot_name") or (guild.me if guild else bot.user).display_name
+    response = await asyncio.to_thread(context_response, t, bot_name)
+    files = [discord.File(io.BytesIO(data), filename) for filename, data in response.files]
+    try:
+        await send(**({"files": files} if files else {}), **embed_options(response.embeds))
+    finally:
+        for file in files:
+            file.close()
+            file.fp.close()
 
 EXPLANATION_COLOR = 0x8796FF
-CONTEXT_ATTACHMENT_NOTICE = "Full transcript attached as **context.txt**."
 
 
 def model_label(t):
@@ -2152,35 +2138,36 @@ def money(cost):
     return f"${cost:.6f} USD" if cost is not None else "Not recorded"
 
 
+# One embed: the transcript, then the logged counts as fields, with a chart of them at the bottom. A long
+# transcript is attached instead, which Discord shows above the embed and can open without downloading — so it's
+# uploaded again each time rather than cached as a link.
 def context_response(t, bot_name):
     text = logged_context(t)
-    tokens, window = t.get("llm_prompt_tokens"), t.get("llm_window")
-    embeds, files = [], []
-    if not t.get("reaction") and tokens is not None:
-        usage = discord.Embed(title="Context", description=f"**{model_label(t)}** · {context_usage(t)}",
-                              color=EXPLANATION_COLOR)
-        if window:
-            usage.set_image(url="attachment://context-usage.png")
-            files.append(("context-usage.png", context_chart.render(tokens, window, t.get("llm_cached_tokens"))))
-        detail = []
-        if (count := chat_message_count(t)) is not None:
-            detail.append(f"{count:,} chat messages")
-        if (output := t.get("llm_completion_tokens")) is not None:
-            detail.append(f"{output:,} output tokens")
-        if detail:
-            usage.set_footer(text=" · ".join(detail))
-        embeds.append(usage)
-    title = f"What {bot_name} saw" if embeds else f"Context · What {bot_name} saw"
+    tokens, window, cached = t.get("llm_prompt_tokens"), t.get("llm_window"), t.get("llm_cached_tokens")
+    files = []
     if len(text) <= CONTEXT_LIMIT:
         description = f"```\n{unfence(text)}\n```"
     else:
-        description = CONTEXT_ATTACHMENT_NOTICE
+        description = None
         files.append(("context.txt", text.encode()))
-    context = discord.Embed(title=title, description=description, color=EXPLANATION_COLOR)
+    embed = discord.Embed(title=f"What {bot_name} saw", description=description, color=EXPLANATION_COLOR)
+    embed.add_field(name="Model", value=model_label(t))
+    if (count := chat_message_count(t)) is not None:
+        embed.add_field(name="Chat messages", value=f"{count:,}")
+    if not t.get("reaction") and tokens is not None:
+        if (output := t.get("llm_completion_tokens")) is not None:
+            embed.add_field(name="Output", value=f"{output:,} tokens")
+        embed.add_field(name="Context window", value=context_usage(t), inline=False)
+        if context_chart.cache_known(tokens, cached):
+            embed.add_field(name="Input cache", value=f"{cached:,} cached · {tokens - cached:,} uncached · "
+                                                      f"{context_chart.percentage(cached, tokens)} cached",
+                            inline=False)
+        if window:
+            embed.set_image(url="attachment://context-usage.png")
+            files.insert(0, ("context-usage.png", context_chart.render(tokens, window, cached)))
     if t.get("no_context"):
-        context.set_footer(text="!nocontext · this side conversation")
-    embeds.append(context)
-    return Explanation(embeds=tuple(embeds), files=tuple(files))
+        embed.set_footer(text="!nocontext · this side conversation")
+    return Explanation(embeds=(embed,), files=tuple(files))
 
 
 # Stats and Diagnostics use the same logged response and never make a model request.
