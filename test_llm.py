@@ -87,6 +87,28 @@ class ModelCommandTests(_Case):
 
 
 class ReplyTests(_Case):
+    async def test_reply_records_the_jev_decision_and_haiku_generation_separately(self):
+        j.model_name = "haiku"
+        responses = []
+        for data in [{"answers": {"asked": {"noul": .9}}, "usage": {"cost": .000081}},
+                     {"choices": [{"message": {"content": "Coffee first. Then walk."}}],
+                      "usage": {"cost": 0, "is_byok": True,
+                                "cost_details": {"upstream_inference_cost": .000577}}}]:
+            response = MagicMock()
+            response.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value=data))
+            responses.append(response)
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.side_effect = responses
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+            self.assertIsNone(await j.choose_reaction("coffee?", "Moss", "Rocky", ["☕"]))
+            reply = await j.generate_reply("coffee?", "Moss", "Rocky", history=[])
+        self.assertEqual(reply, "Coffee first. Then walk.")
+        self.assertEqual([r["purpose"] for r in self.trace["api_calls"]], ["decision", "reply"])
+        self.assertEqual([r["is_byok"] for r in self.trace["api_calls"]], [False, True])
+        self.assertEqual(self.trace["requests"], 2)
+        self.assertAlmostEqual(self.trace["cost"], .000658)
+
     async def test_reply_goes_to_the_chosen_model_and_is_cleaned(self):
         j.model_name = "deepseek"
         llm = AsyncMock(return_value=('rocky: "Is called Biscuit. Small predator."\nrocky: more', TOKENS))
@@ -141,6 +163,11 @@ class ReplyTests(_Case):
                     await j.llm("haiku", [{"role": "user", "content": "cat?"}])
                 self.assertAlmostEqual(self.trace["cost"], cost)
                 self.assertEqual(self.trace.get("byok_cost"), byok)
+                request, = self.trace["api_calls"]
+                self.assertEqual(request["model"], j.LLMS["haiku"]["id"])
+                self.assertEqual(request["purpose"], "reply")
+                self.assertEqual(request["is_byok"], bool(byok))
+                self.assertAlmostEqual(request["router_cost"] + request["key_cost"], cost)
 
     async def test_a_rate_limited_pinned_provider_is_tried_again_before_any_other(self):
         sent = []
@@ -164,6 +191,9 @@ class ReplyTests(_Case):
         self.assertEqual(text, "Is Biscuit.")
         self.assertEqual([p.get("allow_fallbacks") for p in sent], [False, False, True])
         self.assertTrue(all(p["order"] == ["parasail"] and p["require_parameters"] for p in sent))
+        self.assertEqual([r["status"] for r in self.trace["api_calls"]], [429, 429, 200])
+        self.assertEqual([r["attempt"] for r in self.trace["api_calls"]], [0, 1, 2])
+        self.assertTrue(all(r["router_cost"] is None for r in self.trace["api_calls"]))
 
     async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
         session = MagicMock()
@@ -244,6 +274,30 @@ class ReplyTests(_Case):
 
 
 class StatusTests(_Case):
+    async def test_rejected_status_preserves_all_request_purposes_and_accepted_context(self):
+        j.model_name = "haiku"
+        responses = []
+        for size, score in [(2_000, .1), (3_000, .9)]:
+            for data in [{"choices": [{"message": {"content": "I feel coffee is good."}}],
+                          "usage": {"prompt_tokens": size, "completion_tokens": 18, "cost": 0,
+                                    "is_byok": True, "cost_details": {"upstream_inference_cost": .0004}}},
+                         {"answers": {"acceptable": {"noul": score}}, "usage": {"cost": .00004}}]:
+                response = MagicMock()
+                response.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value=data))
+                responses.append(response)
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.side_effect = responses
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+            mood = await j.generate_filtered_status("Rocky", ["i", "feel"], "Moss: coffee")
+        self.assertEqual(mood, "I feel coffee is good.")
+        self.assertEqual([r["purpose"] for r in self.trace["api_calls"]],
+                         ["status", "status_check", "status", "status_check"])
+        self.assertEqual(self.trace["llm_prompt_tokens"], 3_000)
+        self.assertEqual(self.trace["requests"], 4)
+        self.assertAlmostEqual(self.trace["cost"], .00088)
+        self.assertAlmostEqual(self.trace["byok_cost"], .0008)
+
     async def test_status_keeps_its_opener_on_one_line(self):
         j.model_name = "deepseek"
         for answer, want in [("I wonder if sleep is same\nwhen no one watches.", "I wonder if sleep is same when no one watches."),
