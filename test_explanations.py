@@ -1,4 +1,4 @@
-"""Offline checks for Why, Context and Stats answers, using synthetic logs and Discord sends.
+"""Offline checks for diagnostic actions, using synthetic logs and Discord sends.
 
     uv run --with-requirements requirements.txt python -m unittest test_explanations
 """
@@ -52,20 +52,30 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
 
     async def capture(self, content=None, **kwargs):
         file = kwargs.get("file")
+        files = kwargs.get("files") or ([file] if file is not None and file is not discord.utils.MISSING else [])
         data = None
         attachments = []
-        if file is not None and file is not discord.utils.MISSING:
-            data = file.fp.read()
+        for uploaded in files:
+            uploaded_data = uploaded.fp.read()
+            if data is None:
+                file, data = uploaded, uploaded_data
             route = "ephemeral-attachments" if kwargs.get("ephemeral") else "attachments"
             expires = int(time.time()) + 3600
-            url = (f"https://cdn.discordapp.com/{route}/300/{900 + len(self.uploads)}/{file.filename}"
+            url = (f"https://cdn.discordapp.com/{route}/300/{900 + len(self.uploads)}/{uploaded.filename}"
                    f"?ex={expires:x}&is={expires - 3600:x}&hm=synthetic-signature")
-            self.uploads[url] = data  # a stand-in for Discord's hosted files, outside the bot's cache
-            attachments = [SimpleNamespace(url=url)]
-            file.close()
-            file.fp.close()
+            self.uploads[url] = uploaded_data  # Discord's hosted files, outside the bot's cache
+            attachments.append(SimpleNamespace(url=url, filename=uploaded.filename))
+            uploaded.close()
+            uploaded.fp.close()
         self.sent.append((content, file, data, kwargs))
         return SimpleNamespace(attachments=attachments)
+
+    def embeds(self, sent=None):
+        options = (sent or self.sent[-1])[3]
+        return options.get("embeds") or [options["embed"]]
+
+    def fields(self, sent=None):
+        return {field.name: field.value for field in self.embeds(sent)[0].fields}
 
     def chart_bytes(self, sent):
         return sent[2] if sent[2] is not None else self.uploads[sent[3]["embed"].image.url]
@@ -128,7 +138,8 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(self.sent[1][1], discord.utils.MISSING)
         cached, = j.explanation_cache.values()
         self.assertEqual(cached.url, url)
-        self.assertTrue(all(value is None or isinstance(value, (str, int, float)) for value in vars(cached).values()))
+        json.dumps(vars(cached))  # cached metadata can be serialized; attachment bytes cannot
+        self.assertEqual(cached.embeds, ())
         self.assertTrue(self.sent[1][3]["ephemeral"])
         self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
         interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
@@ -143,60 +154,96 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                     await j.context_action.callback(self.interaction(), self.target())
                     await j.context_action.callback(self.interaction(), self.target())
                 context.assert_called_once()
+                first, second = self.embeds(self.sent[0])[0], self.embeds(self.sent[1])[0]
                 if len(text) > j.CONTEXT_LIMIT:
                     self.assertEqual(self.sent[0][2], text.encode())
                     self.assertEqual(self.sent[0][1].filename, "context.txt")
                     self.assertIs(self.sent[1][1], discord.utils.MISSING)
-                    url = next(reversed(self.uploads))
-                    self.assertEqual(self.sent[1][0], f"{self.sent[0][0]}\n[context.txt]({url})")
+                    self.assertIn(next(reversed(self.uploads)), second.description)
                 else:
-                    self.assertEqual(self.sent[0][0], self.sent[1][0])
-                    self.assertIn(j.unfence(text), self.sent[0][0])
+                    self.assertEqual(first.to_dict(), second.to_dict())
+                    self.assertIn(j.unfence(text), first.description)
                     self.assertIs(self.sent[0][1], discord.utils.MISSING)
                 self.assertTrue(self.sent[1][3]["ephemeral"])
                 self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
 
-    async def test_context_shows_how_much_of_an_llms_window_it_used(self):
-        usage = {"llm": "haiku", "llm_window": 1_000_000, "llm_prompt_tokens": 9_800, "llm_prompt_chars": 30_000,
-                 "llm_chat_chars": 20_000, "history": [{"author": "Speaker", "content": "hi"}] * 199}
-        with patch.object(j, "STATUS_CHANNEL", self.channel.id):
-            for name, t, chat in [
-                    ("reply", dict(self.logged, **usage), "~7,000 tokens (200 messages)"),
-                    ("long reply", dict(self.logged, **usage, transcript="Speaker: " + "tea " * 600),
-                     "~7,000 tokens (200 messages)"),
-                    ("status", {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40,
-                                "bot_name": "Testbot", "transcript": "Recent chat", **usage}, "~7,000 tokens\n")]:
-                with self.subTest(name):
-                    self.sent.clear()
-                    j.write_trace(t)
+    async def test_context_uses_exact_window_and_cache_counts_and_preserves_the_transcript(self):
+        for long in (False, True):
+            with self.subTest(long=long):
+                t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=18_673,
+                         llm_cached_tokens=14_533, llm_messages=291, llm_completion_tokens=24,
+                         transcript="Speaker: " + "tea " * (600 if long else 1))
+                j.write_trace(t)
+                self.sent.clear()
+                self.uploads.clear()
+                j.explanation_cache.clear()
+                with patch.object(j.context_chart, "render", wraps=j.context_chart.render) as render:
                     await j.context_action.callback(self.interaction(), self.target(t))
-                    content = self.sent[0][0]
-                    # chat's 20,000 characters count 1.25 times against the prompt's other 10,000: 7,000 of 9,800
-                    self.assertIn("**haiku**: 9,800 of 1,000,000 tokens in its window — 1.0% used, 99.0% free\n"
-                                  "- prompt: ~2,800 tokens\n- chat: " + chat, content + "\n")
-                    self.assertLess(content.index("free"), content.index("```") if "```" in content else len(content))
+                    await j.context_action.callback(self.interaction(), self.target(t))
+                render.assert_called_once_with(18_673, 1_000_000, 14_533)
+                usage, transcript = self.embeds(self.sent[0])
+                self.assertIn("18,673 / 1,000,000 tokens · 1.9% used", usage.description)
+                self.assertEqual(usage.footer.text, "291 chat messages · 24 output tokens")
+                image_url = next(url for url in self.uploads if "context-usage.png" in url)
+                self.assertTrue(self.uploads[image_url].startswith(b"\x89PNG\r\n\x1a\n"))
+                self.assertEqual(self.embeds(self.sent[1])[0].image.url, image_url)
+                self.assertEqual(len(self.uploads), 2 if long else 1)
+                if long:
+                    text_url = next(url for url in self.uploads if "context.txt" in url)
+                    self.assertEqual(self.uploads[text_url], t["transcript"].encode())
+                    self.assertIn(text_url, self.embeds(self.sent[1])[1].description)
+                else:
+                    self.assertIn(t["transcript"], transcript.description)
+                self.assertNotIn("estimated", json.dumps([e.to_dict() for e in self.embeds(self.sent[0])]))
+                cached, = j.explanation_cache.values()
+                json.dumps(vars(cached))
 
-    async def test_context_shows_a_long_chats_cache_and_all_its_messages(self):
-        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=9_800, llm_prompt_chars=30_000,
-                 llm_chat_chars=20_000, llm_cached_tokens=8_000, llm_messages=420)
-        j.write_trace(t)
-        await j.context_action.callback(self.interaction(), self.target(t))
-        self.assertIn("- chat: ~7,000 tokens (420 messages)\n- read from the cache: 8,000 tokens\n", self.sent[0][0])
+    async def test_a_deleted_context_transcript_attachment_remakes_both_files(self):
+        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=100,
+                 transcript="Speaker: " + "tea " * 600)
+        with patch.object(j.context_chart, "render", return_value=b"chart") as render:
+            await j.send_explanation("context", 300, self.guild, t, self.capture)
+            self.available.side_effect = [True, False]
+            await j.send_explanation("context", 300, self.guild, t, self.capture)
+        self.assertEqual(render.call_count, 2)
+        self.assertEqual(len(self.uploads), 4)
+        self.assertEqual(self.available.await_count, 2)
 
-    async def test_context_for_jev_or_an_older_log_has_no_window_usage(self):
+    async def test_context_reuses_images_consumed_into_discord_embeds(self):
+        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=100,
+                 transcript="Speaker: " + "tea " * 600)
+
+        async def consume_image(content=None, **options):
+            sent = await self.capture(content, **options)
+            image, transcript = sent.attachments
+            embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in options["embeds"]]
+            embeds[0].set_image(url=image.url)
+            return SimpleNamespace(attachments=[transcript], embeds=embeds)
+
+        with patch.object(j.context_chart, "render", return_value=b"chart") as render:
+            await j.send_explanation("context", 300, self.guild, t, consume_image)
+            await j.send_explanation("context", 300, self.guild, t, self.capture)
+        render.assert_called_once()
+        self.assertEqual(len(self.uploads), 2)
+        image_url, text_url = self.uploads
+        self.assertEqual(self.embeds()[0].image.url, image_url)
+        self.assertIn(text_url, self.embeds()[1].description)
+
+    async def test_context_for_jev_or_an_older_log_has_a_transcript_without_a_made_up_chart(self):
         for t in (self.logged, dict(self.logged, llm="haiku")):
             with self.subTest(llm=t.get("llm")):
-                self.sent.clear()
                 j.write_trace(t)
                 await j.context_action.callback(self.interaction(), self.target(t))
-                self.assertTrue(self.sent[0][0].startswith('What Testbot saw before replying to "tea?":\n```'))
-                self.assertNotIn("window", self.sent[0][0])
+                embed, = self.embeds()
+                self.assertIn("What Testbot saw", embed.title)
+                self.assertIn(t["transcript"], embed.description)
+                self.assertFalse(embed.image.url)
 
-    async def test_stats_privately_show_the_logged_model_cost_and_context_without_the_transcript(self):
+    async def test_stats_privately_show_only_model_total_cost_and_context_without_a_model_call(self):
         t = dict(self.logged, llm="haiku", llm_model="synthetic/previous-haiku", cost=.0016, byok_cost=.0015,
                  requests=2, seconds=1.2, llm_window=1_000_000, llm_prompt_tokens=9_800,
-                 llm_prompt_chars=30_000, llm_chat_chars=20_000, llm_cached_tokens=8_000,
-                 llm_messages=420, llm_completion_tokens=18, transcript="Synthetic chat that Stats should not quote")
+                 llm_cached_tokens=8_000, llm_messages=420, llm_completion_tokens=18,
+                 transcript="Synthetic chat that Stats should not quote")
         j.write_trace(t)
         interaction = self.interaction()
         with patch.object(j, "model_name", "flash"), patch.object(j, "stats_response", wraps=j.stats_response) as stats, \
@@ -204,18 +251,10 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(j, "post", new_callable=AsyncMock) as post:
             await j.stats_action.callback(interaction, self.target(t))
             await j.stats_action.callback(self.interaction(), self.target(t, original=True))
-        content = self.sent[0][0]
-        self.assertIn("**Model:** **haiku** (`synthetic/previous-haiku`)", content)
-        self.assertIn("**Cost:** $0.001600 USD\n- OpenRouter: $0.000100 USD\n- own API key: $0.001500 USD", content)
-        self.assertIn("Includes all logged API requests, checks and retries.", content)
-        self.assertIn("**API requests:** 2\n**Time:** 1.2s", content)
-        self.assertIn("9,800 of 1,000,000 tokens in its window — 1.0% used, 99.0% free", content)
-        self.assertIn("- prompt: ~2,800 tokens\n- chat: ~7,000 tokens (420 messages)", content)
-        self.assertIn("- read from the cache: 8,000 tokens\n- output: 18 tokens", content)
-        self.assertIn("split is estimated; cached tokens are included in the input total", content)
-        self.assertNotIn(t["transcript"], content)
-        self.assertEqual(content, self.sent[1][0])
-        self.assertLessEqual(len(content), j.CONTEXT_LIMIT)
+        self.assertEqual(self.fields(), {"Model": "Haiku", "Total cost": "$0.001600 USD",
+                                        "Context": "9,800 / 1,000,000 tokens · 1.0% used\n420 chat messages"})
+        self.assertEqual(self.embeds(self.sent[0])[0].to_dict(), self.embeds(self.sent[1])[0].to_dict())
+        self.assertNotIn(t["transcript"], str(self.fields()))
         self.assertEqual(len(self.uploads), 0)
         stats.assert_called_once()
         llm.assert_not_awaited()
@@ -234,75 +273,94 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(name=name):
                     j.write_trace(t)
                     await j.stats_action.callback(self.interaction(), self.target(t, original=original))
-                    content = self.sent[-1][0]
-                    self.assertIn("**Model:** **jev** (`~typesafe/jev-latest`)", content)
-                    self.assertIn(f"**Cost:** ${t['cost']:.6f} USD", content)
-                    self.assertIn(f"**API requests:** {t['requests']}", content)
-                    self.assertIn("Context token usage wasn't logged for Jev's decision requests", content)
+                    self.assertEqual(self.fields()["Model"], "Jev")
+                    self.assertEqual(self.fields()["Total cost"], f"${t['cost']:.6f} USD")
+                    self.assertTrue(self.fields()["Context"].startswith("Not recorded"))
 
-    async def test_stats_for_an_llm_status_show_its_accepted_usage_and_total_retry_cost(self):
+    async def test_stats_for_an_llm_status_show_accepted_usage_and_total_retry_cost(self):
         t = {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40, "bot_name": "Testbot",
              "llm": "haiku", "llm_model": "synthetic/haiku", "cost": .00108, "byok_cost": .001,
-             "requests": 4, "llm_window": 1_000_000, "llm_prompt_tokens": 3_000, "llm_prompt_chars": 10_000,
-             "llm_chat_chars": 0, "llm_cached_tokens": 2_500, "llm_completion_tokens": 18,
-             "status_attempts": [{"accepted": False, "llm_prompt_tokens": 2_000, "llm_cached_tokens": 1_500},
-                                 {"accepted": True, "llm_prompt_tokens": 3_000, "llm_cached_tokens": 2_500}]}
+             "requests": 4, "llm_window": 1_000_000, "llm_prompt_tokens": 3_000,
+             "status_attempts": [{"accepted": False, "llm_prompt_tokens": 2_000},
+                                 {"accepted": True, "llm_prompt_tokens": 3_000}]}
         with patch.object(j, "STATUS_CHANNEL", self.channel.id):
             j.write_trace(t)
             await j.stats_action.callback(self.interaction(), self.target(t))
-        content = self.sent[-1][0]
-        self.assertIn("**Model:** **haiku** (`synthetic/haiku`)", content)
-        self.assertIn("**Cost:** $0.001080 USD\n- OpenRouter: $0.000080 USD\n- own API key: $0.001000 USD", content)
-        self.assertIn("3,000 of 1,000,000 tokens", content)
-        self.assertIn("- read from the cache: 2,500 tokens\n- output: 18 tokens", content)
-        self.assertNotIn("2,000", content)
-        self.assertNotIn("1,500", content)
+        self.assertEqual(self.fields()["Total cost"], "$0.001080 USD")
+        self.assertEqual(self.fields()["Context"], "3,000 / 1,000,000 tokens · 0.3% used")
 
     async def test_stats_handle_missing_usage_zero_cost_and_out_of_credit(self):
-        for name, fields, model, cost in [
-                ("old Jev log", {}, "**jev**", "not logged"),
-                ("old LLM log", {"llm": "haiku"}, "**haiku**", "not logged"),
-                ("free LLM request", {"llm": "kimi", "cost": 0, "llm_completion_tokens": 0},
-                 "**kimi**", "$0.000000 USD"),
-                ("out of credit", {"reply": j.NO_MONEY[0], "cost": 0, "requests": 0},
-                 "none (out of credit)", "$0.000000 USD"),
-                ("LLM out of credit", {"llm": "haiku", "reply": j.NO_MONEY[0], "cost": 0, "requests": 0},
-                 "none (out of credit)", "$0.000000 USD")]:
-            with self.subTest(name=name):
+        for fields, model, cost in [
+                ({}, "Jev", "Not recorded"),
+                ({"llm": "haiku"}, "Haiku", "Not recorded"),
+                ({"llm": "kimi", "cost": 0, "llm_completion_tokens": 0}, "Kimi", "$0.000000 USD"),
+                ({"reply": j.NO_MONEY[0], "cost": 0, "requests": 0}, "None (out of credit)", "$0.000000 USD"),
+                ({"llm": "haiku", "reply": j.NO_MONEY[0], "cost": 0, "requests": 0},
+                 "None (out of credit)", "$0.000000 USD")]:
+            with self.subTest(model=model):
                 t = dict(self.logged, **fields)
                 j.write_trace(t)
                 await j.stats_action.callback(self.interaction(), self.target(t))
-                content = self.sent[-1][0]
-                self.assertIn(f"**Model:** {model}", content)
-                self.assertIn(f"**Cost:** {cost}", content)
-                if "out of credit" in name:
-                    self.assertIn("No generation request was made", content)
-                else:
-                    self.assertIn("Context token usage wasn't logged", content)
-                if name == "old LLM log":
-                    self.assertIn("(model ID not logged)", content)
-                    self.assertNotIn(j.LLMS["haiku"]["id"], content)
-                if name == "free LLM request":
-                    self.assertIn("- output: 0 tokens", content)
+                self.assertEqual(self.fields()["Model"], model)
+                self.assertEqual(self.fields()["Total cost"], cost)
+                self.assertTrue(self.fields()["Context"].startswith("No generation" if model.startswith("None")
+                                                                    else "Not recorded"))
 
-    async def test_stats_show_exact_input_without_a_character_split_and_a_zero_cache_hit(self):
-        t = dict(self.logged, llm="kimi", llm_window=262_144, llm_prompt_tokens=100, llm_cached_tokens=0)
-        j.write_trace(t)
-        await j.stats_action.callback(self.interaction(), self.target(t))
-        content = self.sent[-1][0]
-        self.assertIn("100 of 262,144 tokens", content)
-        self.assertIn("- read from the cache: 0 tokens", content)
-        self.assertNotIn("- prompt:", content)
-        self.assertNotIn("- chat:", content)
-
-    async def test_stats_handle_zero_input_and_a_missing_window_in_partial_logs(self):
-        for window, expected in [(262_144, "0 of 262,144 tokens in its window — 0.0% used, 100.0% free"),
-                                 (None, "Context token usage wasn't logged for this answer")]:
-            with self.subTest(window=window):
-                t = dict(self.logged, llm="kimi", llm_window=window, llm_prompt_tokens=0, llm_prompt_chars=100)
+    async def test_stats_handle_zero_input_and_missing_window_in_partial_logs(self):
+        for tokens, window, expected in [(100, 262_144, "100 / 262,144 tokens · <0.1% used"),
+                                        (0, 262_144, "0 / 262,144 tokens · 0.0% used"),
+                                        (0, None, "0 tokens")]:
+            with self.subTest(tokens=tokens, window=window):
+                t = dict(self.logged, llm="kimi", llm_window=window, llm_prompt_tokens=tokens)
                 j.write_trace(t)
                 await j.stats_action.callback(self.interaction(), self.target(t))
-                self.assertIn(expected, self.sent[-1][0])
+                self.assertTrue(self.fields()["Context"].startswith(expected))
+
+    async def test_diagnostics_explain_request_purposes_routing_and_billing_privately(self):
+        t = dict(self.logged, llm="haiku", cost=.000658, byok_cost=.000577, requests=2, seconds=2.5,
+                 llm_cached_tokens=14_533, llm_completion_tokens=24, api_calls=[
+                     {"model": j.MODEL, "purpose": "decision", "status": 200, "attempt": 0,
+                      "router_cost": .000081, "is_byok": False, "key_cost": 0},
+                     {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "attempt": 0,
+                      "router_cost": 0, "is_byok": True, "key_cost": .000577}])
+        j.write_trace(t)
+        with patch.object(j, "llm", new_callable=AsyncMock) as llm:
+            await j.diagnostics_action.callback(self.interaction(), self.target(t))
+            await j.diagnostics_action.callback(self.interaction(), self.target(t, original=True))
+        fields = self.fields()
+        self.assertEqual(fields["Requests"], "2")
+        self.assertEqual(fields["Total time"], "2.5s")
+        self.assertIn("Jev · 1 request · paid through OpenRouter", fields["Check whether to reply or react"])
+        self.assertIn("$0.000081 USD", fields["Check whether to reply or react"])
+        self.assertIn("Haiku · 1 request · paid through Anthropic key", fields["Write the reply"])
+        self.assertIn("$0.000577 USD", fields["Write the reply"])
+        self.assertIn("Routed through OpenRouter", self.embeds()[0].footer.text)
+        self.assertEqual(self.embeds(self.sent[0])[0].to_dict(), self.embeds(self.sent[1])[0].to_dict())
+        self.assertTrue(self.sent[-1][3]["ephemeral"])
+        llm.assert_not_awaited()
+
+    async def test_diagnostics_handle_old_logs_without_inventing_request_purposes(self):
+        t = dict(self.logged, llm="haiku", cost=.001, byok_cost=.0009, requests=2)
+        j.write_trace(t)
+        await j.diagnostics_action.callback(self.interaction(), self.target(t))
+        self.assertEqual(self.fields()["Requests"], "2")
+        self.assertEqual(self.fields()["Model ID"], "Not recorded")
+        self.assertIn("OpenRouter: $0.000100 USD", self.fields()["Billing"])
+        self.assertNotIn("Write the reply", self.fields())
+        self.assertIn("not recorded", self.embeds()[0].footer.text)
+
+    async def test_diagnostics_count_failed_attempts_and_do_not_price_unknown_failures_as_free(self):
+        t = dict(self.logged, llm="kimi", cost=.001, requests=1, api_calls=[
+            {"model": j.LLMS["kimi"]["id"], "purpose": "reply", "status": 429, "attempt": 0,
+             "router_cost": None, "is_byok": False, "key_cost": 0},
+            {"model": j.LLMS["kimi"]["id"], "purpose": "reply", "status": 200, "attempt": 1,
+             "router_cost": .001, "is_byok": False, "key_cost": 0}])
+        j.write_trace(t)
+        await j.diagnostics_action.callback(self.interaction(), self.target(t))
+        self.assertEqual(self.fields()["Requests"], "2")
+        self.assertIn("1 failed attempt", self.fields()["Write the reply"])
+        self.assertIn("$0.001000 USD reported", self.fields()["Write the reply"])
+        self.assertIn("1 HTTP retries", self.fields()["Retries"])
 
     async def test_stats_require_a_matching_target_in_the_same_channel_and_existing_logs(self):
         j.write_trace(dict(self.logged, cost=.02))
@@ -350,8 +408,8 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(render.call_count, 2)
         self.assertEqual([self.chart_bytes(self.sent[i]) for i in (0, 2, 4)], [b"tea chart", b"coffee chart", b"tea chart"])
         self.assertEqual(len(self.uploads), 2)
-        self.assertIn("tea?", self.sent[1][0])
-        self.assertIn("coffee?", self.sent[3][0])
+        self.assertIn("tea?", self.embeds(self.sent[1])[0].description)
+        self.assertIn("coffee?", self.embeds(self.sent[3])[0].description)
 
     async def test_changed_logs_rerender_even_when_the_reply_text_is_the_same(self):
         j.write_trace(self.logged)
@@ -400,7 +458,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         render.assert_called_once()
         self.assertEqual(self.chart_bytes(self.sent[0]), b"mention chart")
         self.assertTrue(self.sent[1][3]["ephemeral"])
-        self.assertIn("What Testbot saw", self.sent[2][0])
+        self.assertIn("What Testbot saw", self.embeds(self.sent[2])[0].title)
         self.assertEqual(j.find_trace(self.channel.id, target), logged)
         target.content = "<@100000000000000002> edited"
         self.assertIsNone(j.find_trace(self.channel.id, target))  # the new sent field still detects edits
@@ -433,8 +491,8 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
             await j.context_action.callback(self.interaction(), self.target(status))
         self.assertEqual(render.call_count, 2)
         self.assertTrue(all(self.chart_bytes(s).startswith(b"\x89PNG") for s in self.sent[:4]))
-        self.assertEqual(self.sent[4][0], self.sent[5][0])
-        self.assertIn("before the status", self.sent[4][0])
+        self.assertEqual(self.embeds(self.sent[4])[0].to_dict(), self.embeds(self.sent[5])[0].to_dict())
+        self.assertIn(status["transcript"], self.embeds(self.sent[4])[0].description)
 
     async def test_reaction_chart_reuse_skips_emoji_fetches_and_follows_custom_emoji_changes(self):
         reaction = dict(self.logged, reaction=":spark:", reaction_candidates=[[":spark:", .8, .8]], steps=[])

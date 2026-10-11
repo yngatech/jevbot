@@ -31,6 +31,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import why_chart
+import context_chart
 
 load_dotenv()
 
@@ -399,15 +400,34 @@ def penalty(reply, word, recent=(), exempt=()):
     return p
 
 
+def record_api_request(model, purpose, status, attempt, usage=None):
+    """Keep request purposes and reported billing, without storing another copy of the prompt."""
+    if (t := trace.get()) is not None:
+        usage = usage or {}
+        t.setdefault("api_calls", []).append({
+            "model": model, "purpose": purpose, "status": status, "attempt": attempt,
+            "router_cost": usage.get("cost"), "is_byok": bool(usage.get("is_byok")),
+            "key_cost": (usage.get("cost_details") or {}).get("upstream_inference_cost")
+                        if usage.get("is_byok") else 0,
+        })
+
+
 async def post(session, state, questions):
     body = {"model": MODEL, "state": state, "questions": questions}
+    purpose = ("decision" if "asked" in questions or any(q.get("instructions") == "Reaction?"
+                                                       for q in questions.values()) else
+               "status_check" if "acceptable" in questions else
+               "status" if "status" in (trace.get() or {}) else "reply")
     for attempt in range(3):
+        status, usage = "error", None
         try:
             async with session.post(API_URL, json=body, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                status = r.status
                 if r.status < 400:
                     data = await r.json()
+                    usage = data.get("usage") or {}
                     if (t := trace.get()) is not None:
-                        t["cost"] += data.get("usage", {}).get("cost", 0)
+                        t["cost"] += usage.get("cost") or 0
                         t["requests"] += 1
                     await set_credit(True)
                     return data.get("answers", {})
@@ -419,8 +439,11 @@ async def post(session, state, questions):
                 log.warning(f"API {r.status} {attempt}: {(await r.text())[:300]}")
                 await asyncio.sleep(1 + 2 * attempt)
         except Exception as e:
+            status = "error"
             log.warning(f"API err {attempt}: {e}")
             await asyncio.sleep(1 + 2 * attempt)
+        finally:
+            record_api_request(MODEL, purpose, status, attempt, usage)
     return {}
 
 
@@ -772,6 +795,8 @@ async def generate_filtered_status(bot_name, start, chat=""):
                 parent["requests"] += attempt["requests"]
                 if byok := attempt.get("byok_cost"):
                     parent["byok_cost"] = parent.get("byok_cost", 0) + byok
+                if calls := attempt.get("api_calls"):
+                    parent.setdefault("api_calls", []).extend(calls)
                 if "error" in attempt:
                     parent["error"] = attempt["error"]
     return None
@@ -896,23 +921,31 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                 # doesn't have its prompt cache: Parasail's rate limits sent DeepSeek replies to Cloudflare at full
                 # price. Only the last try lets OpenRouter go elsewhere, so a reply still comes.
                 request = body | {"provider": body["provider"] | {"allow_fallbacks": attempt == 2}}
+            status, usage = "error", None
             try:
                 async with session.post(LLM_URL, json=request, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                    status = r.status
                     if r.status == 402:  # out of credit — retrying won't help
                         log.warning(f"LLM 402: {(await r.text())[:300]}")
                         note(error="out of credit")
                         await set_credit(False)
                         return "", []
                     data = await r.json(content_type=None)
+                    usage = data.get("usage") or {}
                     if r.status >= 400 or "choices" not in data:
+                        if r.status < 400:
+                            status = "invalid response"
                         log.warning(f"LLM {r.status} {attempt}: {str(data)[:300]}")
                         await asyncio.sleep(1 + 2 * attempt)
                         continue
             except Exception as e:
+                status = "error"
                 log.warning(f"LLM err {attempt}: {e}")
                 await asyncio.sleep(1 + 2 * attempt)
                 continue
-            usage = data.get("usage") or {}
+            finally:
+                record_api_request(spec["id"], "status" if "status" in (trace.get() or {}) else "reply",
+                                   status, attempt, usage)
             if (t := trace.get()) is not None:
                 # On our own Anthropic key (OpenRouter's BYOK) OpenRouter charges nothing, up to its allowance, and
                 # the request is paid from the key's credit: counted in the cost too, and apart as byok_cost
@@ -921,8 +954,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                 if byok:
                     t["byok_cost"] = t.get("byok_cost", 0) + byok
                 t["requests"] += 1
-            # For Context and Stats: exact input/output counts, cache reads, and the prompt's character count
-            # to estimate its split between voice rules and chat
+            # Exact input/output counts and cache reads returned by OpenRouter.
             note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
                  llm_completion_tokens=usage.get("completion_tokens"),
                  llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
@@ -959,7 +991,8 @@ async def llm_reply(name, message, author, bot_name, history=None, at=None, page
     else:
         blocks = "".join(blocks)
     messages = [{"role": "system", "content": system}, {"role": "user", "content": blocks}]
-    for _ in range(LLM_ATTEMPTS):
+    for attempt in range(LLM_ATTEMPTS):
+        note(llm_attempts=attempt + 1)
         text, tokens = await llm(name, messages)
         if reply := clean_llm(text, bot_name):
             if tokens:
@@ -1731,6 +1764,14 @@ class CachedExplanation:
     url: str | None = None
     filename: str | None = None
     expires: float | None = None
+    embeds: tuple[dict, ...] = ()
+    text_url: str | None = None
+
+@dataclass(frozen=True)
+class Explanation:
+    content: str | None = None
+    embeds: tuple[discord.Embed, ...] = ()
+    files: tuple[tuple[str, bytes], ...] = ()
 
 explanation_cache: OrderedDict[tuple, CachedExplanation] = OrderedDict()
 explanation_pending: dict[tuple, asyncio.Task] = {}
@@ -1847,15 +1888,23 @@ def asked_note(t, bot_name):
 # How diagnostics answer: !why with a Discord reply to it, the actions (right-click a message, Apps) with a message
 # only whoever asked can see. They may quote what people said, so no pings from mentions.
 def reply_to(m):
-    async def send(content=None, file=None, embed=None):
-        return await m.reply(content, file=file, embed=embed, mention_author=False,
+    async def send(content=None, file=None, embed=None, files=None, embeds=None):
+        options = {key: value for key, value in dict(file=file, embed=embed, files=files, embeds=embeds).items()
+                   if value is not None}
+        return await m.reply(content, **options, mention_author=False,
                              allowed_mentions=discord.AllowedMentions.none())
     return send
 
 def answer_privately(interaction):
-    async def send(content=None, file=None, embed=None):
-        return await interaction.followup.send(content or discord.utils.MISSING, file=file or discord.utils.MISSING,
-                                               embed=embed or discord.utils.MISSING, wait=True, ephemeral=True,
+    async def send(content=None, file=None, embed=None, files=None, embeds=None):
+        options = dict(file=file or discord.utils.MISSING, embed=embed or discord.utils.MISSING)
+        if files is not None:
+            options.pop("file")
+            options["files"] = files
+        if embeds is not None:
+            options.pop("embed")
+            options["embeds"] = embeds
+        return await interaction.followup.send(content or discord.utils.MISSING, **options, wait=True, ephemeral=True,
                                                allowed_mentions=discord.AllowedMentions.none())
     return send
 
@@ -1888,12 +1937,25 @@ def keep_explanation(key, response):
         explanation_cache.popitem(last=False)
 
 async def send_cached_explanation(send, response):
-    if response.url is None:
+    if response.embeds:
+        embeds = [discord.Embed.from_dict(copy.deepcopy(data)) for data in response.embeds]
+        text_url = response.text_url or (response.url if response.filename == "context.txt" else None)
+        for embed in embeds:
+            if embed.image.url and embed.image.url.startswith("attachment://"):
+                embed.set_image(url=response.url)
+            if text_url and embed.description:
+                embed.description = embed.description.replace(CONTEXT_ATTACHMENT_NOTICE,
+                                                               f"[Full transcript]({text_url})")
+        await send(response.content, **embed_options(embeds))
+    elif response.url is None:
         await send(response.content)
     elif response.filename.endswith(".png"):
         await send(response.content, embed=discord.Embed().set_image(url=response.url))
     else:
         await send(f"{response.content}\n[{response.filename}]({response.url})")
+
+def embed_options(embeds):
+    return {"embed": embeds[0]} if len(embeds) == 1 else {"embeds": list(embeds)} if embeds else {}
 
 # Shared by commands and actions. Resolve the trace first: "latest" must follow new answers, edited targets must
 # still match, and deleted logs must stop being shown. Keep only short text or a signed attachment URL after
@@ -1916,9 +1978,14 @@ async def send_explanation(kind, channel_id, guild, t, send):
                     pass  # this caller can still deliver if the previous caller failed
             validate = cached is None
             cached = cached or explanation_cache.get(key)
-            if cached and cached.url and (cached.expires <= time.time() + EXPLANATION_EXPIRY_MARGIN
-                                          or validate and not await explanation_attachment_available(cached.url)):
-                cached = None
+            if cached and cached.url:
+                if cached.expires <= time.time() + EXPLANATION_EXPIRY_MARGIN:
+                    cached = None
+                elif validate:
+                    for url in (cached.url, cached.text_url):
+                        if url and not await explanation_attachment_available(url):
+                            cached = None
+                            break
             if cached:
                 try:
                     await send_cached_explanation(send, cached)
@@ -1931,28 +1998,41 @@ async def send_explanation(kind, channel_id, guild, t, send):
             explanation_cache.pop(key, None)
             if kind == "why":
                 content, data, filename = await why_response(t, guild, bot_name)
+                response = Explanation(content, files=((filename, data),) if data is not None else ())
             elif kind == "stats":
-                content, data, filename = stats_response(t), None, None
+                response = Explanation(embeds=(stats_response(t),))
+            elif kind == "diagnostics":
+                response = Explanation(embeds=(diagnostics_response(t),))
             else:
-                content, data, filename = context_response(t, bot_name)
-            cached = CachedExplanation(content)
-            if data is None:
-                await send(content)
+                response = await asyncio.to_thread(context_response, t, bot_name)
+            embeds = tuple(embed.to_dict() for embed in response.embeds)
+            cached = CachedExplanation(response.content, embeds=embeds)
+            if not response.files:
+                await send(response.content, **embed_options(response.embeds))
             else:
-                with io.BytesIO(data) as stream:
-                    file = discord.File(stream, filename)
-                    try:
-                        sent = await send(content, file=file)
-                    finally:
+                files = [discord.File(io.BytesIO(data), filename) for filename, data in response.files]
+                try:
+                    options = {"file": files[0]} if len(files) == 1 else {"files": files}
+                    sent = await send(response.content, **options, **embed_options(response.embeds))
+                finally:
+                    for file in files:
                         file.close()
-                attachments = getattr(sent, "attachments", ())
-                if not attachments:
-                    return None  # delivered, but without a URL to reuse
-                url = attachments[0].url
-                expires = explanation_expiry(url)
+                        file.fp.close()
+                # Discord consumes an image used by attachment:// into the embed: it may no longer be listed
+                # under attachments in the response. Its signed image URL is still reusable.
+                attachments = {getattr(a, "filename", urlsplit(a.url).path.rsplit("/", 1)[-1]): a.url
+                               for a in getattr(sent, "attachments", ())}
+                for embed in getattr(sent, "embeds", ()):
+                    if url := embed.image.url:
+                        attachments.setdefault(urlsplit(url).path.rsplit("/", 1)[-1], url)
+                urls = [attachments.get(filename) for filename, _ in response.files]
+                if not all(urls):
+                    return None  # delivered, but without every URL to reuse
+                expires = min(map(explanation_expiry, urls))
                 if expires <= time.time() + EXPLANATION_EXPIRY_MARGIN:
                     return None
-                cached = CachedExplanation(content, url, filename, expires)
+                cached = CachedExplanation(response.content, urls[0], response.files[0][0], expires, embeds,
+                                           urls[1] if len(urls) > 1 else None)
             keep_explanation(key, cached)
             return cached
         finally:
@@ -2041,83 +2121,144 @@ async def explain_context(channel_id, guild, target, send):
         return
     await send_explanation("context", channel_id, guild, t, send)
 
-# How much of an LLM's window the answer took: the exact total, split between the chat it saw and the rest of the prompt
-# by their share of its characters, since a request's usage only gives the total. A character of chat is worth
-# CHAT_TOKEN_WEIGHT of the prompt's — names, times and short words. Against exact counts with all three LLMs, the
-# chat came out within 2% for 220- and 378-line transcripts (10% low unweighted), and a few tokens off for one line.
-CHAT_TOKEN_WEIGHT = 1.25
+EXPLANATION_COLOR = 0x8796FF
+CONTEXT_ATTACHMENT_NOTICE = "Full transcript attached as **context.txt**."
 
-def window_usage(t):
-    if (tokens := t.get("llm_prompt_tokens")) is None or not (window := t.get("llm_window")):
-        return ""
-    used = tokens / window
-    usage = (f"**{t['llm']}**: {tokens:,} of {window:,} tokens in its window — "
-             f"{'<0.1%' if 0 < used < 0.001 else f'{used:.1%}'} used, {1 - used:.1%} free\n")
-    count = t.get("llm_messages") or ("history" in t and "status" not in t and len(t["history"]) + 1)
-    messages = f" ({count} messages)" if count else ""
-    if t.get("llm_prompt_chars"):
-        chat_chars = CHAT_TOKEN_WEIGHT * t.get("llm_chat_chars", 0)
-        chat = round(tokens * chat_chars / (chat_chars + t["llm_prompt_chars"] - t.get("llm_chat_chars", 0)))
-        usage += f"- prompt: ~{tokens - chat:,} tokens\n- chat: ~{chat:,} tokens{messages}\n"
-    if (cached := t.get("llm_cached_tokens")) is not None:
-        usage += f"- read from the cache: {cached:,} tokens\n"
-    return usage
+
+def model_label(t):
+    if t.get("requests") == 0 and t.get("reply") in NO_MONEY:
+        return "None (out of credit)"
+    return ("jev" if t.get("reaction") else t.get("llm") or "jev").title()
+
+
+def chat_message_count(t):
+    if (count := t.get("llm_messages")) is not None:
+        return count
+    if "history" in t and "status" not in t:
+        return len(t["history"]) + 1
+    return None
+
+
+def context_usage(t):
+    tokens, window = t.get("llm_prompt_tokens"), t.get("llm_window")
+    if t.get("reaction") or tokens is None:
+        return "Not recorded"
+    if window:
+        return f"{tokens:,} / {window:,} tokens · {context_chart.percentage(tokens, window)} used"
+    return f"{tokens:,} tokens"
+
+
+def money(cost):
+    return f"${cost:.6f} USD" if cost is not None else "Not recorded"
+
 
 def context_response(t, bot_name):
-    if "status" in t:
-        what = "its status"
-        head = f"What {bot_name} saw before the status \"{unfence(t['status'])}\""
-    else:
-        what = f"reacting {t['reaction']} to" if t.get("reaction") else "replying to"
-        head = (f"What {bot_name} saw before {what} \"{unfence(t['message'][:80])}\""
-                + (" (!nocontext)" if t.get("no_context") else ""))
     text = logged_context(t)
-    usage = window_usage(t)
-    body = f"{head}:\n{usage}```\n{unfence(text)}\n```"
-    log.info(f"[CONTEXT] {what} {(t.get('message') or t['status'])[:40]!r}")
-    if len(body) <= CONTEXT_LIMIT:
-        return body, None, None
-    return (f"{head}:\n{usage}".rstrip() if usage else head), text.encode(), "context.txt"
+    tokens, window = t.get("llm_prompt_tokens"), t.get("llm_window")
+    embeds, files = [], []
+    if not t.get("reaction") and tokens is not None:
+        usage = discord.Embed(title="Context", description=f"**{model_label(t)}** · {context_usage(t)}",
+                              color=EXPLANATION_COLOR)
+        if window:
+            usage.set_image(url="attachment://context-usage.png")
+            files.append(("context-usage.png", context_chart.render(tokens, window, t.get("llm_cached_tokens"))))
+        detail = []
+        if (count := chat_message_count(t)) is not None:
+            detail.append(f"{count:,} chat messages")
+        if (output := t.get("llm_completion_tokens")) is not None:
+            detail.append(f"{output:,} output tokens")
+        if detail:
+            usage.set_footer(text=" · ".join(detail))
+        embeds.append(usage)
+    title = f"What {bot_name} saw" if embeds else f"Context · What {bot_name} saw"
+    if len(text) <= CONTEXT_LIMIT:
+        description = f"```\n{unfence(text)}\n```"
+    else:
+        description = CONTEXT_ATTACHMENT_NOTICE
+        files.append(("context.txt", text.encode()))
+    context = discord.Embed(title=title, description=description, color=EXPLANATION_COLOR)
+    if t.get("no_context"):
+        context.set_footer(text="!nocontext · this side conversation")
+    embeds.append(context)
+    return Explanation(embeds=tuple(embeds), files=tuple(files))
 
 
-# Stats use the same logs as Why and Context, without generating anything or quoting the transcript.
-async def explain_stats(channel_id, guild, target, send):
+# Stats and Diagnostics use the same logged response and never make a model request.
+async def explain_stats(channel_id, guild, target, send, *, diagnostics=False):
     t = await asyncio.to_thread(find_trace, channel_id, target,
                                 lambda t: t.get("reply") or t.get("reaction") or t.get("status"))
     if t is None:
         await send("Nothing logged for that")
         return
-    await send_explanation("stats", channel_id, guild, t, send)
+    await send_explanation("diagnostics" if diagnostics else "stats", channel_id, guild, t, send)
+
 
 def stats_response(t):
-    name = "jev" if t.get("reaction") else t.get("llm") or "jev"
-    model = MODEL if name == "jev" else t.get("llm_model")
-    lines = [f"**Model:** **{name}**" + (f" (`{model}`)" if model else " (model ID not logged)")]
-    no_generation = t.get("requests") == 0 and t.get("reply") in NO_MONEY
-    if no_generation:
-        lines = ["**Model:** none (out of credit)"]
-    cost = t.get("cost")
-    lines.append(f"**Cost:** ${cost:.6f} USD" if cost is not None else "**Cost:** not logged")
-    if cost is not None and (byok := t.get("byok_cost")):
-        lines.extend([f"- OpenRouter: ${cost - byok:.6f} USD", f"- own API key: ${byok:.6f} USD"])
-    lines.append("Includes all logged API requests, checks and retries.")
-    if (requests := t.get("requests")) is not None:
-        lines.append(f"**API requests:** {requests:,}")
+    embed = discord.Embed(title="Stats", color=EXPLANATION_COLOR)
+    embed.add_field(name="Model", value=model_label(t))
+    embed.add_field(name="Total cost", value=money(t.get("cost")))
+    usage = "No generation" if model_label(t).startswith("None") else context_usage(t)
+    if (count := chat_message_count(t)) is not None:
+        usage += f"\n{count:,} chat messages"
+    embed.add_field(name="Context", value=usage, inline=False)
+    return embed
+
+
+REQUEST_PURPOSES = {"decision": "Check whether to reply or react", "reply": "Write the reply",
+                    "status": "Write the status", "status_check": "Check the status makes sense"}
+
+
+def diagnostics_response(t):
+    embed = discord.Embed(title="Diagnostics", color=EXPLANATION_COLOR)
+    calls = t.get("api_calls")
+    if (requests := len(calls) if calls is not None else t.get("requests")) is not None:
+        embed.add_field(name="Requests", value=f"{requests:,}")
     if (seconds := t.get("seconds")) is not None:
-        lines.append(f"**Time:** {seconds:.1f}s")
-    if no_generation:
-        lines.append("\nNo generation request was made.")
-    elif name != "jev":
-        lines.append("\n**Context usage (final generation request):**")
-        usage = window_usage(t)
-        lines.append(usage.rstrip() if usage else "Context token usage wasn't logged for this answer.")
-        if (output := t.get("llm_completion_tokens")) is not None:
-            lines.append(f"- output: {output:,} tokens")
-        if usage:
-            lines.append("Prompt/chat split is estimated; cached tokens are included in the input total.")
+        embed.add_field(name="Total time", value=f"{seconds:.1f}s")
+    embed.add_field(name="Total cost", value=money(t.get("cost")))
+    if calls:
+        groups = {}
+        for call in calls:
+            key = call["purpose"], call["model"], call["is_byok"]
+            groups.setdefault(key, []).append(call)
+        for (purpose, model, byok), group in groups.items():
+            name = "Jev" if model == MODEL else next((alias.title() for alias, spec in LLMS.items()
+                                                     if spec["id"] == model), model)
+            billing = ("Anthropic key" if model.startswith("anthropic/") else "provider key") if byok else "OpenRouter"
+            costs = [None if c["router_cost"] is None or c["key_cost"] is None
+                     else c["router_cost"] + c["key_cost"] for c in group]
+            known = [cost for cost in costs if cost is not None]
+            cost = sum(known) if known else None
+            failures = sum(c["status"] != 200 for c in group)
+            detail = f"{name} · {len(group):,} request{'s' if len(group) != 1 else ''} · paid through {billing}"
+            price = money(cost) + (" reported" if known and len(known) != len(costs) else "")
+            detail += f"\n**{price}** · `{model}`"
+            if failures:
+                detail += f"\n{failures:,} failed attempt{'s' if failures != 1 else ''}; unreported costs unavailable"
+            embed.add_field(name=REQUEST_PURPOSES.get(purpose, purpose), value=detail, inline=False)
+        retries = sum(c.get("attempt", 0) > 0 for c in calls)
+        generations = max(t.get("llm_attempts", 1) - 1, 0) + max(len(t.get("status_attempts", [])) - 1, 0)
+        if retries or generations:
+            embed.add_field(name="Retries", value=f"{retries:,} HTTP retries · {generations:,} extra generations",
+                            inline=False)
     else:
-        lines.append("\nContext token usage wasn't logged for Jev's decision requests.")
-    return "\n".join(lines)
+        model = MODEL if not t.get("llm") or t.get("reaction") else t.get("llm_model")
+        embed.add_field(name="Model ID", value=f"`{model}`" if model else "Not recorded", inline=False)
+    if (cost := t.get("cost")) is not None:
+        byok = t.get("byok_cost", 0)
+        embed.add_field(name="Billing", value=f"OpenRouter: {money(cost - byok)}\nProvider key: {money(byok)}",
+                        inline=False)
+    if not t.get("reaction"):
+        cache = []
+        if (cached := t.get("llm_cached_tokens")) is not None:
+            cache.append(f"{cached:,} cached input tokens")
+        if (output := t.get("llm_completion_tokens")) is not None:
+            cache.append(f"{output:,} output tokens")
+        if cache:
+            embed.add_field(name="Final generation", value=" · ".join(cache), inline=False)
+    embed.set_footer(text=("Routed through OpenRouter. Provider keys are billed by their provider." if calls else
+                           "Request purposes and retries were not recorded for this message."))
+    return embed
 
 
 # Right-clicking a message for a diagnostic action: that message, as if !why were a Discord reply to it.
@@ -2136,6 +2277,13 @@ async def context_action(interaction: discord.Interaction, target: discord.Messa
 async def stats_action(interaction: discord.Interaction, target: discord.Message):
     await interaction.response.defer(ephemeral=True, thinking=True)
     await explain_stats(interaction.channel_id, interaction.guild, target, answer_privately(interaction))
+
+
+@bot.tree.context_menu(name="Diagnostics")
+async def diagnostics_action(interaction: discord.Interaction, target: discord.Message):
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await explain_stats(interaction.channel_id, interaction.guild, target, answer_privately(interaction),
+                        diagnostics=True)
 
 
 # !model: which model writes the replies and statuses, or with a name, switch to it — for everyone, and kept

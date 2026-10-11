@@ -423,7 +423,7 @@ class ActionTests(_Discord):
     def test_actions_are_message_context_menus(self):
         menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
         self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message,
-                                 "Stats": discord.AppCommandType.message})
+                                 "Stats": discord.AppCommandType.message, "Diagnostics": discord.AppCommandType.message})
 
     async def test_failed_registration_doesnt_stop_startup(self):
         error = discord.HTTPException(Mock(status=503, reason="Service Unavailable"), "unavailable")
@@ -441,7 +441,7 @@ class ActionTests(_Discord):
         self.assertEqual(find.call_args.args[:2], (self.channel.id, self.target))
         sent = i.followup.send.call_args
         self.assertTrue(sent.kwargs["ephemeral"])
-        self.assertIn("Speaker: what's my cat called?", sent.args[0])
+        self.assertIn("Speaker: what's my cat called?", sent.kwargs["embed"].description)
         self.assertEqual(sent.kwargs["allowed_mentions"].to_dict()["parse"], [])  # the quoted @everyone pings nobody
         self.assertIs(sent.kwargs["file"], discord.utils.MISSING)
 
