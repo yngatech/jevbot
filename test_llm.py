@@ -111,12 +111,14 @@ class ReplyTests(_Case):
         session.__aenter__.return_value = session
         session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
             "choices": [{"message": {"content": "Is Biscuit."}}],
-            "usage": {"prompt_tokens": 3_100, "cost": 0.001, "prompt_tokens_details": {"cached_tokens": 2_900}}}))
+            "usage": {"prompt_tokens": 3_100, "completion_tokens": 18, "cost": 0.001,
+                      "prompt_tokens_details": {"cached_tokens": 2_900}}}))
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
             await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
         messages = session.post.call_args.kwargs["json"]["messages"]
         self.assertEqual(self.trace["llm_window"], 262_144)
         self.assertEqual(self.trace["llm_prompt_tokens"], 3_100)
+        self.assertEqual(self.trace["llm_completion_tokens"], 18)
         self.assertEqual(self.trace["llm_cached_tokens"], 2_900)
         self.assertEqual(self.trace["llm_prompt_chars"], sum(len(m["content"]) for m in messages))
         chat = self.trace["transcript"].rsplit("\n", 1)[0]
@@ -255,17 +257,28 @@ class StatusTests(_Case):
         self.assertIn("kettle: my cat knocked my tea over", self.trace["transcript"])
         self.assertEqual(self.trace["llm"], "deepseek")
 
-    async def test_accepted_status_keeps_its_tokens_for_why_and_its_prompt_size_for_context(self):
+    async def test_accepted_status_keeps_its_usage_and_sums_own_key_costs_across_retries(self):
         j.model_name = "deepseek"
         sizes = iter([2_000, 3_000])
         async def llm(name, messages):
-            j.note(llm_window=1, llm_prompt_tokens=next(sizes), llm_prompt_chars=1)
+            size = next(sizes)
+            j.note(llm_window=1, llm_prompt_tokens=size, llm_prompt_chars=1,
+                   llm_cached_tokens=size - 500, llm_completion_tokens=18)
+            t = j.trace.get()
+            t["cost"] += .0004
+            t["byok_cost"] = t.get("byok_cost", 0) + .0004
+            t["requests"] += 1
             return "I feel cat is tiny disaster.", TOKENS
         with patch.object(j, "llm", llm), patch.object(j, "status_score", AsyncMock(side_effect=[0.1, 0.9])):
             mood = await j.generate_filtered_status("rocky", ["i", "feel"], "kettle: cat")
         self.assertEqual(mood, "I feel cat is tiny disaster.")
         self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
         self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("kettle: cat")))
+        self.assertEqual(self.trace["llm_cached_tokens"], 2_500)
+        self.assertEqual(self.trace["llm_completion_tokens"], 18)
+        self.assertAlmostEqual(self.trace["cost"], .0008)
+        self.assertAlmostEqual(self.trace["byok_cost"], .0008)
+        self.assertEqual(self.trace["requests"], 2)
 
 
 class WhyTests(_Case):
