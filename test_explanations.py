@@ -217,7 +217,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(j, "post", new_callable=AsyncMock) as post:
             await j.stats_action.callback(interaction, self.target(t))
             await j.stats_action.callback(self.interaction(), self.target(t, original=True))
-        self.assertEqual(self.fields(), {"Model": "Haiku", "Total cost": "$0.001600 USD",
+        self.assertEqual(self.fields(), {"Model": "synthetic/previous-haiku", "Total cost": "$0.001600 USD",
                                         "Context": "9,800 / 1,000,000 tokens · 1.0% used\n420 chat messages"})
         self.assertEqual(self.embeds(self.sent[0])[0].to_dict(), self.embeds(self.sent[1])[0].to_dict())
         self.assertNotIn(t["transcript"], str(self.fields()))

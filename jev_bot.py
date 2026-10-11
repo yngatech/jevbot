@@ -2113,7 +2113,10 @@ EXPLANATION_COLOR = 0x8796FF
 def model_label(t):
     if t.get("requests") == 0 and t.get("reply") in NO_MONEY:
         return "None (out of credit)"
-    return ("jev" if t.get("reaction") else t.get("llm") or "jev").title()
+    if t.get("reaction"):
+        return "Jev"
+    # Preserve the model version recorded at generation time, even after !model or a config change.
+    return t.get("llm_model") or (t.get("llm") or "jev").title()
 
 
 def chat_message_count(t):
