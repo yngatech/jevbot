@@ -144,26 +144,24 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
         interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
 
-    async def test_context_actions_reuse_inline_and_attached_transcripts(self):
+    async def test_context_actions_send_inline_and_freshly_attached_transcripts(self):
         for text in ("Speaker: tea? @everyone ```\n\nTestbot: ", "Speaker: " + "tea " * 600):
             with self.subTest(attached=len(text) > j.CONTEXT_LIMIT):
                 self.logged["transcript"] = text
                 j.write_trace(self.logged)
                 self.sent.clear()
-                with patch.object(j, "logged_context", wraps=j.logged_context) as context:
-                    await j.context_action.callback(self.interaction(), self.target())
-                    await j.context_action.callback(self.interaction(), self.target())
-                context.assert_called_once()
+                await j.context_action.callback(self.interaction(), self.target())
+                await j.context_action.callback(self.interaction(), self.target())
                 first, second = self.embeds(self.sent[0])[0], self.embeds(self.sent[1])[0]
+                self.assertEqual(first.to_dict(), second.to_dict())
                 if len(text) > j.CONTEXT_LIMIT:
-                    self.assertEqual(self.sent[0][2], text.encode())
-                    self.assertEqual(self.sent[0][1].filename, "context.txt")
-                    self.assertIs(self.sent[1][1], discord.utils.MISSING)
-                    self.assertIn(next(reversed(self.uploads)), second.description)
+                    # Uploaded each time: an attachment opens in Discord's viewer, a link to an old one doesn't
+                    self.assertEqual([(s[1].filename, s[2]) for s in self.sent], [("context.txt", text.encode())] * 2)
+                    self.assertIsNone(first.description)
                 else:
-                    self.assertEqual(first.to_dict(), second.to_dict())
                     self.assertIn(j.unfence(text), first.description)
-                    self.assertIs(self.sent[0][1], discord.utils.MISSING)
+                    self.assertEqual(self.uploads, {})
+                self.assertEqual(j.explanation_cache, {})
                 self.assertTrue(self.sent[1][3]["ephemeral"])
                 self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
 
@@ -176,58 +174,23 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 j.write_trace(t)
                 self.sent.clear()
                 self.uploads.clear()
-                j.explanation_cache.clear()
                 with patch.object(j.context_chart, "render", wraps=j.context_chart.render) as render:
                     await j.context_action.callback(self.interaction(), self.target(t))
-                    await j.context_action.callback(self.interaction(), self.target(t))
                 render.assert_called_once_with(18_673, 1_000_000, 14_533)
-                usage, transcript = self.embeds(self.sent[0])
-                self.assertIn("18,673 / 1,000,000 tokens · 1.9% used", usage.description)
-                self.assertEqual(usage.footer.text, "291 chat messages · 24 output tokens")
-                image_url = next(url for url in self.uploads if "context-usage.png" in url)
-                self.assertTrue(self.uploads[image_url].startswith(b"\x89PNG\r\n\x1a\n"))
-                self.assertEqual(self.embeds(self.sent[1])[0].image.url, image_url)
-                self.assertEqual(len(self.uploads), 2 if long else 1)
+                embed, = self.embeds(self.sent[0])
+                self.assertEqual({f.name: f.value for f in embed.fields},
+                                 {"Model": "Haiku", "Chat messages": "291", "Output": "24 tokens",
+                                  "Context window": "18,673 / 1,000,000 tokens · 1.9% used",
+                                  "Input cache": "14,533 cached · 4,140 uncached · 77.8% cached"})
+                self.assertEqual(embed.image.url, "attachment://context-usage.png")
+                uploads = {url.split("/")[-1].split("?")[0]: data for url, data in self.uploads.items()}
+                self.assertTrue(uploads.pop("context-usage.png").startswith(b"\x89PNG\r\n\x1a\n"))
                 if long:
-                    text_url = next(url for url in self.uploads if "context.txt" in url)
-                    self.assertEqual(self.uploads[text_url], t["transcript"].encode())
-                    self.assertIn(text_url, self.embeds(self.sent[1])[1].description)
+                    self.assertEqual(uploads, {"context.txt": t["transcript"].encode()})
                 else:
-                    self.assertIn(t["transcript"], transcript.description)
-                self.assertNotIn("estimated", json.dumps([e.to_dict() for e in self.embeds(self.sent[0])]))
-                cached, = j.explanation_cache.values()
-                json.dumps(vars(cached))
-
-    async def test_a_deleted_context_transcript_attachment_remakes_both_files(self):
-        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=100,
-                 transcript="Speaker: " + "tea " * 600)
-        with patch.object(j.context_chart, "render", return_value=b"chart") as render:
-            await j.send_explanation("context", 300, self.guild, t, self.capture)
-            self.available.side_effect = [True, False]
-            await j.send_explanation("context", 300, self.guild, t, self.capture)
-        self.assertEqual(render.call_count, 2)
-        self.assertEqual(len(self.uploads), 4)
-        self.assertEqual(self.available.await_count, 2)
-
-    async def test_context_reuses_images_consumed_into_discord_embeds(self):
-        t = dict(self.logged, llm="haiku", llm_window=1_000_000, llm_prompt_tokens=100,
-                 transcript="Speaker: " + "tea " * 600)
-
-        async def consume_image(content=None, **options):
-            sent = await self.capture(content, **options)
-            image, transcript = sent.attachments
-            embeds = [discord.Embed.from_dict(embed.to_dict()) for embed in options["embeds"]]
-            embeds[0].set_image(url=image.url)
-            return SimpleNamespace(attachments=[transcript], embeds=embeds)
-
-        with patch.object(j.context_chart, "render", return_value=b"chart") as render:
-            await j.send_explanation("context", 300, self.guild, t, consume_image)
-            await j.send_explanation("context", 300, self.guild, t, self.capture)
-        render.assert_called_once()
-        self.assertEqual(len(self.uploads), 2)
-        image_url, text_url = self.uploads
-        self.assertEqual(self.embeds()[0].image.url, image_url)
-        self.assertIn(text_url, self.embeds()[1].description)
+                    self.assertEqual(uploads, {})
+                    self.assertIn(t["transcript"], embed.description)
+                self.assertNotIn("estimated", json.dumps(embed.to_dict()))
 
     async def test_context_for_jev_or_an_older_log_has_a_transcript_without_a_made_up_chart(self):
         for t in (self.logged, dict(self.logged, llm="haiku")):
@@ -235,8 +198,10 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 j.write_trace(t)
                 await j.context_action.callback(self.interaction(), self.target(t))
                 embed, = self.embeds()
-                self.assertIn("What Testbot saw", embed.title)
+                self.assertEqual(embed.title, "What Testbot saw")
                 self.assertIn(t["transcript"], embed.description)
+                self.assertEqual(embed.fields[0].value, "Haiku" if t.get("llm") else "Jev")
+                self.assertNotIn("Context window", [f.name for f in embed.fields])
                 self.assertFalse(embed.image.url)
 
     async def test_stats_privately_show_only_model_total_cost_and_context_without_a_model_call(self):
