@@ -357,8 +357,15 @@ class MemoryTests(_Case):
             self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "tea"}], tools=j.MEMORY_TOOLS),
                              ("", [], calls))
             body = session.post.call_args.kwargs["json"]
-            self.assertEqual((body["tools"], body["tool_choice"], body["max_tokens"]), (j.MEMORY_TOOLS, "auto", 200))
+            self.assertEqual((body["tools"], body["tool_choice"], body["max_tokens"]), (j.MEMORY_TOOLS, "auto", 1000))
             self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "tea"}]), ("", []))  # without, as before
+            self.assertNotIn("llm_cut_off", self.trace)
+            session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
+                "choices": [{"message": {"content": "Looking at", "tool_calls": [{"id": "c", "function": {
+                    "name": "remember", "arguments": '{"about": "pip"'}}]}, "finish_reason": "length"}], "usage": {}}))
+            with self.assertLogs(j.log, "WARNING"):
+                await j.llm("haiku", [{"role": "user", "content": "tea"}], tools=j.MEMORY_TOOLS)
+            self.assertTrue(self.trace["llm_cut_off"])
 
 
 class WhyTests(_Case):

@@ -931,7 +931,10 @@ MEMORY_TOOLS = [
         "parameters": {"type": "object", "required": ["number"], "properties": {
             "number": {"type": "integer", "description": "The memory's number"}}}}},
 ]
-LLM_TOOL_MAX_TOKENS = 200  # room for a tool call's arguments
+# Room for the keeper's notes and its tool calls. It works out what to keep in a few sentences first ("Looking at the
+# latest messages: ...") — told not to, it kept a third as much. At 200 it ran out in 13 of 27 requests and its calls
+# came back cut off ('{"about": "beeves"', '{}'); its longest since, 329.
+LLM_TOOL_MAX_TOKENS = 1000
 MEMORY_ROUNDS = 2          # the keeper's turns with the tools, after one reply
 
 LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
@@ -1024,6 +1027,9 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None):
                  llm_prompt_chars=sum(len(text_of(m.get("content"))) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
+            if tools and choice.get("finish_reason") == "length":  # its tool calls are cut off where it stopped
+                log.warning(f"LLM {name} ran out of tokens with tools: {str(choice['message'])[:300]}")
+                note(llm_cut_off=True)
             said = (choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content")))
             return (*said, choice["message"].get("tool_calls") or []) if tools else said
     return failed
