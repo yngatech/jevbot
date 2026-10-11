@@ -267,6 +267,71 @@ def page_text(page, bot_name):
     history_turns(turns, turn, bot_name, page)
     return "\n".join(turns)
 
+# Memories: facts an LLM keeps with its remember tool (keep_memories), shown to it before every reply. Each server has its
+# own, and so does each DM, so nothing said in one is seen in another. A fact is about a person, by their Discord id
+# (their name is whatever they're called in the chat now), or about a topic. Kept in MEMORY_PATH (gitignored).
+MEMORY_PATH = Path(__file__).parent / "memories.json"
+MEMORIES_KEPT = 200  # per server or DM, the latest
+memories: dict[str, dict] = {}  # space: {"next": the next number, "facts": [{"n", "about", "uid", "fact", "by", "at"}]}
+
+def space_of(m):
+    return str(m.guild.id) if m.guild else f"dm-{m.channel.id}"
+
+def load_memories():
+    try:
+        return json.loads(MEMORY_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except Exception as e:  # unreadable — keep it for a look, start again
+        log.warning(f"Loading {MEMORY_PATH.name} failed: {e}")
+        return {}
+
+def save_memories():
+    try:
+        tmp = MEMORY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(memories, ensure_ascii=False, indent=1) + "\n")
+        tmp.replace(MEMORY_PATH)
+    except OSError as e:
+        log.warning(f"Writing {MEMORY_PATH.name} failed: {e}")
+
+memories.update(load_memories())
+
+# people: the ids of the people in the chat, to their names there — a fact about one of them is kept by id
+def remember(space, about, fact, by, people=None):
+    about = about.strip().lstrip("@").strip()
+    kept = memories.setdefault(space, {"next": 1, "facts": []})
+    uid = next((u for u, name in (people or {}).items() if name.lower() == about.lower()), None)
+    f = {"n": kept["next"], "about": about, "uid": str(uid) if uid else None, "fact": fact.strip(), "by": str(by),
+         "at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    kept["next"] += 1
+    kept["facts"].append(f)
+    del kept["facts"][:-MEMORIES_KEPT]
+    save_memories()
+    log.info(f"[REMEMBER] {space} [{f['n']}] {about}: {f['fact']}")
+    return f
+
+def forget(space, n):
+    facts = memories.get(space, {}).get("facts", [])
+    if (f := next((f for f in facts if f["n"] == n), None)) is not None:
+        facts.remove(f)
+        save_memories()
+        log.info(f"[FORGET] {space} [{n}] {f['about']}: {f['fact']}")
+    return f
+
+# What's remembered in a space, a line each, by the name a person goes by in the chat now. numbered: "[3] pip: is
+# vegetarian", for keeping (keep_memories, !memories); else "- pip is vegetarian", for replying — shown as "pip: is
+# vegetarian", like a line of chat, Haiku described its reply in 4 of 8 ("Pip is vegetarian. Rocky should suggest
+# something vegetarian"), and as a sentence in none
+def memory_lines(space, people=None, numbered=True):
+    people = {str(u): name for u, name in (people or {}).items()}
+    lines = []
+    for f in memories.get(space, {}).get("facts", []):
+        name, fact = people.get(f["uid"], f["about"]), f["fact"].rstrip(".")
+        if fact.lower().startswith(f["about"].lower() + " "):  # "pip is vegetarian" as the fact about pip
+            fact = fact[len(f["about"]) + 1:]
+        lines.append(f"[{f['n']}] {name}: {fact}" if numbered else f"- {name} {fact[:1].lower()}{fact[1:]}")
+    return lines
+
 # Vocab
 VOCAB_PATH = Path(__file__).parent / "vocab.txt"
 CUSTOM_VOCAB_PATH = Path(__file__).parent / "custom_vocab.txt"
@@ -656,11 +721,11 @@ async def loom(state, vocab, instructions, max_words=None, min_words=None, done_
 
 
 # llm_history: the longer history an LLM gets, if it isn't `history`; at: when the message was sent, for its times;
-# pages: a long chat's frozen pages, before llm_history
-async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None):
+# pages: a long chat's frozen pages, before llm_history; mind: for an LLM's memory (llm_reply)
+async def generate_reply(message, author, bot_name, history=None, llm_history=None, at=None, pages=None, mind=None):
     if (name := model_name) != "jev":
         return await llm_reply(name, message, author, bot_name, history if llm_history is None else llm_history, at,
-                               pages)
+                               pages, mind)
     # Every word and name people used in the transcript, not just the message being replied to — lets jev say what
     # it can see. Not jev's own words: from a broken reply that would add "garbled" and "unclear" back for reuse.
     vocab = vocabulary(" ".join([f"{h['name']} {h['content']}" for h in history or [] if h["role"] == "user"]
@@ -790,6 +855,7 @@ async def generate_filtered_status(bot_name, start, chat=""):
 #     chat. Of the providers taking all of its parameters (Parasail, Cloudflare, Novita), Parasail is the cheapest, and
 #     a repeat read 7.7K of it from the cache for 0.085¢. StreamLake would be 0.026¢, but has no frequency_penalty.
 #   window: its context length on OpenRouter, in tokens, for Context's usage
+#   memory: show it what's remembered, and keep memories after its replies (keep_memories) — Haiku's tested
 #   cache_marks: mark where a long chat's cache ends (LLM_CACHE) — Claude only caches what's marked; DeepSeek and Kimi
 #     cache the same start of a request by themselves
 LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -797,7 +863,8 @@ LLMS = {
     "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576,
                  "providers": ["parasail"]},
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
-              "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000, "cache_marks": True},
+              "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000, "cache_marks": True,
+              "memory": True},
     "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
     # Newer ones to try live against the two above. On jev_eval's chats V4.1 Flash wrote as good a Rocky as Pro ("Is
     # thief with paper.") for a fraction of the price; K3 had the best lines but drifts longer and into space talk.
@@ -840,6 +907,39 @@ How {bot} talks:
 - To get someone's attention, use @ followed by their full name as shown in the chat, ending with punctuation or a line break. Bare names just talk about them; don't mention everyone you talk about.
 - Never emoji, never says he's a bot or AI. Don't copy the lines below word for word or repeat your earlier replies."""
 
+# Memory, two ways. Replying, an LLM sees what's remembered here but has no tools: offered remember and forget in the
+# reply's request, Haiku wrote about them in 1-2 of 12 replies ("Pip is vegetarian, so suggest something without
+# meat"), where without them it wrote none — with any wording tried, and worse thinking first. Keeping is a request of
+# its own after the reply is sent (keep_memories): the last few messages, what's remembered, and the tools.
+MEMORY_SEEN = """
+
+{bot} remembers things between chats; what's remembered here is shown before each request. Use it like a friend would, without mentioning it."""
+
+MEMORY_KEEPER = """You keep {bot}'s memory of a Discord server: short facts about the people in it, about things that matter to them, and about {bot} itself, so {bot} — a friendly bot in the chat — can bring them up in later chats and stay the same {bot}.
+
+After each of {bot}'s replies you see the last few messages and what's remembered, by number. Use remember for anything in the latest message to {bot}, or {bot}'s reply, that would still matter next week:
+- About a person: food, pets and their names, jobs, where they live, teams they support, trips, plans, big news, or anything someone asks {bot} to remember. Only from what they, or a friend, said — never from {bot}'s replies, which can get people wrong.
+- About {bot}: what it says it likes, dislikes or is, from its own replies, so it gives the same answer next time.
+Not small talk, not a summary of what was talked about, nothing about running {bot} (its costs or code), no jokes unless someone clearly wants them kept, and not what's already remembered. One short fact each, about one person (by their name in the chat), {bot}, or a topic, written to follow it: "is vegetarian", "has a cat called Biscuit", "supports Spurs". Use forget, with its number, when someone says a memory is wrong or asks to forget it; when something has changed, forget the old fact and remember the new one. If there's nothing to keep or change, say "nothing"."""
+
+KEEPER_MESSAGES = 12  # the latest messages the keeper sees
+
+MEMORY_TOOLS = [
+    {"type": "function", "function": {
+        "name": "remember", "description": "Keep a fact for later chats in this server.",
+        "parameters": {"type": "object", "required": ["about", "fact"], "properties": {
+            "about": {"type": "string", "description": "The person's name as it is in the chat, or a short topic"},
+            "fact": {"type": "string", "description": "The fact, short, to follow the name or topic: \"is vegetarian\""}}}}},
+    {"type": "function", "function": {
+        "name": "forget", "description": "Drop a remembered fact that's wrong, or that someone asked to forget.",
+        "parameters": {"type": "object", "required": ["number"], "properties": {
+            "number": {"type": "integer", "description": "The memory's number"}}}}},
+]
+# Room for the keeper's notes and its tool calls. It works out what to keep in a few sentences first ("Looking at the
+# latest messages: ...") — told not to, it kept a third as much. At 200 it ran out in 13 of 27 requests and its calls
+# came back cut off ('{"about": "beeves"', '{}'); its longest since, 329.
+LLM_TOOL_MAX_TOKENS = 1000
+
 LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary entry that starts "{start}". In {bot}'s voice; a reader with no context should get a feeling, thought or question from it. One line, at most 12 words after the opener. Output the whole status, starting with "{start}"."""
 
 def rocky_prompt(bot_name, shuffle=False):
@@ -874,13 +974,17 @@ def llm_tokens(content):
         tokens.pop()
     return tokens
 
-def text_of(content):  # a message's content: a string, or a long chat's blocks
-    return content if isinstance(content, str) else "".join(b["text"] for b in content)
+def text_of(content):  # a message's content: a string, a long chat's blocks, or nothing (a tool call)
+    return content if isinstance(content, str) else "".join(b["text"] for b in content or [])
 
-async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
+# tools: offered to it, and then its tool calls come back too: (text, tokens, calls)
+async def llm(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None):
     spec = LLMS[name]
     body = {"model": spec["id"], "messages": messages, "max_tokens": max_tokens, "temperature": LLM_TEMPERATURE,
             "frequency_penalty": LLM_FREQUENCY_PENALTY, "reasoning": {"enabled": False}, "usage": {"include": True}}
+    if tools:
+        body |= {"tools": tools, "tool_choice": "auto", "max_tokens": max(max_tokens, LLM_TOOL_MAX_TOKENS)}
+    failed = ("", [], []) if tools else ("", [])
     if spec.get("logprobs"):
         # Only to providers that give them — some of DeepSeek's don't
         body |= {"logprobs": True, "top_logprobs": LLM_TOP_LOGPROBS, "provider": {"require_parameters": True}}
@@ -900,7 +1004,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                         log.warning(f"LLM 402: {(await r.text())[:300]}")
                         note(error="out of credit")
                         await set_credit(False)
-                        return "", []
+                        return failed
                     data = await r.json(content_type=None)
                     if r.status >= 400 or "choices" not in data:
                         log.warning(f"LLM {r.status} {attempt}: {str(data)[:300]}")
@@ -923,15 +1027,38 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
             # to split it by
             note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
                  llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
-                 llm_prompt_chars=sum(len(text_of(m["content"])) for m in messages))
+                 llm_prompt_chars=sum(len(text_of(m.get("content"))) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
-            return choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content"))
-    return "", []
+            if tools and choice.get("finish_reason") == "length":  # its tool calls are cut off where it stopped
+                log.warning(f"LLM {name} ran out of tokens with tools: {str(choice['message'])[:300]}")
+                note(llm_cut_off=True)
+            said = (choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content")))
+            return (*said, choice["message"].get("tool_calls") or []) if tools else said
+    return failed
 
 # name: one of LLMS — passed in, since !model can switch while a reply is being written. pages: a long chat's frozen
 # pages, before `history` — in LONG_CHAT_CHANNELS, else None.
-async def llm_reply(name, message, author, bot_name, history=None, at=None, pages=None):
+# A remember or forget call carried out, and what came of it, for the trace
+def use_memory(call, mind):
+    f = call.get("function") or {}
+    try:
+        args = json.loads(f.get("arguments") or "{}")
+        if f.get("name") == "remember":
+            kept = remember(mind["space"], args["about"], args["fact"], mind["by"], mind["people"])
+            result = f"Remembered as [{kept['n']}]."
+        elif f.get("name") == "forget":
+            result = f"Forgot [{args['number']}]." if forget(mind["space"], int(args["number"])) else "No such memory."
+        else:
+            result = f"No tool called {f.get('name')!r}."
+    except (ValueError, KeyError, TypeError) as e:
+        result = f"That didn't work: {e!r}"
+    if (t := trace.get()) is not None:
+        t.setdefault("memory_calls", []).append({"name": f.get("name"), "arguments": f.get("arguments"), "result": result})
+    return result
+
+# mind: where it's replying and who's there, for its memory — {"space", "people": {id: name}, "by": the author's id}
+async def llm_reply(name, message, author, bot_name, history=None, at=None, pages=None, mind=None):
     spec = LLMS[name]
     state = transcript(message, author, bot_name, history, [], at=at or datetime.now(timezone.utc))
     chat = state.rsplit("\n", 1)[0]  # without its own empty turn, which the request asks for instead
@@ -944,10 +1071,16 @@ async def llm_reply(name, message, author, bot_name, history=None, at=None, page
     ask = (f"\n\nWrite {bot_name}'s reply to {author}'s last message. Output only the message." + spec.get("tail", ""))
     if (dice := spec.get("question_dice")) is not None and random.random() >= dice:
         ask += ' This time, no ", question?" tag.'
+    remembers = mind and spec.get("memory")
+    if remembers:
+        # After the chat, where it changes nothing cached when a memory is kept
+        if lines := memory_lines(mind["space"], mind["people"], numbered=False):
+            ask = f"\n\nWhat {bot_name} knows from earlier chats:\n" + "\n".join(lines) + ask
+        note(memories_shown=len(lines))
     # A long chat's pages come first and never change, so the cache can end after the last; the newest messages and
     # the request after it are read in full. The lines aren't shuffled there either, or nothing would match.
     blocks = [f"The chat so far, times in {TIMEZONE.key}:\n\n", *[t + "\n" for t in texts], chat + ask]
-    system = rocky_prompt(bot_name, spec.get("shuffle") and pages is None)
+    system = rocky_prompt(bot_name, spec.get("shuffle") and pages is None) + (MEMORY_SEEN.format(bot=bot_name) if remembers else "")
     if pages is not None and spec.get("cache_marks"):
         blocks = [{"type": "text", "text": t} for t in blocks]
         if texts:
@@ -966,6 +1099,24 @@ async def llm_reply(name, message, author, bot_name, history=None, at=None, page
         if has_credit is False:
             break
     return "..."
+
+# After a reply is sent: anything in it, or the message it answered, to remember or forget. history: the chat before
+# the message, as llm_reply had it. Its text is never shown — only what it does with the tools counts.
+async def keep_memories(name, message, author, bot_name, history, reply, mind, at=None):
+    recent_chat = transcript(message, author, bot_name, (history or [])[-KEEPER_MESSAGES:], [],
+                             at=at or datetime.now(timezone.utc)).rsplit("\n", 1)[0] + f"\n{bot_name}: {reply}"
+    lines = memory_lines(mind["space"], mind["people"])
+    ask = (f"The last few messages:\n\n{recent_chat}\n\n"
+           + ("Remembered here:\n" + "\n".join(lines) if lines else "Nothing remembered here yet.")
+           + f"\n\nAnything in {author}'s last message or {bot_name}'s reply to keep, or change?")
+    cost = (t := trace.get()) and t["cost"]
+    # One request: it makes every call it needs at once, and isn't asked again — what came of them is only logged
+    _, _, calls = await llm(name, [{"role": "system", "content": MEMORY_KEEPER.format(bot=bot_name)},
+                                   {"role": "user", "content": ask}], tools=MEMORY_TOOLS)
+    for c in calls:
+        use_memory(c, mind)
+    if t is not None:
+        t["memory_cost"] = t["cost"] - cost
 
 async def llm_status(name, bot_name, start, chat=""):
     spec = LLMS[name]
@@ -1271,14 +1422,16 @@ def should_respond(m):
 # channel_history is in memory, so rebuild it from Discord the first time a channel talks to jev after a restart
 history_loaded: dict[int, asyncio.Task] = {}
 
-# !why on its own in a message, and !model with or without a model's name — the command, or None
-COMMANDS = {"!why", "!model"}
+# !why and !memories on their own in a message, !model with or without a model's name, and !forget with a memory's
+# number — the command, or None
+COMMANDS = {"!why", "!model", "!memories", "!forget"}
 
 def command(m):
     if m.author.bot:
         return None
     c = strip_mention(m).lower().split()
-    if c and c[0] in COMMANDS and (len(c) == 1 or c[0] == "!model" and len(c) == 2):
+    if c and c[0] in COMMANDS and (len(c) == 1 and c[0] != "!forget" or c[0] == "!model" and len(c) == 2
+                                   or c[0] == "!forget" and len(c) == 2 and c[1].lstrip("[").rstrip("]").isdigit()):
         return c[0]
     return None
 
@@ -1686,7 +1839,7 @@ async def on_message(m):
         heard = True
     if cmd := command(m):
         if not stopping.is_set():
-            await {"!why": why, "!model": model_command}[cmd](m)
+            await {"!why": why, "!model": model_command, "!memories": memories_command, "!forget": forget_command}[cmd](m)
         return
     if not should_respond(m):
         # Not for jev, but part of the conversation it might be asked about
@@ -2099,6 +2252,33 @@ async def model_command(m):
     await m.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
 
 
+# !memories: what's remembered in this server (or DM), numbered for !forget. A long list comes as memories.txt.
+async def memories_command(m):
+    lines = memory_lines(space_of(m), {str(m.author.id): m.author.display_name})
+    text = "\n".join(lines)
+    if not lines:
+        await m.reply("Nothing remembered here yet", mention_author=False)
+    elif len(text) + 50 <= CONTEXT_LIMIT:
+        await m.reply(f"Remembered here (`!forget <number>` to drop one):\n{text}", mention_author=False,
+                      allowed_mentions=discord.AllowedMentions.none())
+    else:
+        await m.reply("Remembered here (`!forget <number>` to drop one):", file=discord.File(io.BytesIO(text.encode()),
+                      "memories.txt"), mention_author=False)
+
+# !forget <number>: drops a memory — by the person it's about, or whoever it was saved for
+async def forget_command(m):
+    space, n = space_of(m), int(strip_mention(m).split()[1].strip("[]"))
+    f = next((f for f in memories.get(space, {}).get("facts", []) if f["n"] == n), None)
+    if f is None:
+        text = f"Nothing remembered as [{n}]"
+    elif str(m.author.id) not in (f["uid"], f["by"]):
+        text = f"Only {f['about']}, or whoever it was saved for, can drop [{n}]"
+    else:
+        forget(space, n)
+        text = f"Forgot [{n}] {f['about']}: {f['fact']}"
+    await m.reply(text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+
 # Messages jev has taken on, so each is answered once: at startup, catch_up() can find one on_message is already
 # answering (its reply not sent yet, so it looks missed), or the other way round. The latest only — catch_up() looks
 # back CATCH_UP_WINDOW minutes.
@@ -2170,6 +2350,14 @@ async def handle(m, c):
                     await attach_reactions(reply_entry, r, prefix="")
                 x.append(reply_entry)
     note(bot_name=bot_name, history=h)
+    # Its memory of this server or DM, and who's in the chat — none in a side conversation, which sees nothing else
+    mind = None
+    if root is None:
+        people = {}
+        for e in [*long, *(e for p in pages or [] for e in p)]:
+            people.update(e.get("users") or {})  # who wrote it, and who it mentions
+        people.pop(str(bot.user.id), None)
+        mind = {"space": space_of(m), "people": people | {str(m.author.id): m.author.display_name}, "by": m.author.id}
     try:
         # Kept out of history: jev would see the link in its transcript and start talking about it
         if has_credit is False:
@@ -2195,7 +2383,7 @@ async def handle(m, c):
                 targets = mention_targets([e for p in pages or [] for e in p] + [*long, entry], bot_name,
                                           reactors=True) if using_llm else {}
                 r = await generate_reply(c, m.author.display_name, bot_name, history=h, llm_history=long,
-                                         at=m.created_at, pages=pages)
+                                         at=m.created_at, pages=pages, mind=mind)
         if has_credit is False and r == "...":  # ran out before the first word
             r = random.choice(NO_MONEY)
         note(reply=r)
@@ -2209,6 +2397,12 @@ async def handle(m, c):
             entry["reply_users"] = message_users(sent)
             if root is not None:
                 side_of[sent.id] = root  # replies to it carry on the side conversation
+            if mind and (name := model_name) in LLMS and LLMS[name].get("memory") and r != "...":
+                try:  # the reply is out, so nobody waits on this — and it going wrong mustn't send "..."
+                    await keep_memories(name, c, m.author.display_name, bot_name, long, r, mind, at=m.created_at)
+                except Exception as e:
+                    log.warning(f"Keeping memories failed: {e!r}")
+                    note(memory_error=repr(e))
     except Exception as e:
         log.error(f"Error: {e}", exc_info=True)
         note(error=repr(e))

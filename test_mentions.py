@@ -56,6 +56,8 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
             (j, "REACTORS_PATH", Path(self.reactors_dir.name) / "reactors.json"),
+            (j, "memories", {}),
+            (j, "MEMORY_PATH", Path(self.reactors_dir.name) / "memories.json"),
         ]:
             p = patch.object(obj, attr, value)
             p.start()
@@ -802,6 +804,69 @@ class LongHistoryTests(_Handling):
         self.assertNotIn("message 291\n", state)
         self.assertIn("message 240\n", state)
         self.assertNotIn("message 230\n", state)
+
+
+class MemoryTests(_Handling):
+    """After a reply is sent, Haiku's keeper looks for something to remember; people can list and drop memories."""
+
+    async def test_the_keeper_runs_after_the_reply_with_who_is_in_the_chat(self):
+        j.add_history(self.channel.id, j.history_entry(self.said("my dog moss ate a sock", name="kettle", ping=False)))
+        m = self.said("rocky what's my dog called?", name="kettle")
+        sent = []
+        m.reply = AsyncMock(side_effect=lambda *a, **k: sent.append(a[0]) or self.said(a[0], to=m, bot=True))
+
+        async def keep(*args, **kwargs):
+            self.assertEqual(sent, ["Moss."])  # the reply is out first
+            keep.args = args
+
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "keep_memories", keep), \
+                patch.object(j, "generate_reply", AsyncMock(return_value="Moss.")) as gen:
+            await j.handle(m, j.message_text(m))
+        mind = gen.call_args.kwargs["mind"]
+        self.assertEqual(mind, {"space": "400", "people": {"500": "kettle"}, "by": 500})
+        self.assertEqual(keep.args[:6], ("haiku", "@Testbot rocky what's my dog called?", "kettle", "Testbot",
+                                         gen.call_args.kwargs["llm_history"], "Moss."))
+
+    async def test_a_failing_keeper_sends_no_dots_and_jev_keeps_nothing(self):
+        for model in ("haiku", "jev"):
+            with self.subTest(model=model):
+                m = self.said("my cat is called biscuit")
+                m.reply = AsyncMock(return_value=self.said("Good name.", to=m, bot=True))
+                keep = AsyncMock(side_effect=RuntimeError("synthetic keeper failure"))
+                with patch.object(j, "model_name", model), patch.object(j, "keep_memories", keep), \
+                        patch.object(j, "generate_reply", AsyncMock(return_value="Good name.")):
+                    await j.handle(m, j.message_text(m))
+                m.reply.assert_awaited_once()
+                self.assertEqual(keep.await_count, model == "haiku")
+
+    async def test_a_side_conversation_has_no_memory(self):
+        q = self.said("!nocontext my cat is called biscuit")
+        q.reply = AsyncMock(return_value=self.said("Good name.", to=q, bot=True))
+        keep = AsyncMock()
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "keep_memories", keep), \
+                patch.object(j, "generate_reply", AsyncMock(return_value="Good name.")) as gen:
+            await j.handle(q, j.message_text(q))
+        self.assertIsNone(gen.call_args.kwargs["mind"])
+        keep.assert_not_awaited()
+
+    async def test_memories_can_be_listed_and_dropped_by_who_they_are_about_or_for(self):
+        j.remember("400", "pip", "is vegetarian", 502, {"500": "pip"})  # about pip (500), saved for kettle (502)
+        j.remember("400", "the geese", "chased kettle", 502)
+        for content, who, expected in [
+                ("!memories", 503, "[1] pip: is vegetarian\n[2] the geese: chased kettle"),
+                ("!forget 2", 503, "Only the geese, or whoever it was saved for, can drop [2]"),
+                ("!forget [1]", 500, "Forgot [1] pip: is vegetarian"),
+                ("!forget 2", 502, "Forgot [2] the geese: chased kettle"),
+                ("!forget 2", 502, "Nothing remembered as [2]"),
+                ("!memories", 502, "Nothing remembered here yet")]:
+            with self.subTest(content=content):
+                m = self.said(content, ping=False)
+                m.author.id = who
+                m.reply = AsyncMock()
+                self.assertEqual(j.command(m), content.split()[0])
+                await j.on_message(m)
+                self.assertIn(expected, m.reply.call_args.args[0])
+        self.assertIsNone(j.command(self.said("!forget the geese", ping=False)))  # chat, not a command
 
 
 class LongChatTests(_Handling):
