@@ -1181,7 +1181,7 @@ def attachment_tag(a):
 # never reaches the vocab from the message or, later, from the history.
 NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)[ \t]*", re.IGNORECASE)
 # The inline navigation marker on jev's side-conversation replies is UI, never model context.
-SIDE_LINK = re.compile(r" \[↳\]\(https://discord\.com/channels/(?:@me|\d+)/\d+/\d+\)$")
+SIDE_LINK = re.compile(r" \[↳(?: thread)?\]\(https://discord\.com/channels/(?:@me|\d+)/\d+/\d+\)$")
 
 def no_context(m):
     return should_respond(m) and NO_CONTEXT.search(strip_mention(m)) is not None
@@ -2207,7 +2207,7 @@ async def handle(m, c):
         content, allowed = resolve_mentions(r, targets) if using_llm else (r, discord.AllowedMentions.none())
         if root is not None and r not in NO_MONEY:
             guild_id = m.guild.id if m.guild else "@me"
-            content += f" [↳](https://discord.com/channels/{guild_id}/{m.channel.id}/{root})"
+            content += f" [↳ thread](https://discord.com/channels/{guild_id}/{m.channel.id}/{root})"
         note(sent=content)  # !why matches the actual Discord text, while reply/tokens keep what the model wrote
         sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
