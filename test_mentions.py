@@ -599,7 +599,7 @@ class OutgoingMentionTests(_Handling):
                 rebuilt = j.entries_with(self.channel.id, root.id)[0]
                 self.assertEqual(live["reply"], rebuilt["reply"])
                 self.assertEqual(live["reply_users"], rebuilt["reply_users"])
-                marker = f" [↳ thread](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{root.id})" if side else ""
+                marker = f" [↳](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{root.id})" if side else ""
                 self.assertEqual(question.reply.call_args.args[0], f"<@{uid}>!" + marker)
 
 
@@ -659,7 +659,7 @@ class NoContextChainTests(_Handling):
     async def test_replies_link_to_root_without_putting_marker_in_context(self):
         q = self.said("!nocontext favourite rock?")
         await self.answer(q, "Granite.")
-        marker = f" [↳ thread](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{q.id})"
+        marker = f" [↳](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{q.id})"
         self.assertEqual(self.sent.content, "Granite." + marker)
         self.assertEqual(self.trace["sent"], "Granite." + marker)
         self.assertEqual(j.message_text(self.sent), "Granite.")
@@ -675,8 +675,8 @@ class NoContextChainTests(_Handling):
         await self.answer(self.said("favourite rock?"), "Granite.")
         self.assertEqual(self.sent.content, "Granite.")
 
-    def test_previous_arrow_only_marker_stays_out_of_context(self):
-        m = self.said("Granite. [↳](https://discord.com/channels/400/300/800)", bot=True)
+    def test_previous_thread_label_stays_out_of_context(self):
+        m = self.said("Granite. [↳ thread](https://discord.com/channels/400/300/800)", bot=True)
         self.assertEqual(j.message_text(m), "Granite.")
 
     async def test_dm_side_reply_links_to_dm_root(self):
@@ -684,7 +684,7 @@ class NoContextChainTests(_Handling):
         q.guild = None
         await self.answer(q, "Granite.")
         self.assertEqual(self.sent.content,
-                         f"Granite. [↳ thread](https://discord.com/channels/@me/{self.channel.id}/{q.id})")
+                         f"Granite. [↳](https://discord.com/channels/@me/{self.channel.id}/{q.id})")
         self.assertEqual(j.message_text(self.sent), "Granite.")
 
     async def test_every_branch_sees_the_whole_side_conversation(self):

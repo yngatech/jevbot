@@ -2409,7 +2409,7 @@ async def handle(m, c):
         content, allowed = resolve_mentions(r, targets) if using_llm else (r, discord.AllowedMentions.none())
         if root is not None and r not in NO_MONEY:
             guild_id = m.guild.id if m.guild else "@me"
-            content += f" [↳ thread](https://discord.com/channels/{guild_id}/{m.channel.id}/{root})"
+            content += f" [↳](https://discord.com/channels/{guild_id}/{m.channel.id}/{root})"
         note(sent=content)  # !why matches the actual Discord text, while reply/tokens keep what the model wrote
         sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
