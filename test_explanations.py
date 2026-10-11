@@ -258,6 +258,35 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         render.assert_called_once()
         self.assertEqual(self.sent[-1][0], "Nothing logged for that")
 
+    async def test_why_command_and_actions_find_a_converted_user_mention(self):
+        logged = dict(self.logged, reply="@Moss knows", sent="<@100000000000000002> knows", llm="deepseek",
+                      llm_tokens=[{"token": "@Moss", "p": .8, "top": [["@Moss", .8]]}])
+        j.write_trace(logged)
+        target = self.target(logged)
+        target.content = logged["sent"]
+        target.clean_content = logged["reply"]
+        with patch.object(j.why_chart, "render", return_value=b"mention chart") as render:
+            await j.why(self.command(target))
+            await j.why_action.callback(self.interaction(), target)
+            await j.context_action.callback(self.interaction(), target)
+        render.assert_called_once()
+        self.assertEqual(self.chart_bytes(self.sent[0]), b"mention chart")
+        self.assertTrue(self.sent[1][3]["ephemeral"])
+        self.assertIn("What Testbot saw", self.sent[2][0])
+        self.assertEqual(j.find_trace(self.channel.id, target), logged)
+        target.content = "<@100000000000000002> edited"
+        self.assertIsNone(j.find_trace(self.channel.id, target))  # the new sent field still detects edits
+
+    async def test_legacy_converted_mentions_match_readable_text_but_require_the_same_id(self):
+        logged = dict(self.logged, reply="@Moss knows")
+        j.write_trace(logged)
+        target = self.target(logged)
+        target.content = "<@100000000000000002> knows"
+        target.clean_content = "@Moss knows"
+        self.assertEqual(j.find_trace(self.channel.id, target), logged)
+        target.id += 1
+        self.assertIsNone(j.find_trace(self.channel.id, target))
+
     async def test_llm_and_status_charts_are_cached(self):
         llm = dict(self.logged, llm="deepseek", llm_tokens=[{"token": "Tea", "p": .8, "top": [["Tea", .8]]}])
         status = {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40,
