@@ -18,6 +18,7 @@ jev_bot hands itself over with bind() — run as a script it's __main__, so impo
 """
 
 import asyncio
+import contextlib
 import html
 import json
 import re
@@ -301,7 +302,9 @@ def said(content, bot_name):
 # Rocky's turn after `waking` (already in the log): its message and tool calls, usually in one response. Only a turn
 # that just kept or dropped memories gets another request, for what it then says. Its requests go through
 # jev_bot.llm_message, which counts their cost on the trace.
-async def take_turn(log, waking, model="rocky", bot_name="rocky"):
+# typing: the channel's typing() — shown only for that second request. Discord shows "rocky is typing" for ~10s after
+# it's sent, and nothing stops it but a message, so shown while it decided, it lingered after a turn that only reacted.
+async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     turn = Turn()
     waking["woke"] = True  # and stays, so the turn it's in reads the same in every later request
     now = datetime.now(timezone.utc)
@@ -312,9 +315,10 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky"):
     t = j.trace.get()
     cost = t["cost"]
     try:
-        for _ in range(1 + FOLLOW_UPS):
-            message = await j.llm_message(model, render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks"))),
-                                          MAX_TOKENS, tools=TOOLS, reasoning=REASONING)
+        for request in range(1 + FOLLOW_UPS):
+            async with typing() if typing and request else contextlib.nullcontext():
+                message = await j.llm_message(model, render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks"))),
+                                              MAX_TOKENS, tools=TOOLS, reasoning=REASONING)
             if message is None:
                 break
             turn.requests += 1

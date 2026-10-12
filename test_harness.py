@@ -147,8 +147,19 @@ class TurnTests(_Case):
         self.assertEqual([e["content"] for e in self.log.events if e["type"] == "result"], ["Reacted.", "Remembered as [1]."])
 
     async def test_after_only_remembering_it_gets_a_turn_to_speak(self):
-        turn, llm = await self.turn(answer(calls=[("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
-                                    answer("Biscuit. Good name."))
+        typed = []
+
+        @__import__("contextlib").asynccontextmanager
+        async def typing():
+            typed.append(llm.await_count)
+            yield
+
+        q = self.said("pip", "rocky my cat is called biscuit", 0, to_bot=True)
+        llm = AsyncMock(side_effect=[answer(calls=[("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
+                                     answer("Biscuit. Good name.")])
+        with patch.object(j, "llm_message", llm):
+            turn = await rh.take_turn(self.log, q, typing=typing)
+        self.assertEqual(typed, [1])  # typing only for the request after the first: it's going to speak
         self.assertEqual((turn.text, turn.requests), ("Biscuit. Good name.", 2))
         self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": "Remembered as [1]."})
 

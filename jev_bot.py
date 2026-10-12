@@ -2387,9 +2387,8 @@ async def rocky_turn(m, entry, bot_name, entries):
     chat = rh.log_for(m.channel)
     rh.sync(chat, entries)
     waking = rh.observe(m)  # there already, unless it's one caught up on at startup
-    async with m.channel.typing():
-        async with gen_lock:
-            turn = await rh.take_turn(chat, waking, "rocky", bot_name)
+    async with gen_lock:  # no typing while it decides — it may only react (take_turn)
+        turn = await rh.take_turn(chat, waking, "rocky", bot_name, typing=m.channel.typing)
     rh.jump(chat)
     note(llm="rocky", llm_model=LLMS["rocky"]["id"], transcript=rh.readable(chat, bot_name, last=40),
          llm_messages=sum(e["type"] == "message" for e in chat.events), harness_requests=turn.requests,
