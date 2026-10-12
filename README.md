@@ -38,6 +38,7 @@ OPENROUTER_API_KEY_EVAL=another_openrouter_key
 STATUS_CHANNEL_ID=channel_to_post_statuses_in
 TIMEZONE=Europe/London
 LONG_CONTEXT_CHANNEL_IDS=channel_ids_for_long_chats
+ROCKY_VIEWER_PORT=8350
 ```
 
 For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments). A line can start with a note in brackets on what had just happened (`(a friend uses slang he doesn't know) No understand word.`), so the LLM sees when he says it; it's told the notes aren't his words. They're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes.
@@ -45,6 +46,8 @@ For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next
 `TIMEZONE` (an IANA name, UTC if unset) is the clock the times in an LLM's transcript are shown on.
 
 `LONG_CONTEXT_CHANNEL_IDS` (comma-separated, none if unset) are the channels where an LLM sees a long chat (see History).
+
+`ROCKY_VIEWER_PORT` (off if unset) serves the page of Rocky's logs on that port while the bot runs (see Rocky's logs).
 
 `OPENROUTER_API_KEY` is the bot's; `jev_eval.py` uses `OPENROUTER_API_KEY_EVAL` instead, so each key can have its own credit limit on OpenRouter and their usage shows up separately.
 
@@ -96,7 +99,18 @@ With `!model`, and the 200-message history, a reply costs ~$0.0015 with Haiku (i
 
 ## Logs
 
-Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, request purposes and reported billing in `api_calls`, the reaction or each word it picked (with its top candidates, each with its probability and its score after penalties, and the done score), and what the API calls actually cost — including a request OpenRouter sent on our own Anthropic key (its BYOK), which OpenRouter reports as free; that part is also logged on its own as `byok_cost`. Status entries also keep each candidate in `status_attempts`, with its judgement score, acceptance, generation trace and cost; the top-level word steps and transcript belong to the accepted candidate so `!why` and Context still show what was posted. The total cost includes all attempts and judgements, including when no new status was accepted. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
+Every message jev handles is written as one JSON line to `logs/YYYY-MM-DD.jsonl`: who said what, the history and transcript jev saw, the question score, request purposes and reported billing in `api_calls`, the reaction or each word it picked (with its top candidates, each with its probability and its score after penalties, and the done score), and what the API calls actually cost — including a request OpenRouter sent on our own Anthropic key (its BYOK), which OpenRouter reports as free; that part is also logged on its own as `byok_cost`. Status entries also keep each candidate in `status_attempts`, with its judgement score, acceptance, generation trace and cost; the top-level word steps and transcript belong to the accepted candidate so `!why` and Context still show what was posted. The total cost includes all attempts and judgements, including when no new status was accepted. A `!model rocky` turn also keeps its events from Rocky's log in `rocky_events`: its responses, with their thinking and tool calls, and its calls' results. The console's `[OUT]` and `[REACT]` lines show the cost too. `logs/` holds what people said in the server, so it's gitignored — keep it local and delete old days whenever.
+
+## Rocky's logs
+
+`rocky_viewer.py` is a web page for looking into `!model rocky`: a channel's log as Rocky sees it, with people's messages, reactions, edits and deletions, and its turns with their thinking (folded away), tool calls and results, and what each turn cost, its tokens and how much was read from the cache, and how long it took; every turn it has taken, newest first, from `logs/`, which goes back past a log's jumps; and its memories, now and as they are in its `<memories>` snapshot. It reads only the files the bot writes, so it shows a log a couple of seconds after it changes and a turn once it's finished, and the open page picks up changes every few seconds.
+
+```bash
+python rocky_viewer.py                    # http://127.0.0.1:8350, this checkout's files
+python rocky_viewer.py --root ../jevbot   # another checkout's
+```
+
+With `ROCKY_VIEWER_PORT` set, the bot serves it too, for as long as it runs. Either way it listens on 127.0.0.1 only, and the page runs no script but its own, showing what people said as text. The logs hold what people said in the server, so it's for this machine; to open it to others, put something in front that checks who's asking first (Cloudflare Tunnel with Cloudflare Access, say), never the bare port.
 
 ## Reactions
 
@@ -124,6 +138,8 @@ A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter bil
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
 `test_status.py` exercises status generation, judging, retries and publishing with synthetic API results and Discord writes (`python -m unittest test_status`). It checks that rejected or unscored candidates keep the previous status, that accepted candidates retain their original wording and diagnostic trace, and that quiet and out-of-credit periods make no attempts.
+
+`test_viewer.py` checks `rocky_viewer.py`'s answers offline with synthetic logs: a channel's log, memories and turns, turns read from a day's file as it grows (a line still being written left for later), a page at a time, nothing sent when nothing has changed, and no file served but the page's own (`python -m unittest test_viewer`).
 
 `test_reactions.py` checks `reactions.py` offline: which log entries count as posts, matching them to synthetic Discord messages, leaving out jev's own reactions, and keeping 👎 apart (`python -m unittest test_reactions`).
 

@@ -172,6 +172,9 @@ class TurnTests(_Case):
             turn = await rh.take_turn(self.log, q, typing=typing)
         self.assertEqual(typed, [1])  # typing only for the request after the first: it's going to speak
         self.assertEqual((turn.text, turn.requests), ("Biscuit. Good name.", 2))
+        # Both its responses and the result between them, for the day's log (and rocky_viewer)
+        self.assertEqual([e["type"] for e in turn.events], ["rocky", "result", "rocky"])
+        self.assertEqual(turn.events, self.log.events[-3:])
         self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": "Remembered as [1]."})
 
     async def test_only_reacting_or_nothing_is_one_request(self):

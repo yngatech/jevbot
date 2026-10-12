@@ -33,6 +33,7 @@ from dotenv import load_dotenv
 
 import why_chart
 import rocky_harness as rh
+import rocky_viewer
 
 load_dotenv()
 
@@ -42,6 +43,7 @@ STATUS_CHANNEL = int(os.environ.get("STATUS_CHANNEL_ID") or 0)  # where each new
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE") or "UTC")  # the clock an LLM's transcript shows times on (IANA name)
 # Channels where an LLM sees a long chat, kept in pages it can cache (see "Long chats" below) — comma-separated IDs
 LONG_CHAT_CHANNELS = {int(c) for c in (os.environ.get("LONG_CONTEXT_CHANNEL_IDS") or "").split(",") if c.strip()}
+VIEWER_PORT = int(os.environ.get("ROCKY_VIEWER_PORT") or 0)  # the page of Rocky's logs, on 127.0.0.1 — unset for none
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
 END = "<END>"
@@ -1100,6 +1102,12 @@ async def setup_hook():
         log.info(f"Synced {len(synced)} app command(s)")
     except discord.HTTPException as e:
         log.warning(f"Registering app commands failed: {e}")
+    if VIEWER_PORT:
+        try:
+            await rocky_viewer.start(VIEWER_PORT)
+            log.info(f"Rocky's logs on http://127.0.0.1:{VIEWER_PORT}")
+        except OSError as e:  # the port's taken — jev runs without it
+            log.warning(f"Serving Rocky's logs failed: {e}")
 bot.setup_hook = setup_hook
 
 # Stopping: the first Ctrl-C (or SIGINT/SIGTERM) takes no new messages and lets the ones being answered finish —
@@ -2397,7 +2405,7 @@ async def rocky_turn(m, entry, bot_name, entries):
     rh.jump(chat)
     note(llm="rocky", llm_model=LLMS["rocky"]["id"], transcript=rh.readable(chat, bot_name, last=40),
          llm_messages=sum(e["type"] == "message" for e in chat.events), harness_requests=turn.requests,
-         memory_kept=[list(k) for k in turn.kept])
+         memory_kept=[list(k) for k in turn.kept], rocky_events=turn.events)
     vocab = emoji_vocabulary(m.guild)
     for n, emoji in turn.reactions:
         target = m.id if n == waking["n"] else chat.discord_id(n)
