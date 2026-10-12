@@ -126,6 +126,17 @@ class ToolTests(_Case):
         self.assertEqual(self.call("forget", number=1)[1], "No such fact.")
         self.assertIn("didn't work", rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about"'}}, {"n": 1})[1])
 
+    def test_a_note_is_kept_as_its_call_and_left_out_of_context(self):
+        self.assertEqual(self.call("note", text="picked 4"), (None, "Noted."))
+        self.assertEqual(self.call("note", text=" ")[1], "Nothing to note.")
+        self.log.add("rocky", text="", calls=[{"id": "c1", "name": "note", "arguments": '{"text": "picked 4"}'},
+                                              {"id": "c2", "name": "react", "arguments": '{"emoji": "🤫"}'}])
+        rendered = rh.render(self.log, "rocky")[-1]["tool_calls"]
+        self.assertEqual(rendered[0]["function"]["arguments"], '{"text": "picked 4"}')  # Rocky sees its note
+        readable = rh.readable(self.log, "rocky")
+        self.assertNotIn("picked 4", readable)  # Context, which anyone can open, doesn't
+        self.assertIn('[note] [react {"emoji": "🤫"}]', readable)
+
     def test_a_wordless_answer_is_nothing_and_a_leading_tag_of_the_asker_goes(self):
         for text in ("(silent)", ".", "*nothing*", "[no reply]"):
             self.assertEqual(rh.said(text, "rocky"), "")
@@ -177,6 +188,10 @@ class TurnTests(_Case):
         self.assertEqual(turn.events, self.log.events[-3:])
         self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": "Remembered as [1]."})
 
+    async def test_after_only_a_note_it_gets_a_turn_to_speak(self):
+        turn, llm = await self.turn(answer(calls=[("note", {"text": "picked 4"})]), answer("Rocky pick. Not tell."))
+        self.assertEqual((turn.text, turn.requests), ("Rocky pick. Not tell.", 2))
+
     async def test_only_reacting_or_nothing_is_one_request(self):
         turn, llm = await self.turn(answer(calls=[("react", {"emoji": "😂"})]))
         self.assertEqual((turn.text, turn.reactions, llm.await_count), ("", [(1, "😂")], 1))
@@ -184,6 +199,8 @@ class TurnTests(_Case):
         turn, llm = await self.turn(answer("(silent)"))
         self.assertEqual((turn.text, turn.reactions, llm.await_count), ("", [], 1))
         self.assertEqual(len(self.log.events), events + 1)  # just the message — an empty turn isn't kept
+        turn, llm = await self.turn(answer(calls=[("note", {"text": "picked 4"}), ("react", {"emoji": "🤫"})]))
+        self.assertEqual((turn.reactions, llm.await_count), ([(3, "🤫")], 1))
 
 
 class KeepingTests(_Case):

@@ -107,6 +107,7 @@ article { padding: .4rem .75rem; margin: .15rem 0; border-radius: 8px; }
 }
 .call-remember .tool { color: #2f7d4a; }
 .call-forget .tool { color: var(--warn); }
+.call-note .tool { color: var(--think); }  /* private, like its thinking */
 .result { font: 12px var(--mono); color: var(--dim); }
 .emoji { font-size: 16px; }
 .metrics {
