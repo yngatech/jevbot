@@ -24,33 +24,26 @@ import aiohttp
 import jev_bot as j
 
 LOG_CHARS = 200_000         # a log's size before its oldest half goes — ~90K Haiku tokens, under its 100K price step
-MAX_TOKENS = 1000           # room for its notes before tool calls; a reply is still cut to its first paragraph
-FOLLOW_UPS = 2              # requests after one that called tools, for what it then says
+MAX_TOKENS = 4000           # its thinking, its message and its tool calls; the message is cut to its first paragraph
+FOLLOW_UPS = 1              # requests after one that only kept or dropped memories, for what it then says
 CACHE = {"type": "ephemeral", "ttl": "1h"}
-SAY = True                  # speak with a say tool, and keep its other text to itself (see SPEAKING)
+FACT_CHARS = 100            # a remembered fact's longest
+# It thinks first. Without thinking, Haiku narrated in 3 of 57 eval turns ("Pip asked a plain question, so I answer
+# that one"); given a say tool for its message instead, it didn't, but thinking with that tool it sometimes did nothing
+# (5 of 57). Thinking and speaking its turn: no narration in 57, reply-or-react right as often, for 0.033¢ a turn
+# where no thinking was 0.015¢, and ~2s slower.
+REASONING = {"effort": "low"}
 
 HARNESS = """
 
-This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you — and woke_you="yes" the one you're answering now; earlier ones may have been answered already, or have moved on. Reactions and edits show up as they happen. Your own earlier messages are your turns.
+This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions and edits show up as they happen. Your own earlier messages are your turns.
 
-Your turn is what you write: it's posted in the channel as your reply to the message that woke you, so write only {bot}'s message, in his voice — never notes about the chat, about what {bot} would say, or about your tools. You can also:
-- react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and say nothing. Write a message when someone asks you something, wants something from you, or you truly have something to add.
-- remember: keep a fact for later chats in this server. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
-- forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed (then remember the new one).
-{speaking}"""
-
-# How it speaks. Writing its message as its reply, and after any tool call in a turn of its own, Haiku still narrated in
-# 3 of 57 eval turns ("Pip asked a plain question, so I answer that one"). With say, what it writes outside its tools
-# is never posted, so thinking aloud does no harm.
-SPEAKING = {
-    False: "A response that uses tools is silent: nothing written alongside a tool call is posted. Once they've run you get another turn — write your message then, or nothing at all (after a react, usually nothing). Never mention reacting, remembering or forgetting.",
-    True: "To speak, call say with your message — it's posted as your reply to the message that woke you, so don't start it with @ their name. Say one message at most. Nothing you write outside your tools is posted, so you can think there; your message itself is only {bot}'s words, never mention reacting, remembering or forgetting.",
-}
-
-SAY_TOOL = {"type": "function", "function": {
-    "name": "say", "description": "Post your message in the channel, as your reply to the message that woke you.",
-    "parameters": {"type": "object", "required": ["text"], "properties": {
-        "text": {"type": "string", "description": "What you say, in your voice"}}}}}
+Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools, alongside your message or instead of it. Write your message and make every tool call in the same response — don't wait to see what a tool did before you speak:
+- react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. Write a message when someone asks you something, wants something from you, or you truly have something to add.
+- remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
+- forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
+What you've remembered is in <memories>, and in your remember calls since.
+Never mention reacting, remembering or forgetting in your message."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -83,6 +76,12 @@ class Log:
     next_n: int = 1
     memories: list = field(default_factory=list)  # [{"n", "about", "fact"}], kept apart from the log
     next_memory: int = 1
+    shown: list = field(default_factory=list)     # the memories in <memories>: as they were at the last jump
+
+    # <memories> as they are now: at a jump, or when someone wants a fact really gone. Everything after it in the
+    # request is then read at full price once, so not for every remember — those are in the log as calls.
+    def reorganise(self):
+        self.shown = [dict(m) for m in self.memories]
 
     def message(self, author, text, at, to_bot=False, reply_to=None, uid=None):
         e = {"type": "message", "n": self.next_n, "author": author, "uid": uid, "at": at, "text": text,
@@ -128,15 +127,14 @@ def people_turn(events, clock, rocky_said):
     return "\n".join(lines)
 
 def memories_text(log):
-    if not log.memories:
+    if not log.shown:
         return "<memories>\nNothing yet.\n</memories>"
-    return "<memories>\n" + "\n".join(f"[{m['n']}] {m['about']}: {m['fact']}" for m in log.memories) + "\n</memories>"
+    return "<memories>\n" + "\n".join(f"[{m['n']}] {m['about']}: {m['fact']}" for m in log.shown) + "\n</memories>"
 
 # The request: system (persona and how this works), <memories>, then the log as turns. Cache marks on the system
 # prompt, the memories, and the end of the request — the next request starts with all of it.
 def render(log, bot_name, cache=True):
-    system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name,
-                                                       speaking=SPEAKING[SAY].format(bot=bot_name))
+    system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name)
     mark = lambda text: [{"type": "text", "text": text, **({"cache_control": CACHE} if cache else {})}]
     messages = [{"role": "system", "content": mark(system) if cache else system},
                 {"role": "user", "content": mark(memories_text(log)) if cache else memories_text(log)}]
@@ -150,16 +148,9 @@ def render(log, bot_name, cache=True):
     for e in log.events:
         if e["type"] == "rocky":
             flush()
-            if SAY and e["text"]:  # an earlier message, as the say call it would have been
-                said_id = f"say_{len(messages)}"
-                messages.append({"role": "assistant", "content": None, "tool_calls": [
-                    {"id": said_id, "type": "function", "function": {"name": "say", "arguments": json.dumps({"text": e["text"]})}}
-                    ] + [{"id": c["id"], "type": "function", "function": {"name": c["name"], "arguments": c["arguments"]}}
-                         for c in e["calls"]]})
-                messages.append({"role": "tool", "tool_call_id": said_id, "content": "Posted."})
-                rocky_said["last"] = e["text"]
-                continue
             m = {"role": "assistant", "content": e["text"] or None}
+            if e.get("reasoning"):  # its thinking, back as it came — signed, and not to be edited
+                m["reasoning_details"] = e["reasoning"]
             if e["calls"]:
                 m["tool_calls"] = [{"id": c["id"], "type": "function",
                                     "function": {"name": c["name"], "arguments": c["arguments"]}} for c in e["calls"]]
@@ -190,8 +181,8 @@ class Turn:
 
 async def complete(session, model, messages, turn):
     spec = j.LLMS[model]
-    body = {"model": spec["id"], "messages": messages, "tools": [SAY_TOOL, *TOOLS] if SAY else TOOLS, "max_tokens": MAX_TOKENS,
-            "temperature": j.LLM_TEMPERATURE, "reasoning": {"enabled": False}, "usage": {"include": True}}
+    body = {"model": spec["id"], "messages": messages, "tools": TOOLS, "max_tokens": MAX_TOKENS,
+            "temperature": j.LLM_TEMPERATURE, "reasoning": REASONING or {"enabled": False}, "usage": {"include": True}}
     if providers := spec.get("providers"):
         body["provider"] = {"order": providers, "require_parameters": True}
     for attempt in range(3):
@@ -220,9 +211,16 @@ def use(log, call, waking):
     try:
         args = json.loads(f.get("arguments") or "{}")
         if f.get("name") == "react":
-            return ("react", args.get("message") or waking["n"], args["emoji"]), "Reacted. That's usually the whole turn."
+            return ("react", args.get("message") or waking["n"], args["emoji"]), "Reacted."
         if f.get("name") == "remember":
             m = {"n": log.next_memory, "about": args["about"].strip().lstrip("@"), "fact": args["fact"].strip().rstrip(".")}
+            # Its thinking once spilled into a fact ("favourite film is Rocky — no, Project Hail Mary? Avoid; keep
+            # simple"), and was kept twice
+            if len(m["fact"]) > FACT_CHARS or "?" in m["fact"]:
+                return None, f"Not kept: one short, settled fact, under {FACT_CHARS} characters."
+            if same := next((x for x in log.memories if (x["about"].lower(), x["fact"].lower()) ==
+                             (m["about"].lower(), m["fact"].lower())), None):
+                return None, f"Already remembered as [{same['n']}]."
             log.next_memory += 1
             log.memories.append(m)
             return ("remember", m["n"], f"{m['about']}: {m['fact']}"), f"Remembered as [{m['n']}]."
@@ -236,19 +234,16 @@ def use(log, call, waking):
     except (ValueError, KeyError, TypeError) as e:
         return None, f"That didn't work: {e!r}"
 
-# What it wrote, as a message — or nothing: told it can say nothing after a react, Haiku wrote "(silent)" or "."
+# What it wrote, as a message — or nothing: told it can say nothing, Haiku has written "(silent)" or "."
 def said(content, bot_name):
     text = j.clean_llm(content or "", bot_name)
     return "" if not re.search(r"\w", text) or re.fullmatch(r"[(\[*].*[)\]*]", text) else text
 
-# Rocky's turn after `waking` (already in the log): a request, and after any that called tools, another for what it
-# says. Text alongside a tool call is the model thinking aloud ("A single lol, a quick react fits better") — it's
-# neither posted nor kept, or it would see itself doing it.
+# Rocky's turn after `waking` (already in the log): its message and tool calls, usually in one response. Only a turn
+# that just kept or dropped memories gets another request, for what it then says.
 async def take_turn(log, waking, model="haiku", bot_name="rocky", session=None):
     turn = Turn()
-    for e in log.events:
-        e.pop("woke", None)
-    waking["woke"] = True
+    waking["woke"] = True  # and stays, so the turn it's in reads the same in every later request
     own = session is None
     session = session or aiohttp.ClientSession(headers=j.HEADERS)
     try:
@@ -257,35 +252,10 @@ async def take_turn(log, waking, model="haiku", bot_name="rocky", session=None):
                                      turn)
             calls = [{"id": c["id"], "name": c["function"]["name"], "arguments": c["function"]["arguments"] or "{}"}
                      for c in message.get("tool_calls") or []]
-            if SAY:  # one request: what it says is its say call; its other text was thinking, and isn't kept
-                spoken = [c for c in calls if c["name"] == "say"][:1]
-                # No tool at all: its text is its reply — 3 of 57 eval turns, all in Rocky's voice. With the tools
-                # required instead, half its say calls came back with no text ({}).
-                text = "" if calls else said(message.get("content"), bot_name)
-                if spoken:
-                    try:
-                        text = said(json.loads(spoken[0]["arguments"]).get("text"), bot_name)
-                    except ValueError:
-                        pass
-                others = [c for c in calls if c["name"] != "say"]
-                if not text and not others:
-                    break  # nothing said or done — an empty turn isn't one the model can be shown later
-                log.add("rocky", text=text, calls=others)
-                for c in others:
-                    done, result = use(log, {"function": {"name": c["name"], "arguments": c["arguments"]}}, waking)
-                    log.add("result", id=c["id"], content=result)
-                    if done and done[0] == "react":
-                        turn.reactions.append(done[1:])
-                    elif done:
-                        turn.kept.append(done)
-                turn.text = text
-                break
-            if not calls:
-                if text := said(message.get("content"), bot_name):
-                    log.add("rocky", text=text, calls=[])
-                    turn.text = text
-                break
-            log.add("rocky", text="", calls=calls)
+            text = said(message.get("content"), bot_name)
+            if not text and not calls:
+                break  # nothing said or done — an empty turn isn't one the model can be shown later
+            log.add("rocky", text=text, calls=calls, reasoning=message.get("reasoning_details"))
             for c in calls:
                 done, result = use(log, {"function": {"name": c["name"], "arguments": c["arguments"]}}, waking)
                 log.add("result", id=c["id"], content=result)
@@ -293,6 +263,9 @@ async def take_turn(log, waking, model="haiku", bot_name="rocky", session=None):
                     turn.reactions.append(done[1:])
                 elif done:
                     turn.kept.append(done)
+            turn.text = " ".join(x for x in (turn.text, text) if x)
+            if text or all(c["name"] == "react" for c in calls):
+                break
     finally:
         if own:
             await session.close()
