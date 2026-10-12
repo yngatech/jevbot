@@ -89,6 +89,17 @@ class RenderTests(_Case):
         self.log.reorganise()  # at a jump
         self.assertIn("[1] pip: likes soup", j.text_of(rh.render(self.log, "rocky")[1]["content"]))
 
+    def test_after_a_tool_call_the_cache_mark_stays_where_the_last_request_ended(self):
+        q = self.said("pip", "rocky remember soup", 0, to_bot=True)
+        q["woke"] = True
+        first = rh.render(self.log, "rocky")
+        self.log.add("rocky", text="", calls=[{"id": "c1", "name": "remember", "arguments": '{"about": "pip", "fact": "soup"}'}])
+        self.log.add("result", id="c1", content="Remembered as [1].")
+        follow_up = rh.render(self.log, "rocky")
+        self.assertEqual(follow_up[2], first[2])  # people's turn, marked as the first request had it
+        self.assertEqual(follow_up[2]["content"][0]["cache_control"], rh.CACHE)
+        self.assertEqual(follow_up[-1]["role"], "tool")
+
     def test_memories_are_the_servers_not_the_channels(self):
         rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
         other = rh.Log("general", "400", 301)

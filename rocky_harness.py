@@ -229,8 +229,12 @@ def render(log, bot_name, cache=True):
         else:
             pending.append(e)
     flush()
-    if cache and messages[-1]["role"] == "user" and isinstance(messages[-1]["content"], str):
-        messages[-1] = {"role": "user", "content": mark(messages[-1]["content"])}
+    # The last of people's turns: the end of the request, or, in the request after a tool call, where the one before
+    # ended — marked only when it was last, that request after a tool call read only the system prompt and memories
+    # from the cache, and paid for the whole log (~0.47¢ for 47K tokens, where a turn was ~0.05¢)
+    last = max((i for i, m in enumerate(messages) if m["role"] == "user" and isinstance(m["content"], str)), default=None)
+    if cache and last is not None:
+        messages[last] = {"role": "user", "content": mark(messages[last]["content"])}
     return messages
 
 # The log as text, for Context and the logs: what it saw, without the system prompt
