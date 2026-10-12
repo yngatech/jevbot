@@ -4,7 +4,7 @@ channels in LONG_CONTEXT_CHANNEL_IDS.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
-and its tool calls (react, remember, forget) are kept with their results. Nothing in the log is rewritten, so every
+and its tool calls (react, remember, forget, note) are kept with their results. Nothing in the log is rewritten, so every
 request starts with the one before it and the model's prompt cache covers all but the newest events. A <memories>
 block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache would be rebuilt
 anyway (tidy): at a jump, when the log outgrows LOG_CHARS and its oldest half goes, or after CACHE_HOURS without a
@@ -48,8 +48,11 @@ LOG_DIR = Path(__file__).parent / "rocky_logs"          # a channel's log each, 
 MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
 
 # Its last paragraph is for secrets. Without it, on a live-length log, "pick a number and don't tell us" got "Rocky pick
-# seven" 4 times in 5, and a secret animal was named in its thinking once in 6, so asked later it made one up. With it,
-# the number or animal was in its thinking 11 times in 11, kept out of its message, and the one it named when asked.
+# seven" 4 times in 5, and a secret animal was named in its thinking once in 6, so asked later it made one up. Told to
+# keep the secret in its thinking, it did whenever it thought — but at low effort it thought in only 4 of 8 replays of
+# a live "pick a number", and at medium in none, so the others only reacted 🤫 with nothing picked. A note is a tool
+# call, and those it makes without thinking: replayed with note, it noted a number 8 times in 8 and an animal 6 in 6,
+# and named the noted one when asked in 12 of 14.
 HARNESS = """
 
 This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns.
@@ -58,9 +61,10 @@ Your turn is what you write: it's posted in the channel as your reply to the mes
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words (a reaction as well, if you like), and so does a request; write a message too when you truly have something to add.
 - remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
 - forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
-What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering or forgetting in your message.
+- note: write something down for yourself.
+What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message.
 
-Nobody sees your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — write the actual number or answer in your thinking, and leave it out of your message until they ask for it. Your thinking stays with your turn, so you'll still know it later, but only what you wrote there."""
+Nobody sees your notes or your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — note the actual number or answer, and leave it out of your message until they ask for it. Your notes stay with your turns, so you'll still know it later."""
 
 TOOLS = [
     {"type": "function", "function": {
@@ -77,6 +81,10 @@ TOOLS = [
         "name": "forget", "description": "Drop a remembered fact.",
         "parameters": {"type": "object", "required": ["number"], "properties": {
             "number": {"type": "integer", "description": "The fact's number in <memories>"}}}}},
+    {"type": "function", "function": {
+        "name": "note", "description": "Write something down for yourself, like a secret you've been asked to keep. Nobody else sees it.",
+        "parameters": {"type": "object", "required": ["text"], "properties": {
+            "text": {"type": "string", "description": "What to keep, like \"picked 4\""}}}}},
 ]
 
 
@@ -251,7 +259,8 @@ def readable(log, bot_name, last=None):
         if m["role"] == "user":
             lines.append(j.text_of(m["content"]))
         elif m["role"] == "assistant":
-            calls = " ".join(f"[{c['function']['name']} {c['function']['arguments']}]" for c in m.get("tool_calls") or [])
+            calls = " ".join("[note]" if c["function"]["name"] == "note" else  # a secret: Context is anyone's to open
+                             f"[{c['function']['name']} {c['function']['arguments']}]" for c in m.get("tool_calls") or [])
             lines.append(f"{bot_name}: {m['content'] or ''} {calls}".rstrip())
         else:
             lines.append(f"[{m['content']}]")
@@ -300,6 +309,9 @@ def use(log, call, waking):
                 facts.remove(gone)
                 memories_changed()
             return ("forget", n, gone and f"{gone['about']}: {gone['fact']}"), "Forgot it." if gone else "No such fact."
+        if f.get("name") == "note":
+            # its call in the log is the note
+            return None, "Noted." if str(args.get("text") or "").strip() else "Nothing to note."
         return None, f"No tool called {f.get('name')!r}."
     except (ValueError, KeyError, TypeError) as e:
         return None, f"That didn't work: {e!r}"
@@ -352,7 +364,8 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             if text:
                 turn.text, turn.spoke = text, e
                 break
-            if all(c["name"] == "react" for c in calls):
+            # A reaction answers; a memory or a note on its own doesn't, so it gets a request to say something
+            if any(c["name"] == "react" for c in calls) and all(c["name"] in ("react", "note") for c in calls):
                 break
         turn.cost = t["cost"] - cost
     finally:
