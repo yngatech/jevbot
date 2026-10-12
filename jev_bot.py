@@ -2067,9 +2067,14 @@ async def explain_why(channel_id, guild, target, send):
         return
     await send_explanation("why", channel_id, guild, t, send)
 
+# A turn Jev's reply-or-react check answered with a reaction, no LLM writing — !model rocky reacts by itself, and
+# may write as well, so its reactions are an LLM's like its messages
+def jev_reacted(t):
+    return bool(t.get("reaction")) and not t.get("llm")
+
 # Prepared content, attachment bytes and filename, without any Discord objects tied to a particular send.
 async def why_response(t, guild, bot_name):
-    if t.get("llm") and not t.get("reaction"):
+    if t.get("llm") and t.get("reply"):
         if not t.get("llm_tokens"):
             log.info(f"[WHY] no tokens from {t['llm']}")
             return (f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
@@ -2121,7 +2126,7 @@ def unfence(text):
 def logged_context(t):
     if "status" in t:
         return t["transcript"]
-    if t.get("reaction"):
+    if jev_reacted(t):
         return t.get("asked_transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [],
                                                        reactions=False, marked=True)
     return t.get("transcript") or transcript(t["message"], t["author"], t["bot_name"], t["history"], [])
@@ -2150,7 +2155,7 @@ EXPLANATION_COLOR = 0x8796FF
 def model_label(t):
     if t.get("requests") == 0 and t.get("reply") in NO_MONEY:
         return "None (out of credit)"
-    if t.get("reaction"):
+    if jev_reacted(t):
         return "Jev"
     # Preserve the model version recorded at generation time, even after !model or a config change.
     return t.get("llm_model") or (t.get("llm") or "jev").title()
@@ -2178,7 +2183,7 @@ def text_bar(part, total, cells=20):
 
 def context_usage(t):
     tokens, window = t.get("llm_prompt_tokens"), t.get("llm_window")
-    if t.get("reaction") or tokens is None:
+    if jev_reacted(t) or tokens is None:
         return "Not recorded"
     if window:
         return f"{tokens:,} / {window:,} tokens · {percentage(tokens, window)} used"
@@ -2205,7 +2210,7 @@ def context_response(t, bot_name):
     embed.add_field(name="Model", value=model_label(t))
     if (count := chat_message_count(t)) is not None:
         embed.add_field(name="Chat messages", value=f"{count:,}")
-    if not t.get("reaction") and tokens is not None:
+    if not jev_reacted(t) and tokens is not None:
         if (output := t.get("llm_completion_tokens")) is not None:
             embed.add_field(name="Output", value=f"{output:,} tokens")
         if window:
@@ -2283,13 +2288,13 @@ def diagnostics_response(t):
             embed.add_field(name="Retries", value=f"{retries:,} HTTP retries · {generations:,} extra generations",
                             inline=False)
     else:
-        model = MODEL if not t.get("llm") or t.get("reaction") else t.get("llm_model")
+        model = MODEL if not t.get("llm") or jev_reacted(t) else t.get("llm_model")
         embed.add_field(name="Model ID", value=f"`{model}`" if model else "Not recorded", inline=False)
     if (cost := t.get("cost")) is not None:
         byok = t.get("byok_cost", 0)
         embed.add_field(name="Billing", value=f"OpenRouter: {money(cost - byok)}\nProvider key: {money(byok)}",
                         inline=False)
-    if not t.get("reaction"):
+    if not jev_reacted(t):
         cache = []
         if (cached := t.get("llm_cached_tokens")) is not None:
             cache.append(f"{cached:,} cached input tokens")

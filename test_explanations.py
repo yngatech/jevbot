@@ -243,6 +243,25 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(self.fields()["Total cost"], f"${t['cost']:.6f} USD")
                     self.assertTrue(self.fields()["Context"].startswith("Not recorded"))
 
+    async def test_rocky_reacting_as_well_as_replying_is_still_its_turn(self):
+        # !model rocky picks its own emoji: a reaction on its turn isn't Jev's reply-or-react check
+        t = dict({k: v for k, v in self.logged.items() if k != "steps"},  # Jev's words: none in a turn of rocky's
+                 llm="rocky", llm_model="synthetic/haiku", reply="Teal. Good colour.", reaction="🎨",
+                 cost=.00115, requests=2, llm_window=1_000_000, llm_prompt_tokens=49_027, llm_cached_tokens=48_813,
+                 llm_messages=474, transcript="testperson: remember my colour\nTestbot: Teal. Good colour.")
+        j.write_trace(t)
+        await j.stats_action.callback(self.interaction(), self.target(t))
+        self.assertEqual(self.fields()["Model"], "synthetic/haiku")
+        self.assertTrue(self.fields()["Context"].startswith("49,027 / 1,000,000 tokens"))
+        self.assertIn(t["transcript"], j.logged_context(t))
+        self.assertFalse(j.jev_reacted(t))
+        self.assertTrue(j.jev_reacted(dict(self.logged, reaction="👍")))
+        content, png, _ = await j.why_response(t, self.guild, "Testbot")
+        self.assertIn("doesn't say how likely its words were", content)  # about its message, not a Jev reaction
+        only_reacted = {k: v for k, v in t.items() if k != "reply"}
+        content, png, _ = await j.why_response(only_reacted, self.guild, "Testbot")
+        self.assertIn("rocky picked it itself", content)
+
     async def test_stats_for_an_llm_status_show_accepted_usage_and_total_retry_cost(self):
         t = {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40, "bot_name": "Testbot",
              "llm": "haiku", "llm_model": "synthetic/haiku", "cost": .00108, "byok_cost": .001,
