@@ -6,7 +6,9 @@ Each channel is an append-only log of events. People's messages, reactions and e
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
 and its tool calls (react, remember, forget) are kept with their results. Nothing in the log is rewritten, so every
 request starts with the one before it and the model's prompt cache covers all but the newest events. A <memories>
-block before the log is only rebuilt at a jump, when the log outgrows LOG_CHARS and its oldest half goes.
+block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache would be rebuilt
+anyway (tidy): at a jump, when the log outgrows LOG_CHARS and its oldest half goes, or after CACHE_HOURS without a
+request.
 
 The way !model's LLMs work elsewhere is a ghostwriter's: the chat as one transcript, then "Write rocky's reply to pip's
 last message". That framing had Haiku sometimes describe a reply instead of writing it ("Rocky suggests something
@@ -33,6 +35,7 @@ LOG_CHARS = 200_000         # a log's size before its oldest half goes — ~90K 
 MAX_TOKENS = 4000           # its thinking, its message and its tool calls; the message is cut to its first paragraph
 FOLLOW_UPS = 1              # requests after one that only kept or dropped memories, for what it then says
 CACHE = {"type": "ephemeral", "ttl": "1h"}
+CACHE_HOURS = 1             # CACHE's lifetime — after this long without a request, the next is read in full anyway
 FACT_CHARS = 100            # a remembered fact's longest
 SAVE_AFTER = 2              # seconds after a change before a log or the memories are written, so a burst writes once
 # It thinks first. Without thinking, Haiku narrated in 3 of 57 eval turns ("Pip asked a plain question, so I answer
@@ -45,7 +48,7 @@ MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
 
 HARNESS = """
 
-This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions and edits show up as they happen. Your own earlier messages are your turns.
+This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns.
 
 Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools, alongside your message or instead of it. Write your message and make every tool call in the same response — don't wait to see what a tool did before you speak:
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words (a reaction as well, if you like), and so does a request; write a message too when you truly have something to add.
@@ -113,6 +116,7 @@ def memories_changed():
 #              "woke": it woke Rocky}
 #   reaction: {"on": n or "you", "you_said", "emoji", "author", "removed"}
 #   edit:     {"on": n, "text"}
+#   deleted:  {"on": n or "you", "you_said"}  — and the message gets "deleted"; tidy() then blanks it ("gone")
 #   rocky:    {"text", "calls": [{"id", "name", "arguments"}], "reasoning", "id": its Discord message}
 #   result:   {"id", "content"}  — what came of a call, right after its turn
 # ids: Discord message id to n, or to "you" for Rocky's own.
@@ -126,6 +130,7 @@ class Log:
     ids: dict = field(default_factory=dict)
     shown: list = field(default_factory=list)  # the facts in <memories>: as they were at the last jump
     seeded: bool = False                       # filled from the channel's history, the first time it was needed
+    asked: datetime = None                     # the last request, to know when the cache has gone
 
     def message(self, author, text, at, to_bot=False, reply_to=None, uid=None, discord_id=None, you_said=None):
         e = {"type": "message", "n": self.next_n, "author": author, "uid": uid, "at": at, "text": text,
@@ -176,14 +181,18 @@ def people_turn(events, clock):
                 reply = f' reply_to="your message: {attr(snippet(e.get("you_said") or ""))}"'
             elif e["reply_to"]:
                 reply = f' reply_to="{e["reply_to"]}"'
-            lines.append(f'<message id="{e["n"]}" from="{attr(e["author"])}" at="{when(e["at"]):%H:%M}"{to}{reply}>'
-                         f'{html.escape(e["text"], quote=False)}</message>')
+            head = f'<message id="{e["n"]}" from="{attr(e["author"])}" at="{when(e["at"]):%H:%M}"{to}{reply}'
+            lines.append(f'{head} deleted="yes"/>' if e.get("gone") else
+                         f'{head}>{html.escape(e["text"], quote=False)}</message>')
         elif e["type"] == "reaction":
             on = f'your message: {snippet(e.get("you_said") or "")}' if e["on"] == "you" else e["on"]
             removed = ' removed="yes"' if e.get("removed") else ""
             lines.append(f'<reaction from="{attr(e["author"])}" emoji="{attr(e["emoji"])}" on="{attr(on)}"{removed}/>')
         elif e["type"] == "edit":
             lines.append(f'<edit id="{e["on"]}">{html.escape(e["text"], quote=False)}</edit>')
+        elif e["type"] == "deleted":
+            on = f'your message: {snippet(e.get("you_said") or "")}' if e["on"] == "you" else e["on"]
+            lines.append(f'<deleted id="{attr(on)}"/>')
     return "\n".join(lines)
 
 def memories_text(log):
@@ -295,6 +304,10 @@ def said(content, bot_name):
 async def take_turn(log, waking, model="rocky", bot_name="rocky"):
     turn = Turn()
     waking["woke"] = True  # and stays, so the turn it's in reads the same in every later request
+    now = datetime.now(timezone.utc)
+    if log.asked and (now - log.asked).total_seconds() > CACHE_HOURS * 3600:
+        tidy(log)  # the cache has gone, so this request is read in full anyway
+    log.asked = now
     token = j.trace.set({"cost": 0.0, "requests": 0}) if j.trace.get() is None else None
     t = j.trace.get()
     cost = t["cost"]
@@ -346,10 +359,20 @@ def jump(log):
     log.events[:] = log.events[cut:]
     kept = {e["n"] for e in log.events if e["type"] == "message"}
     log.ids = {i: n for i, n in log.ids.items() if n == "you" or n in kept}
-    log.reorganise()
+    tidy(log)
     j.log.info(f"[ROCKY] #{log.channel} jumped to {len(log.events)} events")
-    changed(log)
     return True
+
+# What waits for the cache to be rebuilt anyway: <memories> as they are now, and deleted messages blanked, their
+# edits and <deleted> marks gone with them. Until then Rocky has seen what was said, and that it was deleted.
+def tidy(log):
+    gone = {e["n"] for e in log.events if e["type"] == "message" and e.get("deleted")}
+    for e in log.events:
+        if e["type"] == "message" and e["n"] in gone:
+            e["gone"], e["text"] = True, ""
+    log.events[:] = [e for e in log.events if not (e["type"] in ("edit", "deleted") and e["on"] in gone)]
+    log.reorganise()
+    changed(log)
 
 
 # Live logs, one for each channel in LONG_CHAT_CHANNELS, kept in LOG_DIR
@@ -362,7 +385,8 @@ def plain(v):
 def save_log(log):
     log_saves.pop(log.channel_id, None)
     saved = {"channel": log.channel, "space": log.space, "next_n": log.next_n, "ids": log.ids, "shown": log.shown,
-             "seeded": log.seeded, "events": [{k: plain(v) for k, v in e.items()} for e in log.events]}
+             "seeded": log.seeded, "asked": plain(log.asked),
+             "events": [{k: plain(v) for k, v in e.items()} for e in log.events]}
     try:
         LOG_DIR.mkdir(exist_ok=True)
         path = LOG_DIR / f"{log.channel_id}.json"
@@ -386,6 +410,7 @@ def log_for(channel):
     try:
         saved = json.loads((LOG_DIR / f"{channel.id}.json").read_text())
         log.next_n, log.ids, log.shown, log.seeded = saved["next_n"], saved["ids"], saved["shown"], saved["seeded"]
+        log.asked = saved.get("asked") and datetime.fromisoformat(saved["asked"])
         log.events = [e | {"at": datetime.fromisoformat(e["at"])} if e.get("at") else e for e in saved["events"]]
     except FileNotFoundError:
         pass
@@ -430,6 +455,20 @@ def edited(m):
     if text and text != last:
         log.add("edit", on=n, text=text)
         changed(log)
+
+# A message deleted: marked now, and blanked at the next tidy
+def deleted(channel_id, message_id):
+    if (log := logs.get(channel_id)) is None or (on := log.ids.get(str(message_id))) is None:
+        return
+    if on == "you":
+        log.add("deleted", on="you", you_said=log.rocky_text(message_id))
+    else:
+        message = next((e for e in log.events if e["type"] == "message" and e["n"] == on), None)
+        if message is None or message.get("deleted"):
+            return
+        message["deleted"] = True  # not shown until tidy, so nothing earlier in the request changes yet
+        log.add("deleted", on=on)
+    changed(log)
 
 # One of Rocky's messages from outside a turn (written while another !model was chosen), so the log has it
 def spoke_elsewhere(channel_id, text, sent):

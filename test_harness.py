@@ -170,11 +170,12 @@ class KeepingTests(_Case):
         log.message("pip", "soup?", T0, to_bot=True, discord_id=900)
         log.add("rocky", text="Soup good.", calls=[], id=901, reasoning=[{"type": "reasoning.encrypted", "data": "x"}])
         log.ids["901"] = "you"
+        log.asked = T0
         rh.save_log(log)
         rh.logs.clear()
         back = rh.log_for(self.channel())
         self.assertIsNot(back, log)
-        self.assertEqual((back.space, back.ids, back.next_n), ("400", {"900": 1, "901": "you"}, 2))
+        self.assertEqual((back.space, back.ids, back.next_n, back.asked), ("400", {"900": 1, "901": "you"}, 2, T0))
         self.assertEqual(rh.render(back, "rocky"), rh.render(log, "rocky"))
 
     def test_memories_come_back_after_a_restart(self):
@@ -204,6 +205,45 @@ class KeepingTests(_Case):
                          [j.text_of(m.get("content")) for m in before[:-1]])
         self.assertIn(">back</message>", j.text_of(after[-1]["content"]))  # added at the end, not where it was
         self.assertNotIn(">old</message>", j.text_of(after[-1]["content"]))
+
+    def test_a_deleted_message_is_marked_now_and_blanked_when_the_cache_is_rebuilt(self):
+        rh.logs[300] = self.log
+        q = self.said("pip", "my password is hunter2", 0, discord_id=900)
+        self.log.add("edit", on=q["n"], text="my password is hunter3")
+        self.said("kettle", "oops", 1, discord_id=901)
+        self.log.add("rocky", text="Hunter. Is name.", calls=[], id=902)
+        self.log.ids["902"] = "you"
+        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        before = [j.text_of(m.get("content")) for m in rh.render(self.log, "rocky")]
+        rh.deleted(300, 900)
+        rh.deleted(300, 902)
+        rh.deleted(300, 900)  # once is enough
+        rh.deleted(300, 12345)  # never in the log
+        after = [j.text_of(m.get("content")) for m in rh.render(self.log, "rocky")]
+        self.assertEqual(after[:len(before) - 1], before[:-1])  # nothing earlier changes yet
+        self.assertIn("hunter2", after[2])  # Rocky still saw it said...
+        self.assertTrue(after[-1].endswith('<deleted id="1"/>\n<deleted id="your message: Hunter. Is name."/>'))  # ...and gone
+        rh.tidy(self.log)
+        tidied = "\n".join(j.text_of(m.get("content")) for m in rh.render(self.log, "rocky"))
+        self.assertNotIn("hunter", tidied.lower().replace("hunter. is name", ""))
+        self.assertIn('<message id="1" from="pip" at="18:00" deleted="yes"/>', tidied)
+        self.assertNotIn('<deleted id="1"/>', tidied)
+        self.assertIn("[1] pip: likes soup", tidied)  # <memories> brought up to date at the same time
+
+    async def test_after_an_hour_without_a_request_its_turn_tidies_first(self):
+        for idle, tidied in [(timedelta(minutes=50), False), (timedelta(hours=2), True)]:
+            with self.subTest(idle=idle):
+                self.log = rh.Log("bot-spam", "400", 300)
+                rh.logs[300] = self.log
+                self.said("pip", "secret", 0, discord_id=900)
+                rh.deleted(300, 900)
+                self.log.asked = datetime.now(timezone.utc) - idle
+                q = self.said("kettle", "rocky hi", 1, to_bot=True)
+                llm = AsyncMock(return_value=answer("Hi."))
+                with patch.object(j, "llm_message", llm):
+                    await rh.take_turn(self.log, q)
+                self.assertEqual("secret" not in j.text_of(llm.call_args.args[1][2]["content"]), tidied)
+                self.assertGreater(self.log.asked, datetime.now(timezone.utc) - timedelta(minutes=1))
 
     def test_past_its_size_the_oldest_half_goes_at_a_message(self):
         for i in range(40):

@@ -1763,6 +1763,16 @@ async def on_message(m):
     await respond(m)
 
 
+# A deleted message is marked in Rocky's log, and blanked there later (rocky_harness.tidy)
+@bot.event
+async def on_raw_message_delete(p):
+    rh.deleted(p.channel_id, p.message_id)
+
+@bot.event
+async def on_raw_bulk_message_delete(p):
+    for i in p.message_ids:
+        rh.deleted(p.channel_id, i)
+
 # Discord often adds a link's embed just after the message arrives, as an edit — and people fix typos
 @bot.event
 async def on_message_edit(before, after):

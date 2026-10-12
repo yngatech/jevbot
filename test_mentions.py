@@ -636,6 +636,8 @@ class RockyHarnessTests(_Handling):
         await j.on_message_edit(m, m)
         self.assertEqual(rh.logs[self.channel.id].events[-1], {**rh.logs[self.channel.id].events[-1], "type": "edit",
                                                                  "on": 1, "text": "rocky soup or salad"})
+        await j.on_raw_message_delete(SimpleNamespace(channel_id=self.channel.id, message_id=m.id))
+        self.assertEqual(rh.logs[self.channel.id].events[-1]["type"], "deleted")
         side = self.said("!nocontext secret soup")
         with patch.object(j, "llm_message") as llm, patch.object(j, "generate_reply", AsyncMock(return_value="Ok.")):
             await j.on_message(side)
