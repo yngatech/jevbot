@@ -15,6 +15,7 @@ import asyncio
 import logging
 import random
 import signal
+import sys
 import contextvars
 import copy
 import hashlib
@@ -31,6 +32,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 import why_chart
+import rocky_harness as rh
 
 load_dotenv()
 
@@ -104,6 +106,7 @@ NEWLINE = "\\n"  # vocab.txt's line break token — jev sees it literally, Disco
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("jev")
+rh.bind(sys.modules[__name__])  # rocky_harness reads the bot's settings and helpers through this
 
 # One JSON line per message jev handles: what it saw, what it considered, what it did and what it cost.
 # Holds what people said in the server, so it stays local (gitignored) — delete old days freely.
@@ -833,6 +836,9 @@ LLMS = {
     "flash": {"id": "deepseek/deepseek-v4.1-flash", "logprobs": True, "window": 1_048_576, "providers": ["wafer"]},
     "k3": {"id": "moonshotai/kimi-k3", "logprobs": True, "window": 1_048_576, "providers": ["morph"]},
 }
+# Haiku as Rocky itself, in the channels in LONG_CHAT_CHANNELS: the channel as its conversation, with tools to react
+# and remember (rocky_harness). Elsewhere it writes like haiku.
+LLMS["rocky"] = LLMS["haiku"] | {"harness": True}
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
 LLM_FREQUENCY_PENALTY = 0.5
@@ -900,13 +906,24 @@ def llm_tokens(content):
         tokens.pop()
     return tokens
 
-def text_of(content):  # a message's content: a string, or a long chat's blocks
-    return content if isinstance(content, str) else "".join(b["text"] for b in content)
+def text_of(content):  # a message's content: a string, a long chat's blocks, or nothing (a tool call's turn)
+    return content if isinstance(content, str) else "".join(b.get("text", "") for b in content or [])
 
 async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
+    message = await llm_message(name, messages, max_tokens)
+    if message is None:
+        return "", []
+    return message.get("content") or "", llm_tokens((message.get("logprobs") or {}).get("content"))
+
+# A request and its whole answer: the message, with its tool calls and reasoning if there are any, and its logprobs
+# (as "logprobs") — or None if there was none. tools and reasoning: as OpenRouter takes them, for rocky_harness.
+async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, reasoning=None):
     spec = LLMS[name]
     body = {"model": spec["id"], "messages": messages, "max_tokens": max_tokens, "temperature": LLM_TEMPERATURE,
-            "frequency_penalty": LLM_FREQUENCY_PENALTY, "reasoning": {"enabled": False}, "usage": {"include": True}}
+            "frequency_penalty": LLM_FREQUENCY_PENALTY, "reasoning": reasoning or {"enabled": False},
+            "usage": {"include": True}}
+    if tools:
+        body["tools"] = tools
     if spec.get("logprobs"):
         # Only to providers that give them — some of DeepSeek's don't
         body |= {"logprobs": True, "top_logprobs": LLM_TOP_LOGPROBS, "provider": {"require_parameters": True}}
@@ -928,7 +945,7 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
                         log.warning(f"LLM 402: {(await r.text())[:300]}")
                         note(error="out of credit")
                         await set_credit(False)
-                        return "", []
+                        return None
                     data = await r.json(content_type=None)
                     usage = data.get("usage") or {}
                     if r.status >= 400 or "choices" not in data:
@@ -957,11 +974,14 @@ async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
             note(llm_window=spec["window"], llm_prompt_tokens=usage.get("prompt_tokens"),
                  llm_completion_tokens=usage.get("completion_tokens"),
                  llm_cached_tokens=(usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
-                 llm_prompt_chars=sum(len(text_of(m["content"])) for m in messages))
+                 llm_prompt_chars=sum(len(text_of(m.get("content"))) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
-            return choice["message"].get("content") or "", llm_tokens((choice.get("logprobs") or {}).get("content"))
-    return "", []
+            if choice.get("finish_reason") == "length" and tools:  # its tool calls are cut off where it stopped
+                log.warning(f"LLM {name} ran out of tokens with tools: {str(choice['message'])[:300]}")
+                note(llm_cut_off=True)
+            return choice["message"] | ({"logprobs": choice["logprobs"]} if choice.get("logprobs") else {})
+    return None
 
 # name: one of LLMS — passed in, since !model can switch while a reply is being written. pages: a long chat's frozen
 # pages, before `history` — in LONG_CHAT_CHANNELS, else None.
@@ -1723,6 +1743,9 @@ async def on_message(m):
         return  # a DM from anyone else, or jev's own — not even kept as history
     if m.guild and not m.author.bot:  # not jev's own posts, or each status would earn the next
         heard = True
+    # Rocky's log of the channel takes everything said in it, but not side conversations, which it never sees
+    if m.channel.id in LONG_CHAT_CHANNELS and not no_context(m) and not (m.reference and m.reference.message_id in side_of):
+        rh.observe(m)
     if cmd := command(m):
         if not stopping.is_set():
             await {"!why": why, "!model": model_command}[cmd](m)
@@ -1743,6 +1766,7 @@ async def on_message(m):
 # Discord often adds a link's embed just after the message arrives, as an edit — and people fix typos
 @bot.event
 async def on_message_edit(before, after):
+    rh.edited(after)
     entry = next((e for e in entries_with(after.channel.id, after.id) if e.get("id") == after.id), None)
     if entry and (content := message_text(after)):
         entry["content"] = content
@@ -2053,6 +2077,9 @@ async def why_response(t, guild, bot_name):
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))
         log.info(f"[WHY] chart for {t.get('reply') or t.get('status')!r}")
         return None, png, why_filename(said)
+    elif not t.get("reaction_candidates"):  # !model rocky picks its own emoji, with nothing weighed to chart
+        log.info(f"[WHY] reaction {t.get('reaction')}, by {t.get('llm')}")
+        return f"Reacted {t.get('reaction')} to \"{t['message'][:80]}\" — {t.get('llm') or 'it'} picked it itself", None, None
     elif isinstance(t["reaction_candidates"][0], str):
         # Entries from before their probabilities were logged: just the emoji, likeliest first
         log.info(f"[WHY] reaction {t.get('reaction')}")
@@ -2343,6 +2370,48 @@ async def respond_traced(m, **extra):
         write_trace(t)
 
 
+# !model rocky, in a channel with a long chat: Rocky takes its turn in the channel's log (rocky_harness) — its message,
+# its reactions on any message there, and what it remembers. entries: the channel's history, for what the log hasn't
+# seen (the first time, and after a restart).
+async def rocky_turn(m, entry, bot_name, entries):
+    chat = rh.log_for(m.channel)
+    rh.sync(chat, entries)
+    waking = rh.observe(m)  # there already, unless it's one caught up on at startup
+    async with m.channel.typing():
+        async with gen_lock:
+            turn = await rh.take_turn(chat, waking, "rocky", bot_name)
+    rh.jump(chat)
+    note(llm="rocky", llm_model=LLMS["rocky"]["id"], transcript=rh.readable(chat, bot_name, last=40),
+         llm_messages=sum(e["type"] == "message" for e in chat.events), harness_requests=turn.requests,
+         memory_kept=[list(k) for k in turn.kept])
+    vocab = emoji_vocabulary(m.guild)
+    for n, emoji in turn.reactions:
+        target = m.id if n == waking["n"] else chat.discord_id(n)
+        try:
+            await m.channel.get_partial_message(target).add_reaction(vocab.get(emoji, emoji))
+            if target == m.id:
+                entry["reaction"] = emoji
+        except (discord.HTTPException, TypeError) as e:  # an emoji Discord doesn't know, or a message gone
+            log.warning(f"[ROCKY] react {emoji} on {target} failed: {e}")
+    if turn.reactions:
+        note(reaction=" ".join(e for _, e in turn.reactions))
+        log.info(f"[REACT] {' '.join(e for _, e in turn.reactions)} (${trace.get()['cost']:.5f})")
+    if not turn.text:
+        if has_credit is False and not turn.reactions:
+            await m.reply(random.choice(NO_MONEY), mention_author=False)
+        return
+    targets = mention_targets([*entries, entry], bot_name, reactors=True)
+    content, allowed = resolve_mentions(rh.unaddressed(turn.text, m.author.display_name), targets)
+    note(reply=turn.text, sent=content)
+    log.info(f"[OUT] {turn.text} (${trace.get()['cost']:.5f})")
+    sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
+    note(reply_id=sent.id)
+    turn.spoke["id"] = sent.id
+    chat.ids[str(sent.id)] = "you"
+    rh.changed(chat)
+    entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(sent), sent.id, sent.created_at
+    entry["reply_users"] = message_users(sent)
+
 async def handle(m, c):
     if m.guild is None:
         dm_channels.add(m.channel.id)  # before its history loads, so a status made meanwhile can't show it
@@ -2387,6 +2456,9 @@ async def handle(m, c):
             log.info(f"[OUT] out of credit: {gif}")
             await m.reply(gif, mention_author=False)
             return
+        if root is None and model_name == "rocky" and m.channel.id in LONG_CHAT_CHANNELS:
+            await rocky_turn(m, entry, bot_name, [e for p in pages or [] for e in p] + channel_history[m.channel.id])
+            return
         # Decided before typing() — a reaction sends no message, so the typing indicator would linger
         emoji = emoji_vocabulary(m.guild)
         if reaction := await choose_reaction(c, m.author.display_name, bot_name, emoji, history=h):
@@ -2416,6 +2488,8 @@ async def handle(m, c):
         note(sent=content)  # !why matches the actual Discord text, while reply/tokens keep what the model wrote
         sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
+        if root is None:
+            rh.spoke_elsewhere(m.channel.id, message_text(sent), sent)
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(sent), sent.id, sent.created_at
             entry["reply_users"] = message_users(sent)
@@ -2433,6 +2507,9 @@ async def handle(m, c):
 async def on_reaction_change(p, change):
     if p.user_id == bot.user.id:
         return
+    if p.channel_id in rh.logs:  # anyone's reaction on anything in Rocky's log, as it happens
+        name = await reactor_name(bot.get_guild(p.guild_id) if p.guild_id else None, p.user_id, p.member)
+        rh.reacted(p.channel_id, p.message_id, emoji_text(p.emoji), name, change > 0)
     entry = next((e for e in entries_with(p.channel_id, p.message_id) if e.get("reply_id") == p.message_id), None)
     if entry is None:
         return
