@@ -410,6 +410,16 @@ def changed(log):
         except RuntimeError:
             save_log(log)
 
+# Everything waiting to be written, now: at shutdown, so a turn just before a restart isn't lost — the next request
+# would then differ from the last, and read only what came before it from the cache
+def flush():
+    for log in [log for log in logs.values() if log.channel_id in log_saves]:
+        log_saves[log.channel_id].cancel()
+        save_log(log)
+    if memories_save is not None:
+        memories_save.cancel()
+        save_memories()
+
 def log_for(channel):
     if (log := logs.get(channel.id)) is not None:
         return log

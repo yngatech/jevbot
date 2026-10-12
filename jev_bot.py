@@ -2592,6 +2592,11 @@ async def main():
         if handling:
             log.info(f"[STOP] finishing {len(handling)} message(s) in progress — Ctrl-C again to quit now")
             await asyncio.gather(*handling, return_exceptions=True)
+        # Writes that wait a moment so a burst writes once, done now rather than lost
+        rh.flush()
+        if reactors_save is not None:
+            reactors_save.cancel()
+            save_reactors()
         log.info("[STOP] done")
 
 

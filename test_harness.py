@@ -200,6 +200,17 @@ class KeepingTests(_Case):
         self.assertEqual((back.space, back.ids, back.next_n, back.asked), ("400", {"900": 1, "901": "you"}, 2, T0))
         self.assertEqual(rh.render(back, "rocky"), rh.render(log, "rocky"))
 
+    async def test_shutting_down_writes_what_was_waiting(self):
+        log = rh.log_for(self.channel())
+        log.message("pip", "soup?", T0, to_bot=True, discord_id=900)
+        rh.changed(log)
+        rh.use(log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        self.assertFalse((rh.LOG_DIR / "300.json").exists())  # waiting, so a burst writes once
+        rh.flush()
+        self.assertEqual(json.loads((rh.LOG_DIR / "300.json").read_text())["ids"], {"900": 1})
+        self.assertEqual(json.loads(rh.MEMORY_PATH.read_text())["400"]["facts"][0]["fact"], "likes soup")
+        self.assertEqual((rh.log_saves, rh.memories_save), ({}, None))
+
     def test_memories_come_back_after_a_restart(self):
         rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
         rh.save_memories()
