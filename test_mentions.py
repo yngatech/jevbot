@@ -606,11 +606,13 @@ class RockyHarnessTests(_Handling):
         # a reply with its ping off isn't to Rocky, but it's still shown as answering its message
         self.assertEqual((asked["reply_to"], asked["you_said"], asked["to_bot"]), ("you", "@pip Biscuit. Good name.", False))
 
-    async def test_only_reacting_posts_nothing(self):
+    async def test_only_reacting_posts_nothing_and_never_shows_typing(self):
         m = self.said("lol")
+        self.channel.typing = Mock(side_effect=lambda: contextlib.nullcontext())
         with patch.object(j, "llm_message", self.answer_with(calls=[("react", {"emoji": "😂"})])):
             await j.handle(m, j.message_text(m))
         m.reply.assert_not_awaited()
+        self.channel.typing.assert_not_called()  # it would have lingered ~10s after the reaction
         self.partials[m.id].add_reaction.assert_awaited_once_with("😂")
         self.assertEqual(j.channel_history[self.channel.id][-1]["reaction"], "😂")
 
