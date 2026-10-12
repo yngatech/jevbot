@@ -137,3 +137,24 @@ article { padding: .4rem .75rem; margin: .15rem 0; border-radius: 8px; }
 .woke-by { display: flex; flex-wrap: wrap; gap: .5rem; align-items: baseline; }
 .kept { font: 12px var(--mono); color: var(--dim); margin-top: .3rem; }
 .pager { display: flex; align-items: center; justify-content: space-between; gap: 1rem; font-size: 13px; color: var(--dim); }
+
+/* Phones: the channel and tabs in one row — the title is the browser tab's, and the status shows only when it
+   couldn't update — and less indent, so the chat has the width */
+@media (max-width: 640px) {
+  header { flex-wrap: nowrap; gap: .4rem; padding: .4rem .5rem; }
+  h1, #status:not(.error) { display: none; }
+  #status.error {
+    position: absolute; top: 100%; left: 0; right: 0; padding: .2rem .5rem;
+    background: var(--bg); border-bottom: 1px solid var(--line);
+  }
+  #channel { flex: 1 1 0; min-width: 0; }
+  #tabs { flex: none; }
+  #tabs button { padding: .25rem .45rem; }
+  main { padding: .5rem .5rem 3rem; }
+  article { padding: .35rem .5rem; }
+  .rocky { margin-left: .75rem; }
+  .aside { margin-left: 1.25rem; }
+  .n { min-width: 0; }
+  .pager button { white-space: nowrap; }
+  .pager span { text-align: center; }
+}
