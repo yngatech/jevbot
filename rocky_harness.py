@@ -264,6 +264,7 @@ class Turn:
     prompt_tokens: int = 0
     cached_tokens: int = 0
     raw: list = field(default_factory=list)        # each response's message, for looking into
+    events: list = field(default_factory=list)     # its events in the log — its turns and their calls' results
 
 
 def use(log, call, waking):
@@ -335,9 +336,10 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             if not text and not calls:
                 break  # nothing said or done — an empty turn isn't one the model can be shown later
             e = log.add("rocky", text=text, calls=calls, reasoning=message.get("reasoning_details"))
+            turn.events.append(e)
             for c in calls:
                 done, result = use(log, {"function": {"name": c["name"], "arguments": c["arguments"]}}, waking)
-                log.add("result", id=c["id"], content=result)
+                turn.events.append(log.add("result", id=c["id"], content=result))
                 if done and done[0] == "react":
                     turn.reactions.append(done[1:])
                 elif done:

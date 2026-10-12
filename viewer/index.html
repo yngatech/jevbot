@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Rocky's logs</title>
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<header>
+  <h1>Rocky's logs</h1>
+  <select id="channel" aria-label="Channel"></select>
+  <nav id="tabs">
+    <button data-tab="log" aria-pressed="true">Log</button>
+    <button data-tab="turns" aria-pressed="false">Turns</button>
+    <button data-tab="memories" aria-pressed="false">Memories</button>
+  </nav>
+  <span id="status" aria-live="polite"></span>
+</header>
+<main id="view"></main>
+</body>
+</html>
