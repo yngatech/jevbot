@@ -52,7 +52,9 @@ MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
 # keep the secret in its thinking, it did whenever it thought — but at low effort it thought in only 4 of 8 replays of
 # a live "pick a number", and at medium in none, so the others only reacted 🤫 with nothing picked. A note is a tool
 # call, and those it makes without thinking: replayed with note, it noted a number 8 times in 8 and an animal 6 in 6,
-# and named the noted one when asked in 12 of 14.
+# and named the noted one when asked in 12 of 14. Told to leave it out "until they ask for it", it then wouldn't say
+# whether a guess was right — live, the right guess got 🤫, and "was that a yes" "Rocky not say yes or no", 6 times in 6
+# replayed. Told to play fair, checking each guess against its note: "yes. Four. You got it" 6 in 6.
 HARNESS = """
 
 This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns.
@@ -64,7 +66,7 @@ Your turn is what you write: it's posted in the channel as your reply to the mes
 - note: write something down for yourself.
 What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message.
 
-Nobody sees your notes or your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — note the actual number or answer, and leave it out of your message until they ask for it. Your notes stay with your turns, so you'll still know it later."""
+Nobody sees your notes or your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — note the actual number or answer, and leave it out of your message. It's a game, so play it fair: check each guess against your note and say whether they've got it (yes, or no), and say the answer once they've got it or give up. Your notes stay with your turns, so you'll still know it later."""
 
 TOOLS = [
     {"type": "function", "function": {
