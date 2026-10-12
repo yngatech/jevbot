@@ -19,6 +19,7 @@ os.environ.setdefault("OPENROUTER_API_KEY", "test")
 
 import discord
 import jev_bot as j
+import rocky_harness as rh
 
 
 class _Message(SimpleNamespace):
@@ -543,6 +544,105 @@ class _Handling(_Discord):
         self.sent.mentions = [users[uid] for uid in self.sent.raw_mentions if uid in users]
         self.sent.clean_content = discord.Message.clean_content.function(self.sent)
         return self.sent
+
+
+class RockyHarnessTests(_Handling):
+    """!model rocky in a channel with a long chat: Rocky's turn from the channel's log, posted and acted on."""
+
+    def setUp(self):
+        super().setUp()
+        for obj, attr, value in [(j, "LONG_CHAT_CHANNELS", {self.channel.id}), (j, "model_name", "rocky"),
+                                 (rh, "LOG_DIR", Path(self.reactors_dir.name) / "rocky_logs"),
+                                 (rh, "MEMORY_PATH", Path(self.reactors_dir.name) / "rocky_memories.json"),
+                                 (rh, "logs", {}), (rh, "log_saves", {}), (rh, "memories", {}),
+                                 (rh, "memories_loaded", True), (rh, "memories_save", None)]:
+            p = patch.object(obj, attr, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.channel.name = "bot-spam"
+        self.channel.guild = self.guild
+        self.partials = {}
+        self.channel.get_partial_message = lambda i: self.partials.setdefault(i, Mock(add_reaction=AsyncMock()))
+
+    def answer_with(self, text="", calls=()):
+        return AsyncMock(return_value={"role": "assistant", "content": text or None, "tool_calls": [
+            {"id": f"c{i}", "type": "function", "function": {"name": n, "arguments": __import__("json").dumps(a)}}
+            for i, (n, a) in enumerate(calls)] or None})
+
+    async def test_rocky_speaks_reacts_and_remembers_from_the_channels_log(self):
+        await j.on_message(self.said("anyone seen my keys", name="kettle", ping=False))
+        with patch.object(j, "why", AsyncMock()):
+            await j.on_message(self.said("!why", ping=False))  # a command stays out of the log
+        m = self.said("my cat is called biscuit")
+        llm = self.answer_with("@pip Biscuit. Good name.", [("react", {"emoji": "🐱"}),
+                                                            ("remember", {"about": "pip", "fact": "has a cat called Biscuit"})])
+        with patch.object(j, "llm_message", llm):
+            await j.handle(m, j.message_text(m))  # as catch-up does: not seen live, so the turn adds it
+        m.reply.assert_awaited_once()
+        self.assertEqual(m.reply.call_args.args[0], "Biscuit. Good name.")  # it's a reply to pip already
+        self.partials[m.id].add_reaction.assert_awaited_once_with("🐱")
+        j.choose_reaction.assert_not_awaited()  # Rocky decides, not Jev's check
+        log = rh.logs[self.channel.id]
+        people = [e for e in log.events if e["type"] == "message"]
+        self.assertEqual([(e["author"], e["text"]) for e in people][-2:],
+                         [("kettle", "anyone seen my keys"), ("pip", "@Testbot my cat is called biscuit")])
+        self.assertTrue(people[-1]["woke"])
+        self.assertEqual(log.ids[str(self.sent.id)], "you")
+        self.assertEqual(rh.memory("400")["facts"][0]["fact"], "has a cat called Biscuit")
+        self.assertEqual((self.trace["llm"], self.trace["reply"], self.trace["reaction"]), ("rocky", "@pip Biscuit. Good name.", "🐱"))
+        self.assertIn("my cat is called biscuit", self.trace["transcript"])
+        self.assertEqual(j.channel_history[self.channel.id][-1]["reply"], "Biscuit. Good name.")
+
+        # what happens to Rocky's message next is in the log too
+        await j.on_raw_reaction_add(SimpleNamespace(channel_id=self.channel.id, message_id=self.sent.id, guild_id=400,
+                                                    user_id=501, emoji="😂", member=Mock(spec=discord.Member, id=501,
+                                                    display_name="Moss", guild=self.guild)))
+        reply = self.said("why biscuit", to=self.sent, ping=False)
+        reply.reference.resolved = self.sent  # as Discord gives a reply to a message it has
+        rh.observe(reply)
+        reaction, asked = [e for e in log.events if e["type"] in ("reaction", "message")][-2:]
+        # its turn is kept as it wrote it — only the posted message lost the tag
+        self.assertEqual((reaction["author"], reaction["on"], reaction["you_said"]), ("Moss", "you", "@pip Biscuit. Good name."))
+        # a reply with its ping off isn't to Rocky, but it's still shown as answering its message
+        self.assertEqual((asked["reply_to"], asked["you_said"], asked["to_bot"]), ("you", "@pip Biscuit. Good name.", False))
+
+    async def test_only_reacting_posts_nothing(self):
+        m = self.said("lol")
+        with patch.object(j, "llm_message", self.answer_with(calls=[("react", {"emoji": "😂"})])):
+            await j.handle(m, j.message_text(m))
+        m.reply.assert_not_awaited()
+        self.partials[m.id].add_reaction.assert_awaited_once_with("😂")
+        self.assertEqual(j.channel_history[self.channel.id][-1]["reaction"], "😂")
+
+    async def test_other_models_and_other_channels_keep_their_way(self):
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
+            rh.observe(m := self.said("hello?"))
+            await j.handle(m, j.message_text(m))
+        self.assertNotIn("error", self.trace)
+        log = rh.logs[self.channel.id]
+        self.assertEqual(log.events[-1]["text"], "Hello.")  # its message is in the log for when rocky's back
+        self.assertEqual(log.ids[str(self.sent.id)], "you")
+        with patch.object(j, "LONG_CHAT_CHANNELS", set()), patch.object(j, "generate_reply", AsyncMock(return_value="Hi.")) as gen, \
+                patch.object(j, "llm_message") as llm:
+            await j.handle(m2 := self.said("hi"), j.message_text(m2))
+        llm.assert_not_called()
+        gen.assert_awaited_once()
+
+    async def test_an_edit_and_a_side_conversation(self):
+        m = self.said("rocky soup or stew", ping=False)
+        await j.on_message(m)
+        m.content = "rocky soup or salad"
+        m.clean_content = discord.Message.clean_content.function(m)
+        await j.on_message_edit(m, m)
+        self.assertEqual(rh.logs[self.channel.id].events[-1], {**rh.logs[self.channel.id].events[-1], "type": "edit",
+                                                                 "on": 1, "text": "rocky soup or salad"})
+        await j.on_raw_message_delete(SimpleNamespace(channel_id=self.channel.id, message_id=m.id))
+        self.assertEqual(rh.logs[self.channel.id].events[-1]["type"], "deleted")
+        side = self.said("!nocontext secret soup")
+        with patch.object(j, "llm_message") as llm, patch.object(j, "generate_reply", AsyncMock(return_value="Ok.")):
+            await j.on_message(side)
+        llm.assert_not_called()  # a side conversation is answered the old way, and never in the log
+        self.assertNotIn(str(side.id), rh.logs[self.channel.id].ids)
 
 
 class OutgoingMentionTests(_Handling):
