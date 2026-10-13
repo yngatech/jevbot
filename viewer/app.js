@@ -57,7 +57,7 @@ function metrics(t) {
     t.error ? el("span", {class: "error", text: t.error}) : null);
 }
 
-// What a call was about: the message it reacted to, the fact it forgot, what it noted
+// What a call was about: the message it reacted to, the fact it forgot, what it noted or ordered
 function target(call, a, ctx) {
   if (call.name === "react") {
     const m = a.message != null ? ctx.messages[a.message] : null;
@@ -69,6 +69,7 @@ function target(call, a, ctx) {
   }
   if (call.name === "remember") return `${a.about}: ${a.fact}`;
   if (call.name === "note") return a.text;
+  if (call.name === "order") return a.for ? `${a.drink} for ${a.for}` : a.drink;
   return call.arguments;
 }
 

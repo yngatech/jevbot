@@ -4,11 +4,11 @@ channels in LONG_CONTEXT_CHANNEL_IDS.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
-and its tool calls (react, remember, forget, note) are kept with their results. Nothing in the log is rewritten, so every
-request starts with the one before it and the model's prompt cache covers all but the newest events. A <memories>
-block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache would be rebuilt
-anyway (tidy): at a jump, when the log outgrows LOG_TOKENS and its oldest half goes, or after CACHE_HOURS without a
-request.
+and its tool calls (react, remember, forget, note, bar, order) are kept with their results. Nothing in the log is
+rewritten, so every request starts with the one before it and the model's prompt cache covers all but the newest
+events. A <memories> block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache
+would be rebuilt anyway (tidy): at a jump, when the log outgrows LOG_TOKENS and its oldest half goes, or after
+CACHE_HOURS without a request.
 
 The way !model's LLMs work elsewhere is a ghostwriter's: the chat as one transcript, then "Write rocky's reply to pip's
 last message". That framing had Haiku sometimes describe a reply instead of writing it ("Rocky suggests something
@@ -21,9 +21,10 @@ import asyncio
 import contextlib
 import html
 import json
+import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 j = None
@@ -35,7 +36,7 @@ def bind(bot_module):
 LOG_TOKENS = 90_000         # a log's size before its oldest half goes — under Haiku's 100K price step; set in /settings
 CHARS_PER_TOKEN = 2.2       # Haiku's, in our chat — a log is measured in characters, LOG_TOKENS turned into them
 MAX_TOKENS = 4000           # its thinking, its message and its tool calls; the message is cut to its first paragraph
-FOLLOW_UPS = 1              # requests after one that only kept or dropped memories, for what it then says
+FOLLOW_UPS = 2              # requests after one with nothing to say yet, for what it then says — two for bar, then order
 CACHE = {"type": "ephemeral", "ttl": "1h"}
 CACHE_HOURS = 1             # CACHE's lifetime — after this long without a request, the next is read in full anyway
 FACT_CHARS = 100            # a remembered fact's longest
@@ -56,16 +57,22 @@ MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
 # and named the noted one when asked in 12 of 14. Told to leave it out "until they ask for it", it then wouldn't say
 # whether a guess was right — live, the right guess got 🤫, and "was that a yes" "Rocky not say yes or no", 6 times in 6
 # replayed. Told to play fair, checking each guess against its note: "yes. Four. You got it" 6 in 6.
+# The bar's paragraph: told only to "say what happened", it answered a closed bar with just a 🍺 in 3 of 3 replays;
+# told to say it in words, it did in 8 of 8.
 HARNESS = """
 
 This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns.
 
-Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools, alongside your message or instead of it. Write your message and make every tool call in the same response — don't wait to see what a tool did before you speak:
+Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools, alongside your message or instead of it. Write your message and make every tool call in the same response — don't wait to see what a tool did before you speak, except at the bar (below):
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words (a reaction as well, if you like), and so does a request; write a message too when you truly have something to add.
 - remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
 - forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
 - note: write something down for yourself.
+- bar: see whether the bar is open, and what's on.
+- order: order a drink at the bar, for you or for someone here.
 What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message.
+
+The bar is {bar}, down the road. It keeps hours, and some days it doesn't open at all, or something's run out — so when you want a drink, or someone asks you to get one, call bar or order and write nothing yet: you'll see what the bar says, and then tell them in words what happened — open or not, ordered or not — not just a reaction.
 
 Nobody sees your notes or your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — note the actual number or answer, and leave it out of your message. It's a game, so play it fair: check each guess against your note and say whether they've got it (yes, or no), and say the answer once they've got it or give up. Your notes stay with your turns, so you'll still know it later."""
 
@@ -88,7 +95,68 @@ TOOLS = [
         "name": "note", "description": "Write something down for yourself, like a secret you've been asked to keep. Nobody else sees it.",
         "parameters": {"type": "object", "required": ["text"], "properties": {
             "text": {"type": "string", "description": "What to keep, like \"picked 4\""}}}}},
+    {"type": "function", "function": {
+        "name": "bar", "description": "See whether the bar is open, and its menu.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "order", "description": "Order a drink at the bar.",
+        "parameters": {"type": "object", "required": ["drink"], "properties": {
+            "drink": {"type": "string", "description": "As it is on the menu"},
+            "for": {"type": "string", "description": "Who it's for, by their name in the chat; leave out for you"}}}}},
 ]
+# Calls whose result it needs before it speaks: what it wrote alongside one isn't posted
+WAIT_FOR = {"bar", "order"}
+
+
+# The bar: a pub with a menu and hours, in TIMEZONE. Some days it doesn't open, and some days a drink has run out —
+# picked from the date, so a day is the same however often Rocky asks.
+BAR = "The Hail Mary"
+MENU = {  # drink: price
+    "Astrophage Amber": 5.40, "Tau Ceti Pale Ale": 5.80, "Eridani Stout": 6.10, "Blip-A Lager": 4.90,
+    "Petrova Line Sour": 6.50, "Xenonite Cider": 5.20, "Ammonia-Free Lemonade": 2.80,
+}
+HOURS = {0: (16, 23), 1: (16, 23), 2: (16, 23), 3: (16, 23), 4: (12, 24), 5: (12, 24), 6: (12, 22)}  # Monday's 0
+SHUT = ["a taumoeba leak in the cellar", "a private party", "the landlord's at a wedding", "a staff shortage",
+        "pest control", "the card machine's down and so is the till", "the Astrophage tank's being drained",
+        "a xenonite refit"]
+SHUT_DAYS = 0.15            # a day's chance it doesn't open
+SOLD_OUT = 0.4              # a day's chance a drink has run out
+
+def clock():
+    return datetime.now(timezone.utc)
+
+def bar_today(day):
+    pick = random.Random(day.isoformat())
+    shut = pick.choice(SHUT) if pick.random() < SHUT_DAYS else None
+    out = pick.choice(list(MENU)) if pick.random() < SOLD_OUT else None
+    return shut, out
+
+# (open, what the bar says): its menu if it's open, or why not and when it next opens
+def bar_state(now=None):
+    now = (now or clock()).astimezone(j.TIMEZONE)
+    shut, out = bar_today(now.date())
+    opens, closes = HOURS[now.weekday()]
+    if shut:
+        why = f"Closed today: {shut}."
+    elif now.hour < opens:
+        return False, f"Closed. Opens at {opens}:00."
+    elif now.hour >= closes:
+        why = "Closed for the night."
+    else:
+        menu = "; ".join(f"{d} £{p:.2f}" + (" (run out)" if d == out else "") for d, p in MENU.items())
+        until = "midnight" if closes == 24 else f"{closes}:00"
+        last = " Last orders!" if (now.hour, now.minute) >= (closes - 1, 45) else ""
+        return True, f"{BAR} is open until {until}.{last} Menu: {menu}."
+    for ahead in range(1, 8):  # when it next opens
+        day = (now + timedelta(days=ahead)).date()
+        if not bar_today(day)[0]:
+            name = "tomorrow" if ahead == 1 else f"{day:%A}"
+            return False, f"{why} Next open {name} from {HOURS[day.weekday()][0]}:00."
+    return False, why
+
+def menu_drink(asked):
+    asked = re.sub(r"[^a-z]", "", asked.lower())
+    return next((d for d in MENU if asked and (asked in re.sub(r"[^a-z]", "", d.lower()))), None)
 
 
 # Memories: facts kept with remember, a list for each server (and each DM) — every channel of a server shares them.
@@ -220,7 +288,7 @@ def memories_text(log):
 # The request: system (persona and how this works), <memories>, then the log as turns. Cache marks on the system
 # prompt, the memories, and the end of the request — the next request starts with all of it.
 def render(log, bot_name, cache=True):
-    system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name)
+    system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name, bar=BAR)
     mark = lambda text: [{"type": "text", "text": text, **({"cache_control": CACHE} if cache else {})}]
     messages = [{"role": "system", "content": mark(system) if cache else system},
                 {"role": "user", "content": mark(memories_text(log)) if cache else memories_text(log)}]
@@ -315,6 +383,18 @@ def use(log, call, waking):
         if f.get("name") == "note":
             # its call in the log is the note
             return None, "Noted." if str(args.get("text") or "").strip() else "Nothing to note."
+        if f.get("name") == "bar":
+            return None, bar_state()[1]
+        if f.get("name") == "order":
+            is_open, says = bar_state()
+            if not is_open:
+                return None, says
+            drink, who = menu_drink(str(args.get("drink") or "")), str(args.get("for") or "").strip().lstrip("@")
+            if not drink:
+                return None, f"Not on the menu. {says}"
+            if drink == bar_today(clock().astimezone(j.TIMEZONE).date())[1]:
+                return None, f"The {drink}'s run out today. {says}"
+            return None, f"Ordered: {drink}{f' for {who}' if who else ''}, £{MENU[drink]:.2f}."
         return None, f"No tool called {f.get('name')!r}."
     except (ValueError, KeyError, TypeError) as e:
         return None, f"That didn't work: {e!r}"
@@ -325,8 +405,8 @@ def said(content, bot_name):
     return "" if not re.search(r"\w", text) or re.fullmatch(r"[(\[*].*[)\]*]", text) else text
 
 # Rocky's turn after `waking` (already in the log): its message and tool calls, usually in one response. Only a turn
-# that just kept or dropped memories gets another request, for what it then says. Its requests go through
-# jev_bot.llm_message, which counts their cost on the trace.
+# that just kept or dropped memories, noted, or went to the bar gets another request, for what it then says. Its
+# requests go through jev_bot.llm_message, which counts their cost on the trace.
 # typing: the channel's typing() — shown only for that second request. Discord shows "rocky is typing" for ~10s after
 # it's sent, and nothing stops it but a message, so shown while it decided, it lingered after a turn that only reacted.
 async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
@@ -353,6 +433,11 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             calls = [{"id": c["id"], "name": c["function"]["name"], "arguments": c["function"]["arguments"] or "{}"}
                      for c in message.get("tool_calls") or []]
             text = said(message.get("content"), bot_name)
+            # Written before it saw what the bar said — it'll say what happened next request. Left out of the log
+            # too, so it isn't shown a message that was never posted
+            waits = any(c["name"] in WAIT_FOR for c in calls)
+            if waits:
+                text = ""
             if not text and not calls:
                 break  # nothing said or done — an empty turn isn't one the model can be shown later
             e = log.add("rocky", text=text, calls=calls, reasoning=message.get("reasoning_details"))
@@ -367,8 +452,9 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             if text:
                 turn.text, turn.spoke = text, e
                 break
-            # A reaction answers; a memory or a note on its own doesn't, so it gets a request to say something
-            if any(c["name"] == "react" for c in calls) and all(c["name"] in ("react", "note") for c in calls):
+            # A reaction answers; a memory or a note on its own doesn't, so it gets a request to say something, and
+            # so does the bar, for what it said
+            if not waits and any(c["name"] == "react" for c in calls) and all(c["name"] in ("react", "note") for c in calls):
                 break
         turn.cost = t["cost"] - cost
     finally:
