@@ -510,10 +510,12 @@ def deleted(channel_id, message_id):
         log.add("deleted", on=on)
     changed(log)
 
-# One of Rocky's messages from outside a turn (written while another !model was chosen), so the log has it
-def spoke_elsewhere(channel_id, text, sent):
-    if (log := logs.get(channel_id)) is None:
+# One of Rocky's messages from outside a turn (written while another !model was chosen, or a status posted in
+# STATUS_CHANNEL), so the log has it — loaded if nothing's been said there since a restart
+def spoke_elsewhere(channel, text, sent):
+    if channel.id not in j.LONG_CHAT_CHANNELS:
         return
+    log = log_for(channel)
     log.add("rocky", text=text, calls=[], id=sent.id, at=sent.created_at)
     log.ids[str(sent.id)] = "you"
     changed(log)

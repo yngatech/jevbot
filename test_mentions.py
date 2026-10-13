@@ -606,6 +606,28 @@ class RockyHarnessTests(_Handling):
         # a reply with its ping off isn't to Rocky, but it's still shown as answering its message
         self.assertEqual((asked["reply_to"], asked["you_said"], asked["to_bot"]), ("you", "@pip Biscuit. Good name.", False))
 
+    async def test_a_status_posted_in_the_channel_is_something_it_said(self):
+        await j.on_message(self.said("anyone seen my keys", name="kettle", ping=False))
+        rh.flush()
+        rh.logs.clear()  # a restart, and nothing said there since
+        self.channel.send = AsyncMock(side_effect=lambda content, **kwargs: self.said(content, bot=True))
+        with patch.object(j, "STATUS_CHANNEL", self.channel.id), patch.object(j.bot, "get_channel", lambda i: self.channel):
+            await j.post_status("I feel bad. AI copy self, no need human.")
+        log = rh.logs[self.channel.id]
+        self.assertEqual([e["type"] for e in log.events], ["message", "rocky"])  # after what was saved, not instead
+        self.assertEqual(log.events[-1]["text"], "I feel bad. AI copy self, no need human.")
+
+        m = self.said("why are you scared of this", to=self.by_id[self.next_id - 1])
+        m.reference.resolved = self.by_id[m.reference.message_id]
+        rh.observe(m)
+        llm = self.answer_with("Rocky not scared. Rocky worried.")
+        with patch.object(j, "llm_message", llm):
+            await j.handle(m, j.message_text(m))
+        request = llm.await_args.args[1]
+        self.assertEqual([j.text_of(x["content"]) for x in request if x["role"] == "assistant"],
+                         ["I feel bad. AI copy self, no need human."])
+        self.assertIn('reply_to="your message: I feel bad. AI copy self, no need human."', j.text_of(request[-1]["content"]))
+
     async def test_only_reacting_posts_nothing_and_never_shows_typing(self):
         m = self.said("lol")
         self.channel.typing = Mock(side_effect=lambda: contextlib.nullcontext())
