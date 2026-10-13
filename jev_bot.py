@@ -1208,6 +1208,8 @@ def attachment_tag(a):
 NO_CONTEXT = re.compile(r"(?<!\S)!nocontext(?!\S)[ \t]*", re.IGNORECASE)
 # The inline navigation marker on jev's side-conversation replies is UI, never model context.
 SIDE_LINK = re.compile(r" \[↳(?: thread)?\]\(https://discord\.com/channels/(?:@me|\d+)/\d+/\d+\)$")
+# So are the lines under Rocky's messages saying what it did (action_lines)
+ACTION_LINES = re.compile(r"^-# (?:🍺 ordered|🧠 remembered:|🗑️ forgot:) .*$\n?", re.MULTILINE)
 
 def no_context(m):
     return should_respond(m) and NO_CONTEXT.search(strip_mention(m)) is not None
@@ -1271,7 +1273,7 @@ async def side_root(m):
 def message_text(m):
     text = m.clean_content
     if m.author.id == bot.user.id:
-        text = SIDE_LINK.sub("", text)
+        text = ACTION_LINES.sub("", SIDE_LINK.sub("", text)).strip()
     if should_respond(m):
         text = NO_CONTEXT.sub("", text)
     only = len(LINK.findall(text)) == 1
@@ -2397,6 +2399,18 @@ def message_parts(text, limit=MESSAGE_LIMIT):
         text = text[cut:].strip()
     return [*parts, text]
 
+# What Rocky did besides talking, a subtext line each under its message: what it ordered, remembered and forgot. Not
+# its notes, which are secret. Only under a message, and not in its log — it has its calls there.
+def action_lines(shown):
+    lines = []
+    for kind, a, b in shown:
+        if kind == "order":
+            lines.append(f"-# 🍺 ordered {a}" + (f" for {b}" if b else ""))
+        else:
+            about, _, fact = b.partition(": ")
+            lines.append(f"-# {'🧠 remembered' if kind == 'remember' else '🗑️ forgot'}: {about} {fact}")
+    return lines
+
 # !model rocky, in LONG_CHAT_CHANNELS: Rocky takes its turn in the channel's log (rocky_harness) — its message,
 # its reactions on any message there, and what it remembers. entries: the channel's history, for what the log hasn't
 # seen (the first time, and after a restart).
@@ -2432,6 +2446,11 @@ async def rocky_turn(m, entry, bot_name, entries):
     log.info(f"[OUT] {turn.text} (${trace.get()['cost']:.5f})")
     # Past Discord's limit, the rest follow the reply. They're one turn in the log, so any part is its message
     parts = message_parts(content)
+    if actions := "\n".join(action_lines(turn.shown)):
+        if len(parts[-1]) + 1 + len(actions) <= MESSAGE_LIMIT:
+            parts[-1] += "\n" + actions
+        else:
+            parts.append(actions)
     sent = await m.reply(parts[0], mention_author=False, allowed_mentions=allowed)
     more = []
     for part in parts[1:]:
@@ -2447,7 +2466,7 @@ async def rocky_turn(m, entry, bot_name, entries):
     for x in [sent, *more]:
         chat.ids[str(x.id)] = "you"
     rh.changed(chat)
-    entry["reply"] = " ".join(message_text(x) for x in [sent, *more])
+    entry["reply"] = " ".join(message_text(x) for x in [sent, *more]).strip()
     entry["reply_id"], entry["reply_at"] = sent.id, sent.created_at
     entry["reply_users"] = {k: v for x in [sent, *more] for k, v in message_users(x).items()}
 
