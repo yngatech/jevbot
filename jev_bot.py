@@ -972,21 +972,80 @@ log.info(f"Model: {model_name}")
 # DMs: only from the Discord user IDs in dm_users.txt (gitignored, one per line, "#" comments) — every reply costs
 # credit, and nobody else sees what's said in private. Restart the bot to pick up changes.
 DM_USERS_PATH = Path(__file__).parent / "dm_users.txt"
+# Admins, who can change the settings below with /settings: the user IDs in admins.txt (gitignored, the same format), and
+# the bot's owner in Discord's developer portal. Restart the bot to pick up changes.
+ADMINS_PATH = Path(__file__).parent / "admins.txt"
 
-def load_dm_users():
-    if not DM_USERS_PATH.exists():
+def load_users(path):
+    if not path.exists():
         return set()
     users = set()
-    for line in DM_USERS_PATH.read_text().split("\n"):
+    for line in path.read_text().split("\n"):
         if w := line.split("#", 1)[0].strip():
             try:
                 users.add(int(w))
             except ValueError:
-                log.warning(f"{DM_USERS_PATH.name}: {w!r} isn't a user ID")
+                log.warning(f"{path.name}: {w!r} isn't a user ID")
     return users
 
-DM_USERS = load_dm_users()
+DM_USERS = load_users(DM_USERS_PATH)
 log.info(f"Loaded {len(DM_USERS)} DM user(s)")
+ADMINS = load_users(ADMINS_PATH)
+log.info(f"Loaded {len(ADMINS)} admin(s)")
+
+async def is_admin(user):
+    if user.id in ADMINS:
+        return True
+    try:
+        return await bot.is_owner(user)  # asks Discord the first time, then remembers
+    except Exception as e:
+        log.warning(f"Checking the bot's owner failed: {e}")
+        return False
+
+# Settings admins can change with /settings, over the defaults above, kept in SETTINGS_PATH (gitignored) so a restart keeps
+# them: how often there's a new status, and Rocky's context window — how much of its log of a channel it keeps.
+SETTINGS_PATH = Path(__file__).parent / "settings.json"
+SETTING_RANGES = {"STATUS_EVERY": (15, 7 * 24 * 60), "LOG_TOKENS": (10_000, 500_000)}
+saved_settings: dict[str, int] = {}  # only those /settings has changed
+
+def setting(key):
+    return rh.LOG_TOKENS if key == "LOG_TOKENS" else globals()[key]
+
+def setting_allowed(key, value):
+    low, high = SETTING_RANGES[key]
+    return type(value) is int and (low <= value <= high or key == "STATUS_EVERY" and value == 0)
+
+def apply_setting(key, value):
+    if key == "LOG_TOKENS":
+        rh.LOG_TOKENS = value
+    else:
+        globals()[key] = value
+
+def load_settings():
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text())
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        log.warning(f"Loading {SETTINGS_PATH.name} failed: {e}")
+        return
+    for key, value in saved.items():
+        if key in SETTING_RANGES and setting_allowed(key, value):
+            saved_settings[key] = value
+            apply_setting(key, value)
+            log.info(f"Setting {key} = {value}")
+        else:
+            log.warning(f"{SETTINGS_PATH.name}: ignoring {key} = {value!r}")
+
+def save_setting(key, value):
+    apply_setting(key, value)
+    saved_settings[key] = value
+    try:
+        SETTINGS_PATH.write_text(json.dumps(saved_settings) + "\n")
+    except OSError as e:
+        log.warning(f"Writing {SETTINGS_PATH.name} failed: {e}")
+
+load_settings()
 
 # Discord
 intents = discord.Intents.default()
@@ -1242,13 +1301,13 @@ def should_respond(m):
 history_loaded: dict[int, asyncio.Task] = {}
 
 # !why on its own in a message, and !model with or without a model's name — the command, or None
-COMMANDS = {"!why", "!model"}
+COMMANDS = {"!why": 0, "!model": 1}  # the most words each takes after it
 
 def command(m):
     if m.author.bot:
         return None
     c = strip_mention(m).lower().split()
-    if c and c[0] in COMMANDS and (len(c) == 1 or c[0] == "!model" and len(c) == 2):
+    if c and c[0] in COMMANDS and len(c) - 1 <= COMMANDS[c[0]]:
         return c[0]
     return None
 
@@ -1498,18 +1557,21 @@ async def on_ready():
 # The latest is kept in STATUS_PATH, so a restart shows it again instead of paying for a new one, and the next
 # comes when it's due — with the next start, not "I feel" every time.
 # One is only made once someone has said something in a server since the last (or since jev started), so a quiet
-# night doesn't cost anything or fill STATUS_CHANNEL with statuses talking to nobody.
+# night doesn't cost anything or fill STATUS_CHANNEL with statuses talking to nobody — once one is due, the next
+# message brings it. The loop checks every minute, so a new STATUS_EVERY from /settings counts straight away.
 STATUS_PATH = Path(__file__).parent / "status.json"
 status_turn = 0      # which start and chat the next status gets
 status_at = None     # when the kept one was made
+tried_at = None      # when the latest was made or tried for — the next is due STATUS_EVERY minutes after
 heard = False        # whether someone has spoken since then
 
 def load_status():
-    global status, status_turn, status_at
+    global status, status_turn, status_at, tried_at
     try:
         saved = json.loads(STATUS_PATH.read_text())
         status = discord.CustomActivity(name=saved["status"])
         status_turn, status_at = saved["turn"] + 1, datetime.fromisoformat(saved["at"])
+        tried_at = status_at
         log.info(f"[STATUS] kept from {saved['at']}: {saved['status']}")
     except FileNotFoundError:
         pass
@@ -1525,15 +1587,16 @@ def save_status(mood, turn, at):
 if STATUS_EVERY:
     load_status()
 
-@tasks.loop(minutes=STATUS_EVERY or 1)
+@tasks.loop(minutes=1)
 async def update_status():
-    global status, status_turn, heard
-    if has_credit is False:  # showing "out of credit" — and every request would fail anyway
+    global status, status_turn, heard, tried_at
+    if not STATUS_EVERY or has_credit is False:  # off, or showing "out of credit" — every request would fail anyway
         return
-    if not heard:
-        log.info("[STATUS] nobody's spoken since the last, keeping it")
+    now = datetime.now(timezone.utc)
+    if tried_at and now < tried_at + timedelta(minutes=STATUS_EVERY) or not heard:
         return
     heard = False  # before making it, so a message that comes meanwhile counts for the next
+    tried_at = now  # a failed try waits as long as a status would, not a minute
     bot_name = bot.user.display_name
     t = {"at": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": None, "bot_name": bot_name,
          "cost": 0.0, "requests": 0}
@@ -1574,12 +1637,6 @@ async def post_status(mood):
         rh.spoke_elsewhere(channel, mood, sent)
     except Exception as e:  # the status itself is already showing
         log.warning(f"Posting the status in {STATUS_CHANNEL} failed: {e}")
-
-@update_status.before_loop
-async def wait_for_status():  # the kept status stays until it's due
-    if status_at and (due := status_at + timedelta(minutes=STATUS_EVERY)) > datetime.now(timezone.utc):
-        log.info(f"[STATUS] next at {due.isoformat(timespec='seconds')}")
-        await asyncio.sleep((due - datetime.now(timezone.utc)).total_seconds())
 
 # Messages sent while jev was offline (a restart, an outage) never reach on_message. On (re)connect, answer each
 # channel's latest message to jev from the last CATCH_UP_WINDOW minutes since jev last replied or reacted there —
@@ -2209,6 +2266,69 @@ async def diagnostics_action(interaction: discord.Interaction, target: discord.M
     await interaction.response.defer(ephemeral=True, thinking=True)
     await explain_stats(interaction.channel_id, interaction.guild, target, answer_privately(interaction),
                         diagnostics=True)
+
+
+# /settings: the settings, answered privately — with a menu under each that an admin can change it from. A change is
+# kept and counts straight away, and the answer is redrawn with it. The menus stop working after SETTINGS_TIMEOUT
+# or a restart, and /settings again brings new ones. It's in Discord's layout components rather than an embed, so
+# each menu can have its name above it instead of in every option.
+SETTINGS_TIMEOUT = 15 * 60  # seconds
+STATUS_CHOICES = [0, 60, 120, 180, 360, 720, 1440]  # minutes
+CONTEXT_CHOICES = [25_000, 50_000, 90_000, 150_000, 200_000]  # tokens
+
+def describe_status(minutes):
+    if not minutes:
+        return "Off"
+    if minutes % 60:
+        return f"Every {minutes} minutes"
+    return "Every hour" if minutes == 60 else f"Every {minutes // 60} hours"
+
+def describe_tokens(tokens):
+    return f"{tokens // 1000}K tokens" if tokens % 1000 == 0 else f"{tokens:,} tokens"
+
+class SettingMenu(discord.ui.Select):
+    def __init__(self, key, choices, describe):
+        self.key = key
+        current = setting(key)
+        values = sorted({*choices, current})  # one set in an earlier version, or by hand, still shows
+        super().__init__(options=[discord.SelectOption(label=describe(v), value=str(v), default=v == current)
+                                  for v in values])
+
+    async def callback(self, interaction):
+        if not await is_admin(interaction.user):
+            return await interaction.response.send_message("Only admins can change settings", ephemeral=True)
+        change_setting(self.key, int(self.values[0]))
+        log.info(f"[SET] {interaction.user} set {self.key} to {self.values[0]}")
+        await interaction.response.edit_message(view=SettingsView(True))
+
+class SettingsView(discord.ui.LayoutView):
+    def __init__(self, admin):
+        super().__init__(timeout=SETTINGS_TIMEOUT)
+        text = discord.ui.TextDisplay
+        box = discord.ui.Container(text("### Settings"), accent_color=EXPLANATION_COLOR)
+        if admin:
+            box.add_item(text("**New status**"))
+            box.add_item(discord.ui.ActionRow(SettingMenu("STATUS_EVERY", STATUS_CHOICES, describe_status)))
+            box.add_item(text("**Context window** · how far back Rocky remembers a channel"))
+            box.add_item(discord.ui.ActionRow(SettingMenu("LOG_TOKENS", CONTEXT_CHOICES, describe_tokens)))
+        else:
+            box.add_item(text(f"**New status**\n{describe_status(STATUS_EVERY)}"))
+            box.add_item(text(f"**Context window**\n{describe_tokens(rh.LOG_TOKENS)}, how far back Rocky remembers "
+                              "a channel"))
+        box.add_item(text("-# Changes count straight away, and are kept across restarts." if admin else
+                          "-# Only admins can change these."))
+        self.add_item(box)
+
+def change_setting(key, value):
+    save_setting(key, value)
+    if key == "STATUS_EVERY" and value and not update_status.is_running() and bot.is_ready():
+        if status is None:
+            load_status()  # not loaded at startup while statuses were off — when the last one was made
+        update_status.start()
+
+@bot.tree.command(name="settings", description="See the settings — admins can change them")
+async def settings_command(interaction: discord.Interaction):
+    await interaction.response.send_message(view=SettingsView(await is_admin(interaction.user)), ephemeral=True)
 
 
 # !model: which model writes the replies and statuses, or with a name, switch to it — for everyone, and kept

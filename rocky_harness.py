@@ -7,7 +7,7 @@ XML with who, when and what they reply to. Rocky's turns are the assistant's: it
 and its tool calls (react, remember, forget, note) are kept with their results. Nothing in the log is rewritten, so every
 request starts with the one before it and the model's prompt cache covers all but the newest events. A <memories>
 block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache would be rebuilt
-anyway (tidy): at a jump, when the log outgrows LOG_CHARS and its oldest half goes, or after CACHE_HOURS without a
+anyway (tidy): at a jump, when the log outgrows LOG_TOKENS and its oldest half goes, or after CACHE_HOURS without a
 request.
 
 The way !model's LLMs work elsewhere is a ghostwriter's: the chat as one transcript, then "Write rocky's reply to pip's
@@ -32,7 +32,8 @@ def bind(bot_module):
     global j
     j = bot_module
 
-LOG_CHARS = 200_000         # a log's size before its oldest half goes — ~90K Haiku tokens, under its 100K price step
+LOG_TOKENS = 90_000         # a log's size before its oldest half goes — under Haiku's 100K price step; set in /settings
+CHARS_PER_TOKEN = 2.2       # Haiku's, in our chat — a log is measured in characters, LOG_TOKENS turned into them
 MAX_TOKENS = 4000           # its thinking, its message and its tool calls; the message is cut to its first paragraph
 FOLLOW_UPS = 1              # requests after one that only kept or dropped memories, for what it then says
 CACHE = {"type": "ephemeral", "ttl": "1h"}
@@ -375,13 +376,13 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             j.trace.reset(token)
     return turn
 
-# The log's oldest half goes once it's over LOG_CHARS: everything before a message, so no turn loses its results.
+# The log's oldest half goes once it's over LOG_TOKENS: everything before a message, so no turn loses its results.
 # <memories> is rebuilt then, so what was remembered in the dropped half isn't lost with it.
 def chars(log):
     return sum(len(e.get("text") or "") + 60 + sum(len(c["arguments"]) for c in e.get("calls", [])) for e in log.events)
 
 def jump(log):
-    if chars(log) <= LOG_CHARS:
+    if chars(log) <= LOG_TOKENS * CHARS_PER_TOKEN:
         return False
     cut = next((i for i in range(len(log.events) // 2, len(log.events)) if log.events[i]["type"] == "message"), None)
     if cut is None:

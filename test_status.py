@@ -151,7 +151,8 @@ class StatusUpdateTests(_StatusCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.old = j.discord.CustomActivity("I feel rested today")
-        for name, value in (("status", self.old), ("status_turn", 0), ("heard", True), ("gen_lock", asyncio.Lock())):
+        for name, value in (("status", self.old), ("status_turn", 0), ("heard", True), ("tried_at", None),
+                            ("STATUS_EVERY", 180), ("gen_lock", asyncio.Lock())):
             patcher = patch.object(j, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -245,6 +246,7 @@ class StatusUpdateTests(_StatusCase):
     async def test_original_context_alternation_and_prefix_rotation(self):
         for turn in (0, 1, 2, 3):
             with self.subTest(turn=turn), patch.object(j, "status_turn", turn), patch.object(j, "heard", True), \
+                 patch.object(j, "tried_at", None), \
                  patch.object(j, "recent_chat", Mock(return_value="Speaker: dinner tonight")), \
                  patch.object(j, "generate_filtered_status", AsyncMock(return_value="I feel good")) as generate:
                 await j.update_status.coro()
