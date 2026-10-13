@@ -356,6 +356,7 @@ class Turn:
     text: str = ""
     reactions: list = field(default_factory=list)  # [(message n, emoji)]
     kept: list = field(default_factory=list)       # what remember and forget did
+    shown: list = field(default_factory=list)      # what it did that's shown under its message: kept, and orders
     spoke: dict = None                             # the log's event for its message, to give it its Discord id
     requests: int = 0
     cost: float = 0.0
@@ -407,7 +408,7 @@ def use(log, call, waking):
                 return None, f"Not on the menu. {says}"
             if drink == bar_today(clock().astimezone(j.TIMEZONE).date())[1]:
                 return None, f"The {drink}'s run out today. {says}"
-            return None, f"Ordered: {drink}{f' for {who}' if who else ''}, £{MENU[drink]:.2f}."
+            return ("order", drink, who or None), f"Ordered: {drink}{f' for {who}' if who else ''}, £{MENU[drink]:.2f}."
         return None, f"No tool called {f.get('name')!r}."
     except (ValueError, KeyError, TypeError) as e:
         return None, f"That didn't work: {e!r}"
@@ -461,7 +462,10 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
                 if done and done[0] == "react":
                     turn.reactions.append(done[1:])
                 elif done:
-                    turn.kept.append(done)
+                    if done[0] != "order":
+                        turn.kept.append(done)
+                    if done[2]:  # not a forget of no fact
+                        turn.shown.append(done)
             if text:
                 turn.text, turn.spoke = text, e
                 break

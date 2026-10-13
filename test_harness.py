@@ -172,7 +172,7 @@ class ToolTests(_Case):
         out = rh.bar_today(day)[1]
         other = next(d for d in rh.MENU if d != out)
         self.bar_at(datetime(day.year, day.month, day.day, 20, tzinfo=timezone.utc))
-        self.assertEqual(self.call("order", drink=other.lower()), (None, f"Ordered: {other}, £{rh.MENU[other]:.2f}."))
+        self.assertEqual(self.call("order", drink=other.lower()), (("order", other, None), f"Ordered: {other}, £{rh.MENU[other]:.2f}."))
         self.assertEqual(self.call("order", drink=other, **{"for": "@pip"})[1], f"Ordered: {other} for pip, £{rh.MENU[other]:.2f}.")
         self.assertIn(f"{out}'s run out", self.call("order", drink=out)[1])
         self.assertIn(f"{out} £{rh.MENU[out]:.2f} (run out)", self.call("bar")[1])
@@ -245,6 +245,21 @@ class TurnTests(_Case):
         self.assertEqual([e["text"] for e in self.log.events if e["type"] == "rocky"], ["", "", "Rocky have beer. Good, good, good."])
         self.assertEqual(llm.call_args.args[1][-1]["content"], "Ordered: Blip-A Lager, £4.90.")
 
+    async def test_what_it_ordered_remembered_and_forgot_is_shown_in_call_order(self):
+        rh.memory("400")["facts"].append({"n": 9, "about": "pip", "fact": "likes lager", "at": ""})
+        with patch.object(rh, "bar_state", lambda now=None: (True, "Open.")), patch.object(rh, "bar_today", lambda d: (None, None)):
+            turn, llm = await self.turn(
+                answer(calls=[("order", {"drink": "eridani stout", "for": "@pip"}), ("note", {"text": "picked 4"}),
+                              ("forget", {"number": 9}), ("forget", {"number": 99}),
+                              ("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
+                answer("Stout for Pip."))
+        self.assertEqual(turn.shown, [("order", "Eridani Stout", "pip"), ("forget", 9, "pip: likes lager"),
+                                      ("remember", 1, "pip: has a cat called Biscuit")])  # not the note, nor no fact
+        self.assertEqual([k[0] for k in turn.kept], ["forget", "forget", "remember"])  # orders aren't memories
+        self.assertEqual(j.action_lines(turn.shown), ["-# 🍺 ordered Eridani Stout for pip",
+                                                      "-# 🗑️ forgot: pip likes lager",
+                                                      "-# 🧠 remembered: pip has a cat called Biscuit"])
+
     async def test_only_reacting_or_nothing_is_one_request(self):
         turn, llm = await self.turn(answer(calls=[("react", {"emoji": "😂"})]))
         self.assertEqual((turn.text, turn.reactions, llm.await_count), ("", [(1, "😂")], 1))
@@ -292,6 +307,30 @@ class LongMessageTests(_Case):
         self.assertEqual((self.log.ids, entry["reply_id"]), ({"900": "you", "901": "you"}, 900))
         self.assertEqual((entry["reply"], entry["reply_users"]), ("part part", {"900": "pip", "901": "pip"}))
         self.assertEqual(self.log.rocky_text(901), text)  # a reaction to either part is to its message
+
+    async def test_what_it_did_goes_under_its_message_but_not_in_its_log(self):
+        sent = SimpleNamespace(id=900, created_at=T0)
+        channel = SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400), typing=None, send=AsyncMock())
+        m = SimpleNamespace(id=5, channel=channel, guild=channel.guild, author=SimpleNamespace(display_name="pip"),
+                            reply=AsyncMock(return_value=sent))
+        q = self.said("pip", "rocky get me a stout", 0, to_bot=True)
+
+        async def take_turn(log, waking, *args, **kwargs):
+            return rh.Turn(text="Stout for Pip.", spoke=log.add("rocky", text="Stout for Pip.", calls=[]), requests=1,
+                           shown=[("order", "Eridani Stout", "pip"), ("remember", 1, "pip: likes stout")])
+
+        entry = {"name": "pip", "content": "rocky get me a stout", "users": {}}
+        with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
+                patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
+                patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "mention_targets", lambda *a, **k: {}), \
+                patch.object(j, "message_users", lambda x: {}), \
+                patch.object(j, "message_text", lambda x: j.ACTION_LINES.sub("", m.reply.call_args.args[0]).strip()):
+            await j.rocky_turn(m, entry, "rocky", [])
+        self.assertEqual(m.reply.call_args.args[0],
+                         "Stout for Pip.\n-# 🍺 ordered Eridani Stout for pip\n-# 🧠 remembered: pip likes stout")
+        self.assertEqual(self.log.events[-1]["text"], "Stout for Pip.")  # it has its calls in the log
+        self.assertEqual(entry["reply"], "Stout for Pip.")
+        channel.send.assert_not_called()
 
 
 class KeepingTests(_Case):

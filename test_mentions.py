@@ -578,7 +578,8 @@ class RockyHarnessTests(_Handling):
         with patch.object(j, "llm_message", llm):
             await j.handle(m, j.message_text(m))  # as catch-up does: not seen live, so the turn adds it
         m.reply.assert_awaited_once()
-        self.assertEqual(m.reply.call_args.args[0], "Biscuit. Good name.")  # it's a reply to pip already
+        # it's a reply to pip already, and says what Rocky remembered under it
+        self.assertEqual(m.reply.call_args.args[0], "Biscuit. Good name.\n-# 🧠 remembered: pip has a cat called Biscuit")
         self.partials[m.id].add_reaction.assert_awaited_once_with("🐱")
         j.choose_reaction.assert_not_awaited()  # Rocky decides, not Jev's check
         log = rh.logs[self.channel.id]
@@ -801,6 +802,11 @@ class NoContextChainTests(_Handling):
     def test_previous_thread_label_stays_out_of_context(self):
         m = self.said("Granite. [↳ thread](https://discord.com/channels/400/300/800)", bot=True)
         self.assertEqual(j.message_text(m), "Granite.")
+
+    def test_what_rocky_did_under_its_message_stays_out_of_context(self):
+        m = self.said("Stout for Pip.\n-# 🍺 ordered Eridani Stout for pip\n-# 🧠 remembered: pip likes stout", bot=True)
+        self.assertEqual(j.message_text(m), "Stout for Pip.")
+        self.assertIn("-# 🍺 ordered a lager", j.message_text(self.said("-# 🍺 ordered a lager")))  # only Rocky's
 
     async def test_dm_side_reply_links_to_dm_root(self):
         q = self.said("!nocontext favourite rock?")
