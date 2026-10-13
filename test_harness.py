@@ -304,7 +304,7 @@ class KeepingTests(_Case):
             self.log.add("rocky", text="", calls=[{"id": f"c{i}", "name": "react", "arguments": "{}"}])
             self.log.add("result", id=f"c{i}", content="Reacted.")
         rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
-        with patch.object(rh, "LOG_CHARS", rh.chars(self.log) - 1):
+        with patch.object(rh, "LOG_TOKENS", (rh.chars(self.log) - 1) / rh.CHARS_PER_TOKEN):
             self.assertTrue(rh.jump(self.log))
         self.assertEqual(self.log.events[0]["type"], "message")
         self.assertEqual(len(self.log.events), 60)
