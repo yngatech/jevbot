@@ -137,6 +137,45 @@ class ToolTests(_Case):
         self.assertNotIn("picked 4", readable)  # Context, which anyone can open, doesn't
         self.assertIn('[note] [react {"emoji": "🤫"}]', readable)
 
+    def bar_at(self, at):
+        p = patch.object(rh, "clock", lambda: at)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def day(self, shut=False, out=False):  # the first day from T0 that's like this
+        return next(d for d in (T0.date() + timedelta(days=i) for i in range(365))
+                    if bool(rh.bar_today(d)[0]) == shut and bool(rh.bar_today(d)[1]) == out)
+
+    def test_the_bar_keeps_hours_and_some_days_doesnt_open(self):
+        day = self.day()
+        opens, closes = rh.HOURS[day.weekday()]
+        at = lambda h, m=0: datetime(day.year, day.month, day.day, h, m, tzinfo=timezone.utc)
+        self.bar_at(at(opens, 30))
+        self.assertEqual(self.call("bar")[0], None)
+        self.assertIn("is open", self.call("bar")[1])
+        self.assertIn("Blip-A Lager £4.90", self.call("bar")[1])
+        self.assertEqual(rh.bar_state(at(opens - 1)), (False, f"Closed. Opens at {opens}:00."))
+        self.assertIn("Last orders!", rh.bar_state(at(closes - 1, 50))[1])
+        shut = self.day(shut=True)
+        is_open, says = rh.bar_state(datetime(shut.year, shut.month, shut.day, 18, tzinfo=timezone.utc))
+        self.assertFalse(is_open)
+        self.assertRegex(says, r"^Closed today: .+\. Next open \w+ from \d+:00\.$")
+        # and the same whenever it's asked that day
+        self.assertEqual(rh.bar_today(shut), rh.bar_today(shut))
+
+    def test_an_order_is_for_whats_on_while_its_open(self):
+        day = self.day(out=True)
+        out = rh.bar_today(day)[1]
+        other = next(d for d in rh.MENU if d != out)
+        self.bar_at(datetime(day.year, day.month, day.day, 20, tzinfo=timezone.utc))
+        self.assertEqual(self.call("order", drink=other.lower()), (None, f"Ordered: {other}, £{rh.MENU[other]:.2f}."))
+        self.assertEqual(self.call("order", drink=other, **{"for": "@pip"})[1], f"Ordered: {other} for pip, £{rh.MENU[other]:.2f}.")
+        self.assertIn(f"{out}'s run out", self.call("order", drink=out)[1])
+        self.assertIn(f"{out} £{rh.MENU[out]:.2f} (run out)", self.call("bar")[1])
+        self.assertTrue(self.call("order", drink="Guinness")[1].startswith("Not on the menu."))
+        self.bar_at(datetime(day.year, day.month, day.day, 3, tzinfo=timezone.utc))
+        self.assertEqual(self.call("order", drink=other)[1], rh.bar_state()[1])  # closed: what the bar says
+
     def test_a_wordless_answer_is_nothing_and_a_leading_tag_of_the_asker_goes(self):
         for text in ("(silent)", ".", "*nothing*", "[no reply]"):
             self.assertEqual(rh.said(text, "rocky"), "")
@@ -191,6 +230,16 @@ class TurnTests(_Case):
     async def test_after_only_a_note_it_gets_a_turn_to_speak(self):
         turn, llm = await self.turn(answer(calls=[("note", {"text": "picked 4"})]), answer("Rocky pick. Not tell."))
         self.assertEqual((turn.text, turn.requests), ("Rocky pick. Not tell.", 2))
+
+    async def test_at_the_bar_it_sees_what_happened_before_it_speaks(self):
+        with patch.object(rh, "bar_state", lambda now=None: (True, "The Hail Mary is open until 23:00. Menu: Blip-A Lager £4.90.")):
+            turn, llm = await self.turn(answer("Rocky get beer!", [("bar", {}), ("react", {"emoji": "🍺"})]),
+                                        answer(calls=[("order", {"drink": "Blip-A Lager"})]),
+                                        answer("Rocky have beer. Good, good, good."))
+        self.assertEqual((turn.text, turn.reactions, turn.requests), ("Rocky have beer. Good, good, good.", [(1, "🍺")], 3))
+        # What it wrote before it knew isn't posted, nor shown to it as said
+        self.assertEqual([e["text"] for e in self.log.events if e["type"] == "rocky"], ["", "", "Rocky have beer. Good, good, good."])
+        self.assertEqual(llm.call_args.args[1][-1]["content"], "Ordered: Blip-A Lager, £4.90.")
 
     async def test_only_reacting_or_nothing_is_one_request(self):
         turn, llm = await self.turn(answer(calls=[("react", {"emoji": "😂"})]))
