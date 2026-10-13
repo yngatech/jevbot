@@ -256,6 +256,44 @@ class TurnTests(_Case):
         self.assertEqual((turn.reactions, llm.await_count), ([(3, "🤫")], 1))
 
 
+class LongMessageTests(_Case):
+    def test_a_message_too_long_for_discord_is_cut_at_sentences(self):
+        self.assertEqual(j.message_parts("Short."), ["Short."])
+        text = ("Rocky like beer. " * 150).strip()  # 2549 characters
+        parts = j.message_parts(text)
+        self.assertEqual(len(parts), 2)
+        self.assertTrue(all(len(p) <= j.MESSAGE_LIMIT for p in parts))
+        self.assertTrue(parts[0].endswith("beer."))
+        self.assertEqual(" ".join(parts), text)
+        self.assertEqual(j.message_parts("word " * 500, limit=100)[0], ("word " * 20).strip())  # no sentences: spaces
+        self.assertEqual(j.message_parts("x" * 250, limit=100), ["x" * 100, "x" * 100, "x" * 50])
+
+    async def test_its_parts_are_sent_in_turn_and_are_one_message_in_the_log(self):
+        text = ("Rocky like beer. " * 150).strip()
+        sent = [SimpleNamespace(id=900 + i, created_at=T0) for i in range(2)]
+        channel = SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400), typing=None,
+                                  send=AsyncMock(return_value=sent[1]))
+        m = SimpleNamespace(id=5, channel=channel, guild=channel.guild, author=SimpleNamespace(display_name="pip"),
+                            reply=AsyncMock(return_value=sent[0]))
+        q = self.said("pip", "rocky tell me everything", 0, to_bot=True)
+
+        async def take_turn(log, waking, *args, **kwargs):
+            return rh.Turn(text=text, spoke=log.add("rocky", text=text, calls=[]), requests=1)
+
+        entry = {"name": "pip", "content": "rocky tell me everything", "users": {}}
+        with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
+                patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
+                patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "message_text", lambda x: "part"), \
+                patch.object(j, "message_users", lambda x: {str(x.id): "pip"}), \
+                patch.object(j, "mention_targets", lambda *a, **k: {}):
+            await j.rocky_turn(m, entry, "rocky", [])
+        first, rest = m.reply.call_args.args[0], channel.send.call_args.args[0]
+        self.assertEqual(f"{first} {rest}", text)
+        self.assertEqual((self.log.ids, entry["reply_id"]), ({"900": "you", "901": "you"}, 900))
+        self.assertEqual((entry["reply"], entry["reply_users"]), ("part part", {"900": "pip", "901": "pip"}))
+        self.assertEqual(self.log.rocky_text(901), text)  # a reaction to either part is to its message
+
+
 class KeepingTests(_Case):
     def channel(self):
         return SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400))
