@@ -209,7 +209,8 @@ def memories_changed():
 #   reaction: {"on": n or "you", "you_said", "emoji", "author", "removed"}
 #   edit:     {"on": n, "text"}
 #   deleted:  {"on": n or "you", "you_said"}  — and the message gets "deleted"; tidy() then blanks it ("gone")
-#   rocky:    {"text", "calls": [{"id", "name", "arguments"}], "reasoning", "id": its Discord message}
+#   rocky:    {"text", "calls": [{"id", "name", "arguments"}], "reasoning", "id": its Discord message,
+#              "more_ids": the messages after it, when it was too long for one}
 #   result:   {"id", "content"}  — what came of a call, right after its turn
 #   update:   {"commit", "subject"}  — a change to Rocky, deployed: a commit to UPDATES_FROM
 # ids: Discord message id to n, or to "you" for Rocky's own.
@@ -249,7 +250,8 @@ class Log:
         return next((int(i) for i, v in self.ids.items() if v == n), None)
 
     def rocky_text(self, discord_id):
-        return next((e["text"] for e in reversed(self.events) if e["type"] == "rocky" and e.get("id") == discord_id), "")
+        return next((e["text"] for e in reversed(self.events) if e["type"] == "rocky" and
+                     (e.get("id") == discord_id or discord_id in e.get("more_ids", []))), "")
 
 
 def attr(v):

@@ -2384,6 +2384,18 @@ async def respond_traced(m, **extra):
         write_trace(t)
 
 
+# A message too long for Discord as several: each cut at its last sentence's end that fits, or else its last space
+MESSAGE_LIMIT = 2000
+
+def message_parts(text, limit=MESSAGE_LIMIT):
+    parts = []
+    while len(text) > limit:
+        cut = max((m.end() for m in re.finditer(r"[.!?…](?=\s)", text[:limit])), default=0) or text.rfind(" ", 0, limit)
+        cut = cut if cut > 0 else limit
+        parts.append(text[:cut].strip())
+        text = text[cut:].strip()
+    return [*parts, text]
+
 # !model rocky, in LONG_CHAT_CHANNELS: Rocky takes its turn in the channel's log (rocky_harness) — its message,
 # its reactions on any message there, and what it remembers. entries: the channel's history, for what the log hasn't
 # seen (the first time, and after a restart).
@@ -2417,13 +2429,26 @@ async def rocky_turn(m, entry, bot_name, entries):
     content, allowed = resolve_mentions(rh.unaddressed(turn.text, m.author.display_name), targets)
     note(reply=turn.text, sent=content)
     log.info(f"[OUT] {turn.text} (${trace.get()['cost']:.5f})")
-    sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
-    note(reply_id=sent.id)
+    # Past Discord's limit, the rest follow the reply. They're one turn in the log, so any part is its message
+    parts = message_parts(content)
+    sent = await m.reply(parts[0], mention_author=False, allowed_mentions=allowed)
+    more = []
+    for part in parts[1:]:
+        try:
+            more.append(await m.channel.send(part, allowed_mentions=allowed))
+        except discord.HTTPException as e:
+            log.warning(f"[ROCKY] sending part {len(more) + 2} of {len(parts)} failed: {e}")
+            break
+    note(reply_id=sent.id, **({"reply_ids": [x.id for x in [sent, *more]]} if more else {}))
     turn.spoke["id"] = sent.id
-    chat.ids[str(sent.id)] = "you"
+    if more:
+        turn.spoke["more_ids"] = [x.id for x in more]
+    for x in [sent, *more]:
+        chat.ids[str(x.id)] = "you"
     rh.changed(chat)
-    entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(sent), sent.id, sent.created_at
-    entry["reply_users"] = message_users(sent)
+    entry["reply"] = " ".join(message_text(x) for x in [sent, *more])
+    entry["reply_id"], entry["reply_at"] = sent.id, sent.created_at
+    entry["reply_users"] = {k: v for x in [sent, *more] for k, v in message_users(x).items()}
 
 async def handle(m, c):
     if m.guild is None:
