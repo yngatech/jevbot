@@ -23,6 +23,7 @@ import html
 import json
 import random
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +49,8 @@ SAVE_AFTER = 2              # seconds after a change before a log or the memorie
 REASONING = {"effort": "low"}
 LOG_DIR = Path(__file__).parent / "rocky_logs"          # a channel's log each, gitignored
 MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
+HERE = Path(__file__).parent
+UPDATES_FROM = ["rocky_harness.py"]  # changes to Rocky: commits touching these come to its logs as <update>s
 
 # Its last paragraph is for secrets. Without it, on a live-length log, "pick a number and don't tell us" got "Rocky pick
 # seven" 4 times in 5, and a secret animal was named in its thinking once in 6, so asked later it made one up. Told to
@@ -59,9 +62,12 @@ MEMORY_PATH = Path(__file__).parent / "rocky_memories.json"
 # replayed. Told to play fair, checking each guess against its note: "yes. Four. You got it" 6 in 6.
 # The bar's paragraph: told only to "say what happened", it answered a closed bar with just a 🍺 in 3 of 3 replays;
 # told to say it in words, it did in 8 of 8.
+# <update>s: told to bring one up "only when it's what's being talked about or someone asks", it told "anything new
+# with you today?" about the bar in 1 of 5 replays; told to when they ask what's new, 6 of 6. Asked about lunch, it
+# announced it in none of 11.
 HARNESS = """
 
-This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns.
+This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns. An <update> is a change to you, like a new tool, at the point it happened: tell them about it when they ask what's new with you, or it's what's being talked about, but don't announce it out of nowhere.
 
 Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools, alongside your message or instead of it. Write your message and make every tool call in the same response — don't wait to see what a tool did before you speak, except at the bar (below):
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words (a reaction as well, if you like), and so does a request; write a message too when you truly have something to add.
@@ -204,6 +210,7 @@ def memories_changed():
 #   deleted:  {"on": n or "you", "you_said"}  — and the message gets "deleted"; tidy() then blanks it ("gone")
 #   rocky:    {"text", "calls": [{"id", "name", "arguments"}], "reasoning", "id": its Discord message}
 #   result:   {"id", "content"}  — what came of a call, right after its turn
+#   update:   {"commit", "subject"}  — a change to Rocky, deployed: a commit to UPDATES_FROM
 # ids: Discord message id to n, or to "you" for Rocky's own.
 @dataclass
 class Log:
@@ -216,6 +223,7 @@ class Log:
     shown: list = field(default_factory=list)  # the facts in <memories>: as they were at the last jump
     seeded: bool = False                       # filled from the channel's history, the first time it was needed
     asked: datetime = None                     # the last request, to know when the cache has gone
+    code: str = None                           # the last commit it was told about (updates)
 
     def message(self, author, text, at, to_bot=False, reply_to=None, uid=None, discord_id=None, you_said=None):
         e = {"type": "message", "n": self.next_n, "author": author, "uid": uid, "at": at, "text": text,
@@ -278,6 +286,8 @@ def people_turn(events, clock):
         elif e["type"] == "deleted":
             on = f'your message: {snippet(e.get("you_said") or "")}' if e["on"] == "you" else e["on"]
             lines.append(f'<deleted id="{attr(on)}"/>')
+        elif e["type"] == "update":
+            lines.append(f'<update>{html.escape(e["subject"], quote=False)}</update>')
     return "\n".join(lines)
 
 def memories_text(log):
@@ -502,7 +512,7 @@ def plain(v):
 def save_log(log):
     log_saves.pop(log.channel_id, None)
     saved = {"channel": log.channel, "space": log.space, "next_n": log.next_n, "ids": log.ids, "shown": log.shown,
-             "seeded": log.seeded, "asked": plain(log.asked),
+             "seeded": log.seeded, "asked": plain(log.asked), "code": log.code,
              "events": [{k: plain(v) for k, v in e.items()} for e in log.events]}
     try:
         LOG_DIR.mkdir(exist_ok=True)
@@ -539,12 +549,59 @@ def log_for(channel):
         log.next_n, log.ids, log.shown, log.seeded = saved["next_n"], saved["ids"], saved["shown"], saved["seeded"]
         log.asked = saved.get("asked") and datetime.fromisoformat(saved["asked"])
         log.events = [e | {"at": datetime.fromisoformat(e["at"])} if e.get("at") else e for e in saved["events"]]
+        log.code = saved.get("code")
+        updated(log)
     except FileNotFoundError:
-        pass
+        log.code = head()  # a new log starts as Rocky is now
     except Exception as e:  # unreadable — start again, from the channel's history
         j.log.warning(f"Loading the log for #{log.channel} failed: {e}")
     logs[channel.id] = log
     return log
+
+# Updates: commits to UPDATES_FROM since a log's last, as <update>s at its end — appended, so the cache keeps all
+# before them. Only the subject, without its scope or PR number ("give Rocky a bar to order drinks from"): the repo is
+# public, but bodies are long. A log from before updates were told gets every one since its first event, each where
+# it happened — that rewrites the log, but only once, at the deploy that changed the prompt to tell of them, which
+# rewrote the cache anyway.
+def git(*args):
+    try:
+        return subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True, timeout=10, check=True).stdout
+    except (OSError, subprocess.SubprocessError) as e:
+        j.log.warning(f"git {args[0]} failed: {e}")
+        return None
+
+def head():
+    return (git("rev-parse", "HEAD") or "").strip() or None
+
+def updates(since_commit=None, since=None):
+    span = [f"{since_commit}..HEAD"] if since_commit else [f"--since={since.isoformat()}", "HEAD"]
+    found = []
+    for line in (git("log", "--reverse", "--format=%H%x00%ct%x00%s", *span, "--", *UPDATES_FROM) or "").splitlines():
+        commit, at, subject = line.split("\0", 2)
+        found.append({"commit": commit, "at": datetime.fromtimestamp(int(at), timezone.utc),
+                      "subject": re.sub(r"^[\w ,/-]+: |\s*\(#\d+\)$", "", subject)})
+    return found
+
+def updated(log):
+    now = head()
+    if not now or now == log.code:
+        return False
+    first = next((e["at"] for e in log.events if e.get("at")), None)
+    new = updates(log.code) if log.code else updates(since=first) if first else []
+    for u in new:
+        if log.code:
+            log.add("update", **u)
+            continue
+        # where it happened: before the first event after it, but never between a turn's calls and their results
+        i = next((i for i, e in enumerate(log.events) if e.get("at") and e["at"] > u["at"]), len(log.events))
+        while i < len(log.events) and log.events[i]["type"] == "result":
+            i += 1
+        log.events.insert(i, {"type": "update", **u})
+    log.code = now
+    changed(log)
+    if new:
+        j.log.info(f"[ROCKY] #{log.channel} told of {len(new)} update(s)")
+    return bool(new)
 
 # A message in the channel, as it arrives: people's and other apps' — not Rocky's own (its turns add those), commands,
 # or side conversations (jev_bot keeps those out). Returns its event, or None.
