@@ -6,6 +6,7 @@ The model's answers are synthetic.
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,9 @@ class _Case(unittest.IsolatedAsyncioTestCase):
             p = patch.object(obj, attr, value)
             p.start()
             self.addCleanup(p.stop)
+        self.no_git = patch.object(rh, "head", lambda: None)  # the checkout's own commits aren't for tests
+        self.no_git.start()
+        self.addCleanup(self.no_git.stop)
         self.log = rh.Log("bot-spam", "400", 300)
 
     def said(self, author, text, minutes, to_bot=False, **kwargs):
@@ -279,6 +283,71 @@ class KeepingTests(_Case):
         self.assertEqual(json.loads((rh.LOG_DIR / "300.json").read_text())["ids"], {"900": 1})
         self.assertEqual(json.loads(rh.MEMORY_PATH.read_text())["400"]["facts"][0]["fact"], "likes soup")
         self.assertEqual((rh.log_saves, rh.memories_save), ({}, None))
+
+    def repo(self):
+        self.no_git.stop()
+        self.addCleanup(self.no_git.start)  # stopped again by its own cleanup
+        here = Path(self.dir.name) / "repo"
+        here.mkdir()
+        p = patch.object(rh, "HERE", here)
+        p.start()
+        self.addCleanup(p.stop)
+        git = lambda *a, **env: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *a],
+                                               cwd=here, check=True, capture_output=True, text=True,
+                                               env={**os.environ, **env}).stdout.strip()
+        git("init", "-q")
+
+        def commit(path, subject, **env):
+            (here / path).write_text(subject)
+            git("add", path)
+            git("commit", "-qm", subject, **env)
+            return git("rev-parse", "HEAD")
+        return commit
+
+    def test_after_an_update_to_rocky_its_logs_are_told(self):
+        commit = self.repo()
+        first = commit("rocky_harness.py", "generate: give Rocky a note tool (#100)")
+        log = rh.log_for(self.channel())
+        self.assertEqual((log.code, log.events), (first, []))  # a new log starts as Rocky is now
+        log.message("pip", "soup?", T0, to_bot=True)
+        rh.save_log(log)
+        rh.logs.clear()
+        commit("jev_bot.py", "status: something about Jev (#101)")
+        bar = commit("rocky_harness.py", "generate: give Rocky a bar to order drinks from (#106)")
+        before = rh.render(log, "rocky")
+        back = rh.log_for(self.channel())
+        self.assertEqual([(e["commit"], e["subject"]) for e in back.events if e["type"] == "update"],
+                         [(bar, "give Rocky a bar to order drinks from")])
+        self.assertEqual(back.code, bar)
+        after = rh.render(back, "rocky")
+        self.assertEqual(after[:-1], before[:-1])  # appended: the request before it is as it was
+        self.assertIn("<update>give Rocky a bar to order drinks from</update>", j.text_of(after[-1]["content"]))
+        rh.save_log(back)
+        rh.logs.clear()
+        self.assertEqual(len(rh.log_for(self.channel()).events), 2)  # told once
+
+    def test_a_log_from_before_updates_gets_them_where_they_happened(self):
+        commit = self.repo()
+        date = lambda minutes: {"GIT_COMMITTER_DATE": (T0 + timedelta(minutes=minutes)).isoformat()}
+        commit("rocky_harness.py", "generate: before the log began (#1)", **date(-60))
+        commit("rocky_harness.py", "generate: give Rocky a note tool (#100)", **date(2))
+        commit("jev_bot.py", "status: something about Jev (#101)", **date(3))
+        bar = commit("rocky_harness.py", "generate: give Rocky a bar to order drinks from (#106)", **date(30))
+        log = rh.log_for(self.channel())
+        log.code = None
+        log.message("pip", "pick a number", T0, to_bot=True)
+        log.add("rocky", text="", calls=[{"id": "c1", "name": "note", "arguments": "{}"}], at=T0 + timedelta(minutes=1))
+        log.add("result", id="c1", content="Noted.", at=T0 + timedelta(minutes=3))  # after the note tool's commit
+        log.message("pip", "is it 4", T0 + timedelta(minutes=10), to_bot=True)
+        rh.save_log(log)
+        rh.logs.clear()
+        back = rh.log_for(self.channel())
+        self.assertEqual([e.get("subject") or e["type"] for e in back.events],
+                         ["message", "rocky", "result", "give Rocky a note tool", "message",
+                          "give Rocky a bar to order drinks from"])
+        self.assertEqual(back.code, bar)
+        rendered = rh.render(back, "rocky")  # a turn's calls still come straight before their results
+        self.assertEqual([m["role"] for m in rendered[2:5]], ["user", "assistant", "tool"])
 
     def test_memories_come_back_after_a_restart(self):
         rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})

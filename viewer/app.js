@@ -163,6 +163,8 @@ function logView(data) {
       out.push(aside([`✎ #${e.on} edited: `, el("span", {class: "quote", text: e.text})]));
     else if (e.type === "deleted")
       out.push(aside(`🗑 ${onWhat(e.on, e.you_said, ctx)} deleted`, "warn"));
+    else if (e.type === "update")
+      out.push(aside(`⬆ update: ${e.subject}`));
   });
   return out;
 }
