@@ -1693,7 +1693,7 @@ async def update_status():
 
 # A status is gone when the next comes, so each is also posted in STATUS_CHANNEL, to keep and react to. jev's own
 # messages never enter the history, so a posted status isn't in the next one's recent chat. Its id is logged, so
-# !why and Context can find it.
+# !why and Context can find it. Rocky's log of the channel has it too, so asked about it there, it knows it said it.
 async def post_status(mood):
     if not STATUS_CHANNEL:
         return
@@ -1701,6 +1701,7 @@ async def post_status(mood):
         channel = bot.get_channel(STATUS_CHANNEL) or await bot.fetch_channel(STATUS_CHANNEL)
         sent = await channel.send(mood, allowed_mentions=discord.AllowedMentions.none())
         note(status_id=sent.id)
+        rh.spoke_elsewhere(channel, mood, sent)
     except Exception as e:  # the status itself is already showing
         log.warning(f"Posting the status in {STATUS_CHANNEL} failed: {e}")
 
@@ -2511,7 +2512,7 @@ async def handle(m, c):
         sent = await m.reply(content, mention_author=False, allowed_mentions=allowed)
         note(reply_id=sent.id)  # for !why
         if root is None:
-            rh.spoke_elsewhere(m.channel.id, message_text(sent), sent)
+            rh.spoke_elsewhere(m.channel, message_text(sent), sent)
         if r not in NO_MONEY:
             entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(sent), sent.id, sent.created_at
             entry["reply_users"] = message_users(sent)
