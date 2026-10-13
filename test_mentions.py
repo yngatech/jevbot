@@ -53,7 +53,6 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "side_of", {}),
             (j, "reactor_names", {}),
             (j, "LONG_CHAT_CHANNELS", set()),  # not whatever .env sets
-            (j, "long_chats", {}),
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
             (j, "REACTORS_PATH", Path(self.reactors_dir.name) / "reactors.json"),
@@ -961,30 +960,17 @@ class LongHistoryTests(_Handling):
         self.assertNotIn("message 230\n", state)
 
 
-class LongChatTests(_Handling):
-    """In a LONG_CHAT_CHANNELS channel an LLM sees frozen pages of the chat, then the newest messages, and the request
-    can be cached up to the last page."""
+class LongContextChannelTests(_Handling):
+    """In a LONG_CHAT_CHANNELS channel another LLM sees the last LLM_HISTORY messages, as anywhere else; the channel's
+    history keeps everything a rebuild read, for Rocky's log."""
 
     def setUp(self):
         super().setUp()
-        self.dir = tempfile.TemporaryDirectory()
-        self.addCleanup(self.dir.cleanup)
-        for attr, value in [("LONG_CHAT_CHANNELS", {self.channel.id}), ("LONG_CHAT_PATH", Path(self.dir.name) / "long_chat.json")]:
-            p = patch.object(j, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        p = patch.object(j, "LONG_CHAT_CHANNELS", {self.channel.id})
+        p.start()
+        self.addCleanup(p.stop)
         self.start = datetime.now(timezone.utc) - timedelta(hours=1)
         j.channel_history[self.channel.id] = []
-        self.add(0, 300)
-
-    def add(self, first, last):
-        for i in range(first, last):  # chatter, and a message to jev every 10th, answered
-            to_bot = i % 10 == 0
-            entry = {"role": "user", "name": "kettle", "content": f"message {i}", "id": i + 1,
-                     "at": self.start + timedelta(seconds=i), "to_bot": to_bot}
-            if to_bot:
-                entry |= {"reply": f"answer {i}", "reply_id": 10_000 + i}
-            j.add_history(self.channel.id, entry)
 
     async def ask(self, model="haiku"):
         asked = []
@@ -999,110 +985,20 @@ class LongChatTests(_Handling):
             await j.handle(m, j.message_text(m))
         return asked[0]
 
-    def contents(self, page):
-        return [e["content"] for e in page]
-
-    async def test_a_page_freezes_once_its_newest_message_is_a_page_old(self):
-        pages = j.long_chats[self.channel.id]["pages"]
-        self.assertEqual([self.contents(p) for p in pages], [[f"message {i}" for i in range(50 * n, 50 * n + 50)]
-                                                             for n in range(5)])
-        self.assertEqual(self.contents(j.unfrozen(self.channel.id)), [f"message {i}" for i in range(250, 300)])
-        self.add(300, 349)
-        self.assertEqual(len(pages), 5)  # 99 unfrozen
-        self.add(349, 350)
-        self.assertEqual(len(pages), 6)
-
-    async def test_a_frozen_page_keeps_its_text_through_edits_and_reactions(self):
-        page = j.long_chats[self.channel.id]["pages"][-1]
-        before = j.page_text(page, "Testbot")
-        frozen = next(e for e in j.channel_history[self.channel.id] if e["id"] == page[0]["id"])  # still in the store
-        frozen["content"] = "edited"
-        await j.on_raw_reaction_add(SimpleNamespace(channel_id=self.channel.id, message_id=10_200, guild_id=400,
-                                                    user_id=501, emoji="😂", member=Mock(
-                                                        spec=discord.Member, id=501, display_name="Moss", guild=self.guild)))
-        self.assertEqual(j.page_text(page, "Testbot"), before)
-        self.assertEqual(frozen["reply_reactions"], {"😂": 1})  # Jev's window still sees it
-
-    async def test_the_request_is_cached_up_to_the_last_page_and_only_grows_after_it(self):
+    async def test_another_llm_sees_the_last_llm_history_messages_in_one_string(self):
+        for i in range(300):
+            j.add_history(self.channel.id, {"role": "user", "name": "kettle", "content": f"message {i}", "id": i + 1,
+                                            "at": self.start + timedelta(seconds=i), "to_bot": False})
         with patch.object(j, "rocky_prompt", wraps=j.rocky_prompt) as prompt:
-            first = await self.ask()
-        prompt.assert_called_with("Testbot", False)  # the book lines in one order, or the cache would never match
-        system, user = first
-        self.assertEqual(system["content"][0]["cache_control"], j.LLM_CACHE)
-        blocks = user["content"]
-        self.assertEqual([i for i, b in enumerate(blocks) if "cache_control" in b], [len(blocks) - 2])
-        self.assertTrue(blocks[0]["text"].startswith("The chat so far"))
-        self.assertIn("message 0\n", blocks[1]["text"])
-        self.assertIn("message 249", blocks[-2]["text"])  # the last page
-        self.assertIn("message 299\n", blocks[-1]["text"])
-        self.assertTrue(blocks[-1]["text"].endswith(j.LLMS["haiku"]["tail"]) or "no \", question?\" tag" in blocks[-1]["text"])
-        self.assertEqual(self.trace["llm_messages"], 301)  # the 300 before, and "what now?"
+            system, user = await self.ask()
+        prompt.assert_called_with("Testbot", True)  # Haiku's lines shuffled, like anywhere else
+        self.assertIsInstance(system["content"], str)
+        self.assertTrue(user["content"].startswith("The chat so far"))
+        self.assertNotIn(f"message {299 - j.LLM_HISTORY}\n", user["content"])
+        self.assertIn(f"message {300 - j.LLM_HISTORY}\n", user["content"])
+        self.assertEqual(self.trace["llm_messages"], j.LLM_HISTORY + 1)
 
-        self.add(300, 340)
-        second = await self.ask()
-        self.assertEqual(second[0], first[0])
-        self.assertEqual(second[1]["content"][:-1], blocks[:-1])  # everything before the newest messages, unchanged
-        self.assertIn("message 339\n", second[1]["content"][-1]["text"])
-
-        self.add(340, 360)  # a new page freezes: the marker moves onto it, and what came before stays the same
-        third = (await self.ask())[1]["content"]
-        self.assertEqual([b["text"] for b in third[:-2]], [b["text"] for b in second[1]["content"][:-1]])
-        self.assertEqual([i for i, b in enumerate(third) if "cache_control" in b], [len(third) - 2])
-
-        # A model that caches by itself gets the same text, as one string
-        deepseek = await self.ask("deepseek")
-        self.assertEqual(deepseek[0]["content"], j.rocky_prompt("Testbot"))
-        self.assertTrue(deepseek[1]["content"].startswith("".join(b["text"] for b in second[1]["content"][:-1])))
-
-    async def test_past_the_limit_the_oldest_pages_go_in_one_jump(self):
-        size = lambda: (sum(j.entry_chars(e) for p in j.long_chats[self.channel.id]["pages"] for e in p)
-                        + sum(j.entry_chars(e) for e in j.unfrozen(self.channel.id)))
-        with patch.object(j, "LONG_CHAT_CHARS", size() + 500):
-            pages = j.long_chats[self.channel.id]["pages"]
-            first = pages[0][0]["content"]
-            self.add(300, 305)
-            self.assertEqual(pages[0][0]["content"], first)
-            self.add(305, 340)  # over the limit
-            self.assertLessEqual(size(), j.LONG_CHAT_CHARS // 2)
-            self.assertEqual(self.contents(pages[-1])[-1], "message 249")  # the newest pages stay
-            dropped = pages[0][0]["content"]
-            self.assertNotEqual(dropped, first)
-            self.add(340, 345)
-            self.assertEqual(pages[0][0]["content"], dropped)  # and then it grows again
-
-    async def test_pages_come_back_the_same_after_a_restart(self):
-        chat = j.long_chats[self.channel.id]
-        loaded = j.load_long_chats()[self.channel.id]
-        self.assertEqual(loaded["since"], chat["since"])
-        self.assertEqual([j.page_text(p, "Testbot") for p in loaded["pages"]],
-                         [j.page_text(p, "Testbot") for p in chat["pages"]])
-        with patch.object(j, "LONG_CHAT_CHANNELS", set()):
-            self.assertEqual(j.load_long_chats(), {})  # a channel taken out of .env is forgotten
-
-    async def test_legacy_page_ids_are_recovered_once_without_changing_text(self):
-        for scanned in (True, False):
-            with self.subTest(scanned=scanned):
-                source = self.said("old chat", name="Moss Meadow", ping=False)
-                entry = j.history_entry(source)
-                del entry["users"]
-                j.long_chats[self.channel.id] = {"pages": [[entry]], "since": source.created_at}
-                before = j.page_text([entry], "Testbot")
-                source.author.display_name, source.clean_content = "Moss Renamed", "edited"
-                self.channel.fetch_message.reset_mock()
-                await j.restore_page_users(self.channel, [source] if scanned else [])
-                j.long_chats = j.load_long_chats()
-                await j.restore_page_users(self.channel, [])
-                self.assertEqual(self.channel.fetch_message.await_count, int(not scanned))
-                page = j.long_chats[self.channel.id]["pages"][0]
-                self.assertEqual(j.page_text(page, "Testbot"), before)
-                self.assertEqual(j.mention_targets(page, "Testbot")["Moss Meadow"], source.author.id)
-        del page[0]["users"]
-        self.channel.fetch_message.side_effect = discord.NotFound(Mock(status=404, reason="Not Found"), "gone")
-        await j.restore_page_users(self.channel, [])
-        self.assertIsNone(j.mention_targets(page, "Testbot")["Moss Meadow"])
-
-    async def test_a_rebuild_freezes_pages_from_everything_it_read(self):
-        j.channel_history[self.channel.id], j.long_chats = [], {}
+    async def test_a_rebuild_keeps_everything_it_read_only_in_these_channels(self):
         scanned = []
         for i in range(j.HISTORY_SCAN):
             m = self.said(f"old {i}", name="kettle", ping=False)
@@ -1115,22 +1011,13 @@ class LongChatTests(_Handling):
 
         self.channel.history = history
         await self.load_history(SimpleNamespace(channel=self.channel))
-        pages = j.long_chats[self.channel.id]["pages"]
-        frozen = [e["content"] for p in pages for e in p]
-        self.assertEqual(frozen[0], "old 0")  # not just the latest LLM_HISTORY
-        self.assertEqual(frozen + self.contents(j.unfrozen(self.channel.id)), [f"old {i}" for i in range(j.HISTORY_SCAN)])
-        self.assertEqual(len(j.channel_history[self.channel.id]), j.LLM_HISTORY + 1)  # the store is still trimmed
+        self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]],
+                         [f"old {i}" for i in range(j.HISTORY_SCAN)])  # not just the latest LLM_HISTORY
 
-    async def test_a_message_to_jev_it_never_answered_is_left_out_of_its_page(self):
-        j.channel_history[self.channel.id], j.long_chats[self.channel.id] = [], {"pages": [], "since": None}
-        for i in range(100):
-            j.add_history(self.channel.id, {"role": "user", "name": "pip", "content": f"chat {i}", "id": 5000 + i,
-                                            "at": self.start + timedelta(hours=1, seconds=i), "to_bot": i in (3, 4),
-                                            **({"reply": "Yes."} if i == 4 else {})})
-        page, = j.long_chats[self.channel.id]["pages"]
-        self.assertEqual(len(page), 49)
-        self.assertNotIn("chat 3", self.contents(page))
-
+        j.channel_history[self.channel.id] = []
+        with patch.object(j, "LONG_CHAT_CHANNELS", set()):
+            await self.load_history(SimpleNamespace(channel=self.channel))
+        self.assertEqual(len(j.channel_history[self.channel.id]), j.LLM_HISTORY + 1)  # trimmed elsewhere
 
 if __name__ == "__main__":
     unittest.main()
