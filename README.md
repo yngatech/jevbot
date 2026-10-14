@@ -49,7 +49,7 @@ For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next
 
 `ROCKY_VIEWER_PORT` (off if unset) serves the page of Rocky's logs on that port while the bot runs (see Rocky's logs).
 
-`OPENROUTER_API_KEY` is the bot's; `jev_eval.py` uses `OPENROUTER_API_KEY_EVAL` instead, so each key can have its own credit limit on OpenRouter and their usage shows up separately.
+`OPENROUTER_API_KEY` is the bot's; `jev_eval.py` and `rocky_replay.py` use `OPENROUTER_API_KEY_EVAL` instead, so each key can have its own credit limit on OpenRouter and their usage shows up separately. With your own Anthropic keys on OpenRouter (BYOK), give each OpenRouter key its own Anthropic key, from its own Claude Console workspace, so tests show up apart there too and can't use up the bot's rate limit.
 
 Enable **Message Content Intent** in Discord developer portal.
 
@@ -136,6 +136,17 @@ python jev_eval.py --compare before.json  # on your branch
 ```
 
 A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter billed for it. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
+
+`rocky_replay.py` replays messages to `!model rocky` on a copy of the live channel log, its memories and `rocky_lines.txt`, and prints what Rocky did: its tool calls and their results, its reactions, and what it said. Nothing is written back, and its thinking isn't printed. Run it on master and on your branch to compare:
+
+```bash
+python rocky_replay.py "@rocky how are you doing?" "lol rocky"
+python rocky_replay.py -n 3 --file scenarios.txt       # one message a line
+python rocky_replay.py --at "2026-10-16 19:00" "rocky get us a beer"
+python rocky_replay.py --fresh "@rocky get me a stout"  # a short synthetic chat instead of the live log
+```
+
+In a worktree it reads the files of the checkout its `.env` links to. A turn on the live log is ~$0.007 and ~70K input tokens, on `OPENROUTER_API_KEY_EVAL`, one request at a time — the first of a run writes the log to the cache, which counts towards Anthropic's input tokens a minute, so don't run many at once. Its output can quote the live log (what Rocky reacted to), so keep it local. `test_replay.py` checks it offline (`python -m unittest test_replay`).
 
 `test_penalty.py` needs no API: it replays the logged steps of real replies through `penalty()` and checks that the variant loops change while funny ones stay the same (`python test_penalty.py`).
 
