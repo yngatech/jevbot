@@ -758,8 +758,9 @@ LLMS = {
     "k3": {"id": "moonshotai/kimi-k3", "logprobs": True, "window": 1_048_576, "providers": ["morph"]},
 }
 # Haiku as Rocky itself, in the channels in LONG_CHAT_CHANNELS: the channel as its conversation, with tools to react
-# and remember (rocky_harness). Elsewhere it writes like haiku.
-LLMS["rocky"] = LLMS["haiku"] | {"harness": True}
+# and remember (rocky_harness). Elsewhere it writes like haiku. cache_marks: mark where its log's cache ends — Claude
+# only caches what's marked, so without them every turn reads the whole log at full price.
+LLMS["rocky"] = LLMS["haiku"] | {"harness": True, "cache_marks": True}
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
 LLM_FREQUENCY_PENALTY = 0.5
@@ -2235,7 +2236,10 @@ def diagnostics_response(t):
                         inline=False)
     if not jev_reacted(t):
         cache = []
-        if (cached := t.get("llm_cached_tokens")) is not None:
+        cached = t.get("llm_cached_tokens")
+        if (tokens := t.get("llm_prompt_tokens")) is not None:
+            cache.append(f"{tokens:,} input tokens" + (f" ({cached:,} cached)" if cached is not None else ""))
+        elif cached is not None:
             cache.append(f"{cached:,} cached input tokens")
         if (output := t.get("llm_completion_tokens")) is not None:
             cache.append(f"{output:,} output tokens")

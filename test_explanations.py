@@ -319,10 +319,21 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("$0.000081 USD", fields["Check whether to reply or react"])
         self.assertIn("Haiku · 1 request · paid through Anthropic key", fields["Write the reply"])
         self.assertIn("$0.000577 USD", fields["Write the reply"])
+        self.assertEqual(fields["Final generation"], "14,533 cached input tokens · 24 output tokens")  # no input count
         self.assertIn("Routed through OpenRouter", self.embeds()[0].footer.text)
         self.assertEqual(self.embeds(self.sent[0])[0].to_dict(), self.embeds(self.sent[1])[0].to_dict())
         self.assertTrue(self.sent[-1][3]["ephemeral"])
         llm.assert_not_awaited()
+
+    async def test_diagnostics_show_the_final_generations_input_with_its_cached_part(self):
+        for cached, expected in [(0, "71,141 input tokens (0 cached) · 70 output tokens"),
+                                 (70_998, "71,141 input tokens (70,998 cached) · 70 output tokens")]:
+            with self.subTest(cached=cached):
+                t = dict(self.logged, llm="rocky", cost=.007, llm_prompt_tokens=71_141, llm_cached_tokens=cached,
+                         llm_completion_tokens=70)
+                j.write_trace(t)
+                await j.diagnostics_action.callback(self.interaction(), self.target(t))
+                self.assertEqual(self.fields()["Final generation"], expected)
 
     async def test_diagnostics_handle_old_logs_without_inventing_request_purposes(self):
         t = dict(self.logged, llm="haiku", cost=.001, byok_cost=.0009, requests=2)
