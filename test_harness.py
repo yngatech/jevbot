@@ -206,6 +206,8 @@ class TurnTests(_Case):
         (name, messages, max_tokens), kwargs = llm.call_args
         self.assertEqual((name, max_tokens, kwargs), ("rocky", rh.MAX_TOKENS, {"tools": rh.TOOLS, "reasoning": rh.REASONING}))
         self.assertIn('woke_you="yes"', j.text_of(messages[-1]["content"]))
+        # marked for the cache: without the marks, every turn read the whole log at full price
+        self.assertEqual([m["content"][0]["cache_control"] for m in (messages[0], messages[1], messages[-1])], [rh.CACHE] * 3)
         rocky = next(e for e in self.log.events if e["type"] == "rocky")
         self.assertIs(turn.spoke, rocky)
         self.assertEqual(rocky["reasoning"], [{"type": "reasoning.text", "text": "a cat fact"}])
