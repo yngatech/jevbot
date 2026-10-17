@@ -273,6 +273,107 @@ class TurnTests(_Case):
         self.assertEqual((turn.reactions, llm.await_count), ([(3, "🤫")], 1))
 
 
+class LookTests(_Case):
+    PICTURE = "data:image/jpeg;base64,AAAA"
+
+    def png(self, size, mode="RGBA", fmt="PNG"):
+        out = __import__("io").BytesIO()
+        rh.Image.new(mode, size, (255, 128, 0, 0) if mode == "RGBA" else 7).save(out, fmt)
+        return out.getvalue()
+
+    async def look(self, *answers, found=None, error=None):
+        q = self.said("pip", "rocky look at my cat [photo]", 0, to_bot=True, discord_id=900)
+        llm = AsyncMock(side_effect=list(answers))
+        pictures = AsyncMock(return_value=found, side_effect=error)
+        with patch.object(j, "llm_message", llm), patch.object(rh, "pictures", pictures):
+            turn = await rh.take_turn(self.log, q)
+        return turn, llm, pictures
+
+    async def test_it_sees_the_pictures_before_it_speaks(self):
+        turn, llm, pictures = await self.look(answer("Cute cat!", [("look", {})]), answer("Cat orange. Fat, fat, fat."),
+                                              found=[self.PICTURE])
+        self.assertEqual(pictures.await_args.args[1], 1)  # the message that woke it
+        self.assertEqual((turn.text, turn.requests), ("Cat orange. Fat, fat, fat.", 2))
+        # what it guessed before it looked isn't posted, nor shown to it as said
+        self.assertEqual([e["text"] for e in self.log.events if e["type"] == "rocky"], ["", "Cat orange. Fat, fat, fat."])
+        self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": [
+            {"type": "text", "text": "Message 1's picture:"}, {"type": "image_url", "image_url": {"url": self.PICTURE}}]})
+        self.assertEqual(rh.readable(self.log, "rocky").splitlines()[-2], "[Message 1's picture:]")
+        # and it's still there in later requests, after a restart too
+        rh.save_log(self.log)
+        rh.logs.clear()
+        again = rh.log_for(SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400)))
+        self.assertEqual(rh.render(again, "rocky"), rh.render(self.log, "rocky"))
+
+    async def test_what_it_couldnt_see_it_is_told(self):
+        for found, error, told in [([], None, "Message 1 has no pictures."), (None, None, "No message 1 to look at."),
+                                   (None, j.discord.NotFound(SimpleNamespace(status=404, reason=""), "gone"),
+                                    "Message 1 was deleted."),
+                                   (None, j.aiohttp.ClientError("down"), "Couldn't see message 1's pictures.")]:
+            with self.subTest(told=told):
+                self.log = rh.Log("bot-spam", "400", 300)
+                turn, llm, _ = await self.look(answer(calls=[("look", {"message": 1})]), answer("Rocky not see."),
+                                               found=found, error=error)
+                self.assertEqual(llm.call_args.args[1][-1]["content"], told)
+                self.assertNotIn("image_url", json.dumps(llm.call_args.args[1]))
+
+    async def test_a_messages_pictures_are_fetched_again_and_shrunk(self):
+        big, gif, text = self.png((3000, 1500)), self.png((40, 40), "P", "GIF"), b"not a picture"
+        files = {"https://cdn/a.png": big, "https://cdn/b.txt": text, "https://tenor/thumb.png": gif,
+                 "https://cdn/sticker.png": self.png((160, 160))}
+        m = SimpleNamespace(
+            attachments=[SimpleNamespace(url="https://cdn/a.png", content_type="image/png"),
+                         SimpleNamespace(url="https://cdn/b.txt", content_type="text/plain")],
+            embeds=[SimpleNamespace(image=SimpleNamespace(url=None), thumbnail=SimpleNamespace(url="https://tenor/thumb.png"))],
+            stickers=[SimpleNamespace(url="https://cdn/sticker.png", format=SimpleNamespace(name="png")),
+                      SimpleNamespace(url="https://cdn/lottie.json", format=SimpleNamespace(name="lottie"))])
+        channel = SimpleNamespace(fetch_message=AsyncMock(return_value=m))
+        fetched = []
+
+        class Response:
+            def __init__(self, url):
+                self.status, self.content = 200, SimpleNamespace(read=AsyncMock(return_value=files[url]))
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+
+        class Session:
+            def __init__(self, *a, **k):
+                pass
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            def get(self, url, **k):
+                fetched.append(url)
+                return Response(url)
+
+        self.said("pip", "look [photo]", 0, discord_id=900)
+        bot = SimpleNamespace(get_channel=lambda i: channel if i == 300 else None)
+        with patch.object(j, "bot", bot), patch.object(j.aiohttp, "ClientSession", Session):
+            found = await rh.pictures(self.log, 1)
+            self.assertIsNone(await rh.pictures(self.log, 2))  # not in the log
+        channel.fetch_message.assert_awaited_once_with(900)
+        self.assertEqual(fetched, ["https://cdn/a.png", "https://tenor/thumb.png", "https://cdn/sticker.png"])
+        sizes = [rh.Image.open(__import__("io").BytesIO(__import__("base64").b64decode(u.split(",", 1)[1]))).size
+                 for u in found]
+        self.assertEqual(sizes, [(1024, 512), (40, 40), (160, 160)])
+        self.assertTrue(all(u.startswith("data:image/jpeg;base64,") for u in found))
+        self.assertIsNone(rh.shrunk(text))
+
+    async def test_a_deleted_messages_pictures_go_when_the_cache_is_rebuilt(self):
+        rh.logs[300] = self.log
+        await self.look(answer(calls=[("look", {})]), answer("Cat."), found=[self.PICTURE])
+        size = rh.chars(self.log)
+        self.assertGreater(size, rh.PICTURE_CHARS)  # counted at its tokens, not its base64
+        rh.deleted(300, 900)
+        self.assertIn(self.PICTURE, json.dumps(rh.render(self.log, "rocky")))  # until the cache goes
+        rh.tidy(self.log)
+        self.assertNotIn(self.PICTURE, json.dumps(rh.render(self.log, "rocky")))
+        self.assertIn("Message 1 was deleted.", json.dumps(rh.render(self.log, "rocky")))
+
+
 class LongMessageTests(_Case):
     def test_a_message_too_long_for_discord_is_cut_at_sentences(self):
         self.assertEqual(j.message_parts("Short."), ["Short."])

@@ -4,7 +4,7 @@ channels in LONG_CONTEXT_CHANNEL_IDS.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
-and its tool calls (react, remember, forget, note, bar, order) are kept with their results. Nothing in the log is
+and its tool calls (react, remember, forget, note, bar, order, look) are kept with their results. Nothing in the log is
 rewritten, so every request starts with the one before it and the model's prompt cache covers all but the newest
 events. A <memories> block before the log is a snapshot, rebuilt — and deleted messages blanked — only when the cache
 would be rebuilt anyway (tidy): at a jump, when the log outgrows LOG_TOKENS and its oldest half goes, or after
@@ -18,8 +18,10 @@ jev_bot hands itself over with bind() — run as a script it's __main__, so impo
 """
 
 import asyncio
+import base64
 import contextlib
 import html
+import io
 import json
 import random
 import re
@@ -27,6 +29,8 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from PIL import Image, UnidentifiedImageError
 
 j = None
 
@@ -42,6 +46,11 @@ FOLLOW_UPS = 4              # requests after one with nothing to say yet, for wh
 CACHE = {"type": "ephemeral", "ttl": "1h"}
 CACHE_HOURS = 1             # CACHE's lifetime — after this long without a request, the next is read in full anyway
 FACT_CHARS = 100            # a remembered fact's longest
+PICTURES = 4                # most pictures a look shows, from one message
+PICTURE_SIDE = 1024         # a picture's longest side, shrunk to it — ~1400 tokens at most, square; text in a
+                            # screenshot or meme still reads
+PICTURE_BYTES = 20_000_000  # most of a picture downloaded
+PICTURE_CHARS = 1400 * 2.2  # a picture in the log, counted as text for its size (chars): its most tokens, in chars
 SAVE_AFTER = 2              # seconds after a change before a log or the memories are written, so a burst writes once
 # It thinks first. Without thinking, Haiku narrated in 3 of 57 eval turns ("Pip asked a plain question, so I answer
 # that one"); given a say tool for its message instead, it didn't, but thinking with that tool it sometimes did nothing
@@ -66,17 +75,21 @@ UPDATES_FROM = ["rocky_harness.py"]  # changes to Rocky: commits touching these 
 # <update>s: told to bring one up "only when it's what's being talked about or someone asks", it told "anything new
 # with you today?" about the bar in 1 of 5 replays; told to when they ask what's new, 6 of 6. Asked about lunch, it
 # announced it in none of 11.
+# look: until it looks, a picture is a [photo] tag. Told to look and write nothing yet, on the live log it looked at a
+# synthetic photo sent to it 6 times in 6 and said what was in it (pepperoni pizza; a sign's words); with no picture,
+# it didn't look.
 HARNESS = """
 
 This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns. An <update> is a change to you, like a new tool, at the point it happened: tell them about it when they ask what's new with you, or it's what's being talked about, but don't announce it out of nowhere.
 
-Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools: make your calls and write your message in the same response — a call on its own, with no message, is only for what needs no answer. Don't wait to see what a tool did before you speak, except at the bar (below):
+Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools: make your calls and write your message in the same response — a call on its own, with no message, is only for what needs no answer. Don't wait to see what a tool did before you speak, except to look and at the bar (below):
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words, yes-or-no ones too (a reaction as well, if you like), and so does a request; write a message too when you truly have something to add.
 - remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
 - forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
 - note: write something down for yourself.
 - bar: see whether the bar is open, and what's on.
 - order: order a drink at the bar, for you or for someone here.
+- look: see the pictures in a message. A [photo], [gif] or [sticker], or a link, is all you know of a picture until you look — so when you're shown one, or asked about one, look and write nothing yet: you'll see it, and then answer. Never say what's in a picture you haven't looked at.
 What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message.
 
 The bar is {bar}, down the road. It keeps hours, and some days it doesn't open at all, or something's run out — so when you want a drink, or someone asks you to get one, call bar or order and write nothing yet: you'll see what the bar says, and then tell them in words what happened — open or not, ordered or not — not just a reaction.
@@ -110,9 +123,13 @@ TOOLS = [
         "parameters": {"type": "object", "required": ["drink"], "properties": {
             "drink": {"type": "string", "description": "As it is on the menu"},
             "for": {"type": "string", "description": "Who it's for, by their name in the chat; leave out for you"}}}}},
+    {"type": "function", "function": {
+        "name": "look", "description": "See the pictures in a message: photos, gifs, stickers and links' previews.",
+        "parameters": {"type": "object", "properties": {
+            "message": {"type": "integer", "description": "The message's id; leave out for the one that woke you"}}}}},
 ]
 # Calls whose result it needs before it speaks: what it wrote alongside one isn't posted
-WAIT_FOR = {"bar", "order"}
+WAIT_FOR = {"bar", "order", "look"}
 
 
 # The bar: a pub with a menu and hours, in TIMEZONE. Some days it doesn't open, and some days a drink has run out —
@@ -211,7 +228,8 @@ def memories_changed():
 #   deleted:  {"on": n or "you", "you_said"}  — and the message gets "deleted"; tidy() then blanks it ("gone")
 #   rocky:    {"text", "calls": [{"id", "name", "arguments"}], "reasoning", "id": its Discord message,
 #              "more_ids": the messages after it, when it was too long for one}
-#   result:   {"id", "content"}  — what came of a call, right after its turn
+#   result:   {"id", "content", "on": a look's message n, "pictures": a look's, as data: URLs}  — what came of a call,
+#             right after its turn
 #   update:   {"commit", "subject"}  — a change to Rocky, deployed: a commit to UPDATES_FROM
 # ids: Discord message id to n, or to "you" for Rocky's own.
 @dataclass
@@ -323,7 +341,11 @@ def render(log, bot_name, cache=True):
                                     "function": {"name": c["name"], "arguments": c["arguments"]}} for c in e["calls"]]
             messages.append(m)
         elif e["type"] == "result":
-            messages.append({"role": "tool", "tool_call_id": e["id"], "content": e["content"]})
+            content = e["content"]
+            if e.get("pictures"):
+                content = [{"type": "text", "text": content},
+                           *({"type": "image_url", "image_url": {"url": url}} for url in e["pictures"])]
+            messages.append({"role": "tool", "tool_call_id": e["id"], "content": content})
         else:
             pending.append(e)
     flush()
@@ -347,7 +369,7 @@ def readable(log, bot_name, last=None):
                              f"[{c['function']['name']} {c['function']['arguments']}]" for c in m.get("tool_calls") or [])
             lines.append(f"{bot_name}: {m['content'] or ''} {calls}".rstrip())
         else:
-            lines.append(f"[{m['content']}]")
+            lines.append(f"[{j.text_of(m['content'])}]")
     return "\n".join(lines)
 
 
@@ -413,6 +435,60 @@ def use(log, call, waking):
     except (ValueError, KeyError, TypeError) as e:
         return None, f"That didn't work: {e!r}"
 
+# The pictures in a Discord message: its images, its embeds' (a gif's from Tenor, a link's preview) and its stickers.
+# Fetched again when it looks: attachment links expire after a day or so.
+async def pictures(log, n):
+    if not isinstance(n, int) or not (discord_id := log.discord_id(n)):
+        return None
+    channel = j.bot.get_channel(log.channel_id) or await j.bot.fetch_channel(log.channel_id)
+    m = await channel.fetch_message(discord_id)
+    urls = [a.url for a in m.attachments if (a.content_type or "").startswith("image/")]
+    urls += [x.url for e in m.embeds for x in (e.image, e.thumbnail) if x and x.url]
+    urls += [s.url for s in m.stickers if str(getattr(s.format, "name", "")) != "lottie"]
+    found = []
+    async with j.aiohttp.ClientSession() as session:
+        for url in dict.fromkeys(urls):
+            if len(found) == PICTURES:
+                break
+            async with session.get(url, timeout=j.aiohttp.ClientTimeout(total=30)) as r:
+                if r.status == 200 and (picture := shrunk(await r.content.read(PICTURE_BYTES))):
+                    found.append(picture)
+    return found
+
+# A picture as a JPEG data: URL, no bigger than PICTURE_SIDE — a gif's first frame. None if it isn't one.
+def shrunk(data):
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.seek(0)
+        img = img.convert("RGBA")
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    img.thumbnail((PICTURE_SIDE, PICTURE_SIDE))
+    flat = Image.new("RGB", img.size, "white")  # a sticker's see-through parts
+    flat.paste(img, mask=img.getchannel("A"))
+    out = io.BytesIO()
+    flat.save(out, "JPEG", quality=85)
+    return "data:image/jpeg;base64," + base64.b64encode(out.getvalue()).decode()
+
+# look: the result's text, and its pictures
+async def look(log, arguments, waking):
+    try:
+        n = json.loads(arguments or "{}").get("message") or waking["n"]
+    except (ValueError, AttributeError):
+        n = waking["n"]
+    try:
+        found = await pictures(log, n)
+    except j.discord.NotFound:
+        return n, f"Message {n} was deleted.", []
+    except Exception as e:
+        j.log.warning(f"[ROCKY] looking at message {n} failed: {e!r}")
+        return n, f"Couldn't see message {n}'s pictures.", []
+    if found is None:
+        return n, f"No message {n} to look at.", []
+    if not found:
+        return n, f"Message {n} has no pictures.", []
+    return n, f"Message {n}'s {'picture' if len(found) == 1 else f'{len(found)} pictures'}:", found
+
 # What it wrote, as a message — or nothing: told it can say nothing, Haiku has written "(silent)" or "."
 def said(content, bot_name):
     text = j.clean_llm(content or "", bot_name)
@@ -457,6 +533,10 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             e = log.add("rocky", text=text, calls=calls, reasoning=message.get("reasoning_details"))
             turn.events.append(e)
             for c in calls:
+                if c["name"] == "look":
+                    on, result, seen = await look(log, c["arguments"], waking)
+                    turn.events.append(log.add("result", id=c["id"], content=result, on=on, pictures=seen))
+                    continue
                 done, result = use(log, {"function": {"name": c["name"], "arguments": c["arguments"]}}, waking)
                 turn.events.append(log.add("result", id=c["id"], content=result))
                 if done and done[0] == "react":
@@ -470,7 +550,7 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
                 turn.text, turn.spoke = text, e
                 break
             # A reaction answers; a memory or a note on its own doesn't, so it gets a request to say something, and
-            # so does the bar, for what it said
+            # so do the bar and a look, for what it then says
             if not waits and any(c["name"] == "react" for c in calls) and all(c["name"] in ("react", "note") for c in calls):
                 break
         turn.cost = t["cost"] - cost
@@ -482,7 +562,8 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
 # The log's oldest half goes once it's over LOG_TOKENS: everything before a message, so no turn loses its results.
 # <memories> is rebuilt then, so what was remembered in the dropped half isn't lost with it.
 def chars(log):
-    return sum(len(e.get("text") or "") + 60 + sum(len(c["arguments"]) for c in e.get("calls", [])) for e in log.events)
+    return sum(len(e.get("text") or "") + 60 + sum(len(c["arguments"]) for c in e.get("calls", []))
+               + PICTURE_CHARS * len(e.get("pictures") or []) for e in log.events)
 
 def jump(log):
     if chars(log) <= LOG_TOKENS * CHARS_PER_TOKEN:
@@ -505,6 +586,9 @@ def tidy(log):
         if e["type"] == "message" and e["n"] in gone:
             e["gone"], e["text"] = True, ""
     log.events[:] = [e for e in log.events if not (e["type"] in ("edit", "deleted") and e["on"] in gone)]
+    for e in log.events:  # and what it saw of their pictures
+        if e["type"] == "result" and e.get("on") in gone and e.get("pictures"):
+            e["content"], e["pictures"] = f"Message {e['on']} was deleted.", []
     log.reorganise()
     changed(log)
 

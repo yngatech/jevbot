@@ -7,6 +7,7 @@ calls and their results, its reactions, and what it said. Nothing is written bac
     python rocky_replay.py -n 3 --file scenarios.txt     # one message a line, # for comments
     python rocky_replay.py --at "2026-10-16 19:00" "rocky get us a beer"
     python rocky_replay.py --fresh "@rocky get me a stout"   # a short synthetic chat instead of the live log
+    python rocky_replay.py --image cat.png "@rocky what's this"  # sent with a picture, which look sees
 
 Run on master and on your branch to compare. It reads the live checkout's files (where this checkout's .env links to,
 or this one's): its Rocky log, memories and rocky_lines.txt. A message comes 2 minutes after the log's last event,
@@ -23,6 +24,7 @@ import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import jev_bot as j
 import rocky_harness as rh
@@ -63,13 +65,16 @@ def load(live, channel_id, fresh, at):
     return log, memories, at or last + timedelta(minutes=2)
 
 
-async def replay(base, memories, text, when, author):
+async def replay(base, memories, text, when, author, picture=None):
     log = copy.deepcopy(base)
     rh.memories.clear()
     rh.memories.update(copy.deepcopy(memories))
     rh.memories_loaded = True
     rh.clock = lambda: when
-    turn = await rh.take_turn(log, log.message(author, text, when, to_bot=True))
+    sent = log.message(author, f"{text} [photo]" if picture else text, when, to_bot=True)
+    # Only the replayed message has a picture to see — the log's have no Discord to fetch theirs from
+    rh.pictures = AsyncMock(side_effect=lambda _, n: [picture] if picture and n == sent["n"] else None)
+    turn = await rh.take_turn(log, sent)
     steps = []
     for e in turn.events:
         if e["type"] == "rocky":
@@ -88,6 +93,7 @@ async def main():
     ap.add_argument("--author", default=AUTHOR, help=f"who says it (default {AUTHOR})")
     ap.add_argument("--channel", type=int, help="the channel's log (default the first LONG_CONTEXT_CHANNEL_IDS)")
     ap.add_argument("--fresh", action="store_true", help="a short synthetic chat instead of the live log")
+    ap.add_argument("--image", help="a picture sent with each message, for look — a synthetic one, not from the chat")
     ap.add_argument("--model", default="rocky", help="an LLM with the harness (default rocky)")
     args = ap.parse_args()
     messages = list(args.messages)
@@ -107,6 +113,9 @@ async def main():
         ap.error("set --channel or LONG_CONTEXT_CHANNEL_IDS, or use --fresh")
     at = args.at and (args.at if args.at.tzinfo else args.at.replace(tzinfo=j.TIMEZONE))
     logging.getLogger("jev").setLevel(logging.WARNING)
+    picture = args.image and rh.shrunk(Path(args.image).read_bytes())
+    if args.image and not picture:
+        ap.error(f"{args.image} isn't a picture")
 
     live = live_dir()
     base, memories, when = load(live, channel, args.fresh, at)
@@ -116,7 +125,7 @@ async def main():
     j.trace.set(spent)
     for text in messages:
         for i in range(args.runs):
-            turn, steps = await replay(base, memories, text, when, args.author)
+            turn, steps = await replay(base, memories, text, when, args.author, picture)
             shown = "".join(f"\n    {l}" for l in j.action_lines(turn.shown))
             print(f"[{text}] #{i + 1} reqs={turn.requests} react={[e for _, e in turn.reactions]} said={turn.text!r}"
                   + "".join(f"\n    {s}" for s in steps) + shown, flush=True)
