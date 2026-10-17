@@ -2427,7 +2427,9 @@ async def rocky_turn(m, entry, bot_name, entries):
     rh.jump(chat)
     note(llm="rocky", llm_model=LLMS["rocky"]["id"], transcript=rh.readable(chat, bot_name, last=40),
          llm_messages=sum(e["type"] == "message" for e in chat.events), harness_requests=turn.requests,
-         memory_kept=[list(k) for k in turn.kept], rocky_events=turn.events)
+         memory_kept=[list(k) for k in turn.kept],
+         # a look's pictures stay in Rocky's log, and are only counted here: logs/ keeps every day
+         rocky_events=[e | {"pictures": len(e["pictures"])} if e.get("pictures") else e for e in turn.events])
     vocab = emoji_vocabulary(m.guild)
     for n, emoji in turn.reactions:
         target = m.id if n == waking["n"] else chat.discord_id(n)
