@@ -440,6 +440,27 @@ class KeepingTests(_Case):
     def channel(self):
         return SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400))
 
+    def test_a_reply_to_a_message_the_log_doesnt_have_shows_what_it_replied_to(self):
+        user = SimpleNamespace(id=1, display_name="rocky")
+        channel = self.channel()
+        mine = SimpleNamespace(id=50, author=user, clean_content="Is good. Soup my favourite too.")
+        theirs = SimpleNamespace(id=51, author=SimpleNamespace(id=7, display_name="kettle"), clean_content="soup is soup")
+        sent = lambda i, reply: SimpleNamespace(id=i, channel=channel, author=SimpleNamespace(id=8, display_name="pip"),
+                                                clean_content="this one ^^", created_at=T0, reference=SimpleNamespace(
+                                                    message_id=reply.id, resolved=reply))
+        with patch.object(j.bot._connection, "user", user), patch.object(j, "command", lambda m: None), \
+                patch.object(j, "should_respond", lambda m: True), patch.object(j, "message_text", lambda m: m.clean_content):
+            rh.observe(sent(900, mine))
+            rh.observe(sent(901, theirs))
+            gone = sent(902, mine)
+            gone.reference.resolved = j.discord.DeletedReferencedMessage(gone.reference)
+            with patch.object(j.bot._connection, "_get_message", lambda i: None):
+                rh.observe(gone)
+        text = rh.people_turn(rh.log_for(channel).events, {})
+        self.assertIn('reply_to="your older message: Is good. Soup my favourite too.">this one ^^', text)
+        self.assertIn('reply_to="an older message from kettle: soup is soup">this one ^^', text)
+        self.assertIn('<message id="3" from="pip" at="18:00" to="you">this one ^^', text)  # deleted: nothing to show
+
     def test_a_log_comes_back_after_a_restart(self):
         log = rh.log_for(self.channel())
         log.message("pip", "soup?", T0, to_bot=True, discord_id=900)

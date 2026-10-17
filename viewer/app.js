@@ -117,6 +117,7 @@ function onWhat(on, youSaid, ctx) {
 function message(e, ctx) {
   const reply = e.reply_to === "you" ? `↪ ${ctx.bot}: “${snippet(e.you_said, 60)}”`
     : e.reply_to ? `↪ #${e.reply_to}${ctx.messages[e.reply_to] ? ` ${ctx.messages[e.reply_to].author}: “${snippet(ctx.messages[e.reply_to].text, 50)}”` : ""}`
+    : e.older ? `↪ older, ${e.older.author === "you" ? ctx.bot : e.older.author}: “${snippet(e.older.text, 60)}”`
     : null;
   return el("article", {class: `message${e.to_bot ? " to-bot" : ""}${e.woke ? " woke" : ""}${e.gone ? " gone" : ""}`, id: `m${e.n}`},
     el("div", {class: "who"},
