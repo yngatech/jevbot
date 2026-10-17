@@ -205,7 +205,7 @@ def memories_changed():
 
 # What happened in a channel, oldest first. Events are dicts with a "type" and "at":
 #   message:  {"n", "author", "uid", "text", "to_bot", "reply_to": n or "you", "you_said": that message of Rocky's,
-#              "woke": it woke Rocky}
+#              "older": {"author": a name or "you", "text"} when what it replies to isn't in the log, "woke": it woke Rocky}
 #   reaction: {"on": n or "you", "you_said", "emoji", "author", "removed"}
 #   edit:     {"on": n, "text"}
 #   deleted:  {"on": n or "you", "you_said"}  — and the message gets "deleted"; tidy() then blanks it ("gone")
@@ -227,9 +227,12 @@ class Log:
     asked: datetime = None                     # the last request, to know when the cache has gone
     code: str = None                           # the last commit it was told about (updates)
 
-    def message(self, author, text, at, to_bot=False, reply_to=None, uid=None, discord_id=None, you_said=None):
+    def message(self, author, text, at, to_bot=False, reply_to=None, uid=None, discord_id=None, you_said=None,
+                older=None):
         e = {"type": "message", "n": self.next_n, "author": author, "uid": uid, "at": at, "text": text,
              "to_bot": to_bot, "reply_to": reply_to, "you_said": you_said}
+        if older:
+            e["older"] = older
         self.next_n += 1
         self.events.append(e)
         if discord_id:
@@ -277,6 +280,9 @@ def people_turn(events, clock):
                 reply = f' reply_to="your message: {attr(snippet(e.get("you_said") or ""))}"'
             elif e["reply_to"]:
                 reply = f' reply_to="{e["reply_to"]}"'
+            elif o := e.get("older"):
+                whose = "your older message" if o["author"] == "you" else f'an older message from {o["author"]}'
+                reply = f' reply_to="{attr(whose + ": " + o["text"])}"'
             head = f'<message id="{e["n"]}" from="{attr(e["author"])}" at="{when(e["at"]):%H:%M}"{to}{reply}'
             lines.append(f'{head} deleted="yes"/>' if e.get("gone") else
                          f'{head}>{html.escape(e["text"], quote=False)}</message>')
@@ -610,6 +616,15 @@ def updated(log):
         j.log.info(f"[ROCKY] #{log.channel} told of {len(new)} update(s)")
     return bool(new)
 
+# What a message replies to when the log doesn't have it — from before the log, or a command — as Discord sent it
+# with the reply: who said it, and the start of it, since it's nowhere else Rocky can see. None if Discord didn't
+# send it, or it's deleted or has no text.
+def replied_outside(m):
+    r = m.reference.resolved or j.bot._connection._get_message(m.reference.message_id)
+    if r is None or isinstance(r, j.discord.DeletedReferencedMessage) or not (text := j.message_text(r)):
+        return None
+    return {"author": "you" if r.author.id == j.bot.user.id else r.author.display_name, "text": snippet(text, 200)}
+
 # A message in the channel, as it arrives: people's and other apps' — not Rocky's own (its turns add those), commands,
 # or side conversations (jev_bot keeps those out). Returns its event, or None.
 def observe(m):
@@ -618,13 +633,15 @@ def observe(m):
         return next((e for e in log.events if e.get("n") == n), None)
     if m.author.id == j.bot.user.id or j.command(m) or not (text := j.message_text(m)):
         return None
-    reply_to = you_said = None
+    reply_to = you_said = older = None
     if m.reference and m.reference.message_id:
         reply_to = log.ids.get(str(m.reference.message_id))
         if reply_to == "you":
             you_said = log.rocky_text(m.reference.message_id)
+        elif reply_to is None:
+            older = replied_outside(m)
     e = log.message(m.author.display_name, text, m.created_at, to_bot=j.should_respond(m), reply_to=reply_to,
-                    uid=m.author.id, discord_id=m.id, you_said=you_said)
+                    uid=m.author.id, discord_id=m.id, you_said=you_said, older=older)
     changed(log)
     return e
 
