@@ -8,7 +8,7 @@
 ## Privacy
 
 - This repo is public. Never put real chat messages, usernames or server emoji names in PRs, commits, tests or fixtures. Use synthetic conversations, such as `jev_eval.py`'s scenarios. You can validate against real logs locally, but describe what you found without quoting them.
-- Never print Rocky's reasoning text from its logs. Strip it first (`jq 'del(.. | .reasoning?, .reasoning_details?)'`) and work from counts and structure.
+- Rocky's thinking is kept in its logs as Anthropic's signed blocks (`reasoning_details`, each with a `text` and a `signature`). Never print a block's `text`, and never edit a block: Anthropic's safeguards treat reading or tampering with it as extracting the model's reasoning. Its other fields, lengths and counts are fine. Strip it before printing logs: `jq 'del(.. | .reasoning?, .reasoning_details?)'`.
 - `rocky_lines.txt` holds copyrighted quotes. Never print or commit it.
 
 ## Testing
