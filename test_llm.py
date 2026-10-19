@@ -106,6 +106,8 @@ class ReplyTests(_Case):
         self.assertEqual(reply, "Coffee first. Then walk.")
         self.assertEqual([r["purpose"] for r in self.trace["api_calls"]], ["decision", "reply"])
         self.assertEqual([r["is_byok"] for r in self.trace["api_calls"]], [False, True])
+        self.assertNotIn("finish_reason", self.trace["api_calls"][0])  # Jev's decisions don't have one
+        self.assertIn("finish_reason", self.trace["api_calls"][1])
         self.assertEqual(self.trace["requests"], 2)
         self.assertAlmostEqual(self.trace["cost"], .000658)
 
@@ -194,6 +196,62 @@ class ReplyTests(_Case):
         self.assertEqual([r["status"] for r in self.trace["api_calls"]], [429, 429, 200])
         self.assertEqual([r["attempt"] for r in self.trace["api_calls"]], [0, 1, 2])
         self.assertTrue(all(r["router_cost"] is None for r in self.trace["api_calls"]))
+        # Why each stopped: nothing for the failures, which had no answer
+        self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, None])
+
+    async def test_a_refusal_is_recorded_and_warned_about_without_what_was_said(self):
+        replies = iter([SimpleNamespace(status=502, json=AsyncMock(return_value={"error": {"code": 502}})),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value={
+                            "id": "gen-synthetic-1", "provider": "Anthropic",
+                            "choices": [{"message": {"content": "Secret refusal words."},
+                                         "finish_reason": "content_filter", "native_finish_reason": "refusal"}],
+                            "usage": {"cost": .0001}}))])
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
+                patch.object(j.asyncio, "sleep", AsyncMock()), self.assertLogs(j.log, "WARNING") as logs:
+            await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+        failed, refused = self.trace["api_calls"]
+        self.assertEqual({k: failed[k] for k in ["finish_reason", "native_finish_reason", "id", "provider"]},
+                         dict.fromkeys(["finish_reason", "native_finish_reason", "id", "provider"]))
+        self.assertEqual((refused["finish_reason"], refused["native_finish_reason"], refused["id"],
+                          refused["provider"]), ("content_filter", "refusal", "gen-synthetic-1", "Anthropic"))
+        self.assertEqual(j.stopped_early(refused), "refusal")
+        warning, = [line for line in logs.output if "refused" in line]
+        self.assertIn("content_filter, refusal", warning)
+        self.assertIn("gen-synthetic-1", warning)
+        self.assertNotIn("Secret", "".join(logs.output))
+
+    async def test_an_odd_response_is_still_retried(self):
+        replies = iter([SimpleNamespace(status=502, json=AsyncMock(return_value={"choices": [None]})),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value=["not", "a", "completion"])),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value={
+                            "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop"}],
+                            "usage": {}}))])
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
+                patch.object(j.asyncio, "sleep", AsyncMock()):
+            reply, _ = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+        self.assertEqual(reply, "Is Biscuit.")
+        self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, "stop"])
+
+    async def test_an_ordinary_ending_is_recorded_without_a_warning(self):
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
+            "id": "gen-synthetic-2", "provider": "Parasail",
+            "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop",
+                         "native_finish_reason": "stop"}], "usage": {}}))
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
+                patch.object(j.log, "warning") as warning:
+            await j.llm("deepseek", [{"role": "user", "content": "cat?"}])
+        call, = self.trace["api_calls"]
+        self.assertEqual((call["finish_reason"], call["provider"], call["id"]), ("stop", "Parasail", "gen-synthetic-2"))
+        self.assertIsNone(j.stopped_early(call))
+        warning.assert_not_called()
 
     async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
         session = MagicMock()

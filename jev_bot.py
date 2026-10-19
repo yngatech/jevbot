@@ -328,16 +328,37 @@ def penalty(reply, word, recent=(), exempt=()):
     return p
 
 
-def record_api_request(model, purpose, status, attempt, usage=None):
-    """Keep request purposes and reported billing, without storing another copy of the prompt."""
+# How a chat completion can end without its answer: OpenRouter's content_filter, or the provider's own refusal
+REFUSALS = {"refusal", "content_filter"}
+FINISHED = {None, "stop", "tool_calls"}  # endings not worth a mention
+
+
+def record_api_request(model, purpose, status, attempt, usage=None, response=None):
+    """Keep request purposes and reported billing, without storing another copy of the prompt.
+
+    response: a chat completion's JSON ({} if there was none) — why it stopped, OpenRouter's generation id and the
+    provider it went to, for auditing routing. Not for Jev's decisions, which have none of these."""
     if (t := trace.get()) is not None:
         usage = usage or {}
-        t.setdefault("api_calls", []).append({
+        call = {
             "model": model, "purpose": purpose, "status": status, "attempt": attempt,
             "router_cost": usage.get("cost"), "is_byok": bool(usage.get("is_byok")),
             "key_cost": (usage.get("cost_details") or {}).get("upstream_inference_cost")
                         if usage.get("is_byok") else 0,
-        })
+        }
+        if response is not None:  # any JSON at all, on any status: an odd one mustn't stop the retries (this is in finally)
+            response = response if isinstance(response, dict) else {}
+            choices = response.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+            call |= {"finish_reason": choice.get("finish_reason"),
+                     "native_finish_reason": choice.get("native_finish_reason"),
+                     "id": response.get("id"), "provider": response.get("provider")}
+        t.setdefault("api_calls", []).append(call)
+
+
+def stopped_early(call):  # why a logged request stopped, if not by finishing: a refusal, running out of tokens
+    if call.get("finish_reason") not in FINISHED or call.get("native_finish_reason") in REFUSALS:
+        return call.get("native_finish_reason") or call["finish_reason"]
 
 
 async def post(session, state, questions):
@@ -855,7 +876,7 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
                 # doesn't have its prompt cache: Parasail's rate limits sent DeepSeek replies to Cloudflare at full
                 # price. Only the last try lets OpenRouter go elsewhere, so a reply still comes.
                 request = body | {"provider": body["provider"] | {"allow_fallbacks": attempt == 2}}
-            status, usage = "error", None
+            status, usage, data = "error", None, None
             try:
                 async with session.post(LLM_URL, json=request, timeout=aiohttp.ClientTimeout(total=60)) as r:
                     status = r.status
@@ -879,7 +900,7 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
                 continue
             finally:
                 record_api_request(spec["id"], "status" if "status" in (trace.get() or {}) else "reply",
-                                   status, attempt, usage)
+                                   status, attempt, usage, data or {})
             if (t := trace.get()) is not None:
                 # On our own Anthropic key (OpenRouter's BYOK) OpenRouter charges nothing, up to its allowance, and
                 # the request is paid from the key's credit: counted in the cost too, and apart as byok_cost
@@ -895,6 +916,10 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
                  llm_prompt_chars=sum(len(text_of(m.get("content"))) for m in messages))
             await set_credit(True)
             choice = data["choices"][0]
+            if reasons := {choice.get("finish_reason"), choice.get("native_finish_reason")} & REFUSALS:
+                # Otherwise just an empty reply. The reason only, never what it said.
+                log.warning(f"LLM {name} refused ({', '.join(sorted(reasons))}) via {data.get('provider')}, "
+                            f"generation {data.get('id')}")
             if choice.get("finish_reason") == "length" and tools:  # its tool calls are cut off where it stopped
                 log.warning(f"LLM {name} ran out of tokens with tools: {str(choice['message'])[:300]}")
                 note(llm_cut_off=True)
@@ -2221,6 +2246,12 @@ def diagnostics_response(t):
             detail += f"\n**{price}** · `{model}`"
             if failures:
                 detail += f"\n{failures:,} failed attempt{'s' if failures != 1 else ''}; unreported costs unavailable"
+            stops = {}
+            for c in group:
+                if reason := stopped_early(c):
+                    stops[reason] = stops.get(reason, 0) + 1
+            if stops:
+                detail += "\nStopped early: " + ", ".join(f"{r} ×{n}" if n > 1 else r for r, n in stops.items())
             embed.add_field(name=REQUEST_PURPOSES.get(purpose, purpose), value=detail, inline=False)
         retries = sum(c.get("attempt", 0) > 0 for c in calls)
         generations = max(t.get("llm_attempts", 1) - 1, 0) + max(len(t.get("status_attempts", [])) - 1, 0)

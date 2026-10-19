@@ -357,6 +357,19 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1 failed attempt", self.fields()["Write the reply"])
         self.assertIn("$0.001000 USD reported", self.fields()["Write the reply"])
         self.assertIn("1 HTTP retries", self.fields()["Retries"])
+        self.assertNotIn("Stopped early", self.fields()["Write the reply"])  # older logs have no endings
+
+    async def test_diagnostics_show_refusals_and_other_early_stops(self):
+        call = {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "router_cost": 0,
+                "is_byok": False, "key_cost": 0, "id": "gen-synthetic", "provider": "Anthropic"}
+        t = dict(self.logged, llm="haiku", cost=0, requests=4, api_calls=[
+            call | {"attempt": 0, "finish_reason": "content_filter", "native_finish_reason": "refusal"},
+            call | {"attempt": 0, "finish_reason": "content_filter", "native_finish_reason": "refusal"},
+            call | {"attempt": 0, "finish_reason": "length", "native_finish_reason": "max_tokens"},
+            call | {"attempt": 0, "finish_reason": "stop", "native_finish_reason": "end_turn"}])
+        j.write_trace(t)
+        await j.diagnostics_action.callback(self.interaction(), self.target(t))
+        self.assertIn("Stopped early: refusal ×2, max_tokens", self.fields()["Write the reply"])
 
     async def test_stats_require_a_matching_target_in_the_same_channel_and_existing_logs(self):
         j.write_trace(dict(self.logged, cost=.02))
