@@ -331,7 +331,8 @@ def memories_text(log):
 
 # The request: system (persona and how this works), <memories>, then the log as turns. Cache marks on the system
 # prompt, the memories, and the end of the request — the next request starts with all of it.
-def render(log, bot_name, cache=True):
+# until: the last event to show — a turn's requests see the log as it was when it began, and what it's done since
+def render(log, bot_name, cache=True, until=None):
     system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name, bar=BAR)
     mark = lambda text: [{"type": "text", "text": text, **({"cache_control": CACHE} if cache else {})}]
     messages = [{"role": "system", "content": mark(system) if cache else system},
@@ -343,7 +344,8 @@ def render(log, bot_name, cache=True):
             messages.append({"role": "user", "content": people_turn(pending, clock)})
             pending.clear()
 
-    for e in log.events:
+    end = next((i + 1 for i in range(len(log.events) - 1, -1, -1) if log.events[i] is until), len(log.events))
+    for e in log.events[:end]:
         if e["type"] == "rocky":
             flush()
             m = {"role": "assistant", "content": e["text"] or None}
@@ -527,13 +529,14 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     token = j.trace.set({"cost": 0.0, "requests": 0}) if j.trace.get() is None else None
     t = j.trace.get()
     cost = t["cost"]
+    # Where its turn goes: what came while it was deciding comes after, has its own turn, and isn't in its follow-ups.
+    # Put before, the next turn's request ended with Rocky's, and Haiku 5.5 refused it (no prefill)
+    began = log.events[-1]
     try:
         for request in range(1 + FOLLOW_UPS):
-            # A message that comes while it waits goes after its turn: it answered without it. Put before, the
-            # next turn's request ended with Rocky's, and Haiku 5.5 refused it (no prefill)
-            seen = log.events[-1]
+            seen = turn.events[-1] if turn.events else began
             async with typing() if typing and request else contextlib.nullcontext():
-                messages = render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks")))
+                messages = render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks")), until=seen)
                 # A request can't end with Rocky (Haiku 5.5 takes it as a prefill, and refuses it): when one of its messages
                 # from outside a turn came after the one that woke it. Not a str, so the cache mark stays on people's turn
                 if messages[-1]["role"] == "assistant":
