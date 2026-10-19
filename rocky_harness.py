@@ -83,11 +83,14 @@ UPDATES_FROM = ["rocky_harness.py"]  # changes to Rocky: commits touching these 
 # speak, even asked to prove it could. Told to write first, on a fresh chat it reacted and spoke in 4 of 4 asked to; on
 # the live log, full of turns that only reacted, in 0 of 6, though "did you have a good weekend?" got words in 3 of 3
 # where it had in 1 of 4.
+# Several at once: two questions to it from two people before its turn, replayed on the live log. Told only the newest
+# was its to answer (and the other not marked), it answered one of them in 3 of 9 — once the one it wasn't woken by —
+# and both in none. Told to answer all of them, saying who's who, both in 3 of 9; the rest, on both, only reacted.
 HARNESS = """
 
-This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you, and the newest of those is the one you're answering now; older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns. An <update> is a change to you, like a new tool, at the point it happened: tell them about it when they ask what's new with you, or it's what's being talked about, but don't announce it out of nowhere.
+This is #{channel} on Discord, as it happens. People's messages come to you as <message> elements: who sent it (from), when (at, {timezone} time), its number (id), and the message it replies to (reply_to). to="you" marks one sent to you — tagging you, or replying to you. woke_you="yes" marks each that woke you. The ones since your last turn are what you're answering now — several, when they came at once: answer them all in your one message, saying who's who. Older ones have had their turn. Reactions, edits and deletions show up as they happen. Your own earlier messages are your turns. An <update> is a change to you, like a new tool, at the point it happened: tell them about it when they ask what's new with you, or it's what's being talked about, but don't announce it out of nowhere.
 
-Your turn is what you write: it's posted in the channel as your reply to the message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools. Your response ends at your first call, so write your message first and then make your calls, in the same response — a call on its own, with no message, is only for what needs no answer. Don't wait to see what a tool did before you speak, except to look and at the bar (below):
+Your turn is what you write: it's posted in the channel as your reply to the first message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools. Your response ends at your first call, so write your message first and then make your calls, in the same response — a call on its own, with no message, is only for what needs no answer. Don't wait to see what a tool did before you speak, except to look and at the bar (below):
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words, yes-or-no ones too, and so does a request; write a message too when you truly have something to add. To react and speak, write the message, then react: a reaction first leaves your turn with nothing said.
 - remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
 - forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
@@ -106,7 +109,7 @@ TOOLS = [
         "name": "react", "description": "Put an emoji on a message.",
         "parameters": {"type": "object", "required": ["emoji"], "properties": {
             "emoji": {"type": "string", "description": "One emoji, or a server emoji by name, like :blobwave:"},
-            "message": {"type": "integer", "description": "The message's id; leave out for the one that woke you"}}}}},
+            "message": {"type": "integer", "description": "The message's id; leave out for the first that woke you"}}}}},
     {"type": "function", "function": {
         "name": "remember", "description": "Keep a fact for later chats in this server.",
         "parameters": {"type": "object", "required": ["about", "fact"], "properties": {
@@ -131,7 +134,7 @@ TOOLS = [
     {"type": "function", "function": {
         "name": "look", "description": "See the pictures in a message: photos, gifs, stickers and links' previews.",
         "parameters": {"type": "object", "properties": {
-            "message": {"type": "integer", "description": "The message's id; leave out for the one that woke you"}}}}},
+            "message": {"type": "integer", "description": "The message's id; leave out for the first that woke you"}}}}},
 ]
 # Calls whose result it needs before it speaks: what it wrote alongside one isn't posted
 WAIT_FOR = {"bar", "order", "look"}
@@ -521,7 +524,13 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     after = next((i for i, e in enumerate(log.events) if e is waking), len(log.events))
     if any(e["type"] == "rocky" and not e.get("elsewhere") for e in log.events[after + 1:]):
         return turn
-    waking["woke"] = True  # and stays, so the turn it's in reads the same in every later request
+    # Every message to it since it last spoke is this turn's: one that came while it waited is in this request, and has
+    # no turn of its own. Marked for good, so the turn it's in reads the same in every later request
+    since = max((i for i, e in enumerate(log.events) if e["type"] == "rocky"), default=-1)
+    for e in log.events[since + 1:]:
+        if e["type"] == "message" and e["to_bot"] and not e.get("gone"):
+            e["woke"] = True
+    waking["woke"] = True
     now = datetime.now(timezone.utc)
     if log.asked and (now - log.asked).total_seconds() > CACHE_HOURS * 3600:
         tidy(log)  # the cache has gone, so this request is read in full anyway

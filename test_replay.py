@@ -77,6 +77,12 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🧠 remembered: pip is hungry", out)
         self.assertEqual({p: p.read_text() for p in self.live.rglob("*") if p.is_file()}, self.before)
 
+    async def test_with_another_message_both_are_its_to_answer(self):
+        llm, _ = await self.run_main("--channel", str(CHANNEL), "rocky soup?", "--with", "fern: rocky tea?")
+        text = j.text_of(llm.await_args.args[1][-1]["content"])
+        self.assertIn('from="fern"', text)
+        self.assertEqual(text.count('woke_you="yes"'), 2)
+
     async def test_it_needs_the_eval_key(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             await self.run_main("--channel", str(CHANNEL), "hi", env={"OPENROUTER_API_KEY_EVAL": ""})
