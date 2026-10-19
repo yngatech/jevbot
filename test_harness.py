@@ -331,7 +331,19 @@ class TurnTests(_Case):
             await rh.take_turn(self.log, first)
             turn = await rh.take_turn(self.log, second)
         self.assertEqual((turn.text, turn.requests, llm.await_count), ("", 0, 1))
-        self.assertNotIn("woke", second)
+        # Both were the first turn's to answer, and its request said so
+        self.assertTrue(first["woke"] and second["woke"])
+        self.assertEqual(j.text_of(llm.await_args.args[1][-1]["content"]).count('woke_you="yes"'), 2)
+
+    async def test_a_message_answered_elsewhere_or_already_isnt_this_turns(self):
+        earlier = self.said("kettle", "rocky biscuit?", 0, to_bot=True)  # answered while another !model was chosen
+        self.log.add("rocky", text="Biscuit good.", calls=[], id=901, elsewhere=True)
+        chatter = self.said("moss", "tea anyone", 1)
+        q = self.said("pip", "rocky soup?", 2, to_bot=True)
+        llm = AsyncMock(side_effect=[answer("Soup good.")])
+        with patch.object(j, "llm_message", llm):
+            await rh.take_turn(self.log, q)
+        self.assertEqual(("woke" in earlier, "woke" in chatter, q["woke"]), (False, False, True))
 
     async def test_a_status_posted_while_a_message_waits_doesnt_answer_it(self):
         q = self.said("pip", "rocky soup?", 0, to_bot=True)

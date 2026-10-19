@@ -8,6 +8,7 @@ calls and their results, its reactions, and what it said. Nothing is written bac
     python rocky_replay.py --at "2026-10-16 19:00" "rocky get us a beer"
     python rocky_replay.py --fresh "@rocky get me a stout"   # a short synthetic chat instead of the live log
     python rocky_replay.py --image cat.png "@rocky what's this"  # sent with a picture, which look sees
+    python rocky_replay.py "@rocky soup?" --with "fern: @rocky tea?"  # another to it, there before its turn
 
 Run on master and on your branch to compare. It reads the live checkout's files (where this checkout's .env links to,
 or this one's): its Rocky log, memories and rocky_lines.txt. A message comes 2 minutes after the log's last event,
@@ -65,13 +66,15 @@ def load(live, channel_id, fresh, at):
     return log, memories, at or last + timedelta(minutes=2)
 
 
-async def replay(base, memories, text, when, author, picture=None):
+async def replay(base, memories, text, when, author, picture=None, also=()):
     log = copy.deepcopy(base)
     rh.memories.clear()
     rh.memories.update(copy.deepcopy(memories))
     rh.memories_loaded = True
     rh.clock = lambda: when
     sent = log.message(author, f"{text} [photo]" if picture else text, when, to_bot=True)
+    for who, said in also:  # came while it waited, so they're in its turn
+        log.message(who, said, when + timedelta(seconds=2), to_bot=True)
     # Only the replayed message has a picture to see — the log's have no Discord to fetch theirs from
     rh.pictures = AsyncMock(side_effect=lambda _, n: [picture] if picture and n == sent["n"] else None)
     turn = await rh.take_turn(log, sent)
@@ -94,6 +97,8 @@ async def main():
     ap.add_argument("--channel", type=int, help="the channel's log (default the first LONG_CONTEXT_CHANNEL_IDS)")
     ap.add_argument("--fresh", action="store_true", help="a short synthetic chat instead of the live log")
     ap.add_argument("--image", help="a picture sent with each message, for look — a synthetic one, not from the chat")
+    ap.add_argument("--with", dest="also", action="append", default=[], metavar="AUTHOR: TEXT",
+                    help="another message to Rocky, a moment after, before its turn (repeatable)")
     ap.add_argument("--model", default="rocky", help="an LLM with the harness (default rocky)")
     args = ap.parse_args()
     messages = list(args.messages)
@@ -101,6 +106,9 @@ async def main():
         messages += [l.strip() for l in Path(args.file).read_text().splitlines() if l.strip() and not l.startswith("#")]
     if not messages:
         ap.error("say something to Rocky")
+    if any(":" not in a for a in args.also):
+        ap.error("--with takes AUTHOR: TEXT")
+    also = [tuple(x.strip() for x in a.split(":", 1)) for a in args.also]
     if not j.LLMS.get(args.model, {}).get("harness"):
         ap.error(f"{args.model} isn't an LLM with the harness")
     # Its own key, so replays have their own limits and usage on OpenRouter and Anthropic, apart from the bot's
@@ -125,7 +133,7 @@ async def main():
     j.trace.set(spent)
     for text in messages:
         for i in range(args.runs):
-            turn, steps = await replay(base, memories, text, when, args.author, picture)
+            turn, steps = await replay(base, memories, text, when, args.author, picture, also)
             shown = "".join(f"\n    {l}" for l in j.action_lines(turn.shown))
             print(f"[{text}] #{i + 1} reqs={turn.requests} react={[e for _, e in turn.reactions]} said={turn.text!r}"
                   + "".join(f"\n    {s}" for s in steps) + shown, flush=True)

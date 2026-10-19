@@ -145,6 +145,7 @@ python rocky_replay.py -n 3 --file scenarios.txt       # one message a line
 python rocky_replay.py --image cat.png "@rocky what's this"  # sent with a synthetic picture, for look
 python rocky_replay.py --at "2026-10-16 19:00" "rocky get us a beer"
 python rocky_replay.py --fresh "@rocky get me a stout"  # a short synthetic chat instead of the live log
+python rocky_replay.py "@rocky soup?" --with "fern: @rocky tea?"  # another to it, there before its turn
 ```
 
 In a worktree it reads the files of the checkout its `.env` links to. A turn on the live log is ~$0.007 and ~70K input tokens, on `OPENROUTER_API_KEY_EVAL`, one request at a time — the first of a run writes the log to the cache, which counts towards Anthropic's input tokens a minute, so don't run many at once. Its output can quote the live log (what Rocky reacted to), so keep it local. `test_replay.py` checks it offline (`python -m unittest test_replay`).
