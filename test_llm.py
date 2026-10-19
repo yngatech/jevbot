@@ -223,6 +223,21 @@ class ReplyTests(_Case):
         self.assertIn("gen-synthetic-1", warning)
         self.assertNotIn("Secret", "".join(logs.output))
 
+    async def test_an_odd_response_is_still_retried(self):
+        replies = iter([SimpleNamespace(status=502, json=AsyncMock(return_value={"choices": [None]})),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value=["not", "a", "completion"])),
+                        SimpleNamespace(status=200, json=AsyncMock(return_value={
+                            "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop"}],
+                            "usage": {}}))])
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
+                patch.object(j.asyncio, "sleep", AsyncMock()):
+            reply, _ = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+        self.assertEqual(reply, "Is Biscuit.")
+        self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, "stop"])
+
     async def test_an_ordinary_ending_is_recorded_without_a_warning(self):
         session = MagicMock()
         session.__aenter__.return_value = session

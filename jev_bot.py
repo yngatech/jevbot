@@ -346,8 +346,10 @@ def record_api_request(model, purpose, status, attempt, usage=None, response=Non
             "key_cost": (usage.get("cost_details") or {}).get("upstream_inference_cost")
                         if usage.get("is_byok") else 0,
         }
-        if response is not None:
-            choice = (response.get("choices") or [{}])[0]
+        if response is not None:  # any JSON at all, on any status: an odd one mustn't stop the retries (this is in finally)
+            response = response if isinstance(response, dict) else {}
+            choices = response.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
             call |= {"finish_reason": choice.get("finish_reason"),
                      "native_finish_reason": choice.get("native_finish_reason"),
                      "id": response.get("id"), "provider": response.get("provider")}
