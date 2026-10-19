@@ -262,9 +262,11 @@ class Log:
             self.ids[str(discord_id)] = e["n"]
         return e
 
-    def add(self, type, **fields):
+    # after: an event to put it right after — its turn goes where its request ended, before what came meanwhile
+    def add(self, type, after=None, **fields):
         e = {"type": type, "at": fields.pop("at", None) or datetime.now(timezone.utc), **fields}
-        self.events.append(e)
+        i = next((i + 1 for i in range(len(self.events) - 1, -1, -1) if self.events[i] is after), len(self.events))
+        self.events.insert(i, e)
         return e
 
     # <memories> as they are now: at a jump, or when someone wants a fact really gone. Everything after it in the
@@ -329,7 +331,8 @@ def memories_text(log):
 
 # The request: system (persona and how this works), <memories>, then the log as turns. Cache marks on the system
 # prompt, the memories, and the end of the request — the next request starts with all of it.
-def render(log, bot_name, cache=True):
+# until: the last event to show — a turn's requests see the log as it was when it began, and what it's done since
+def render(log, bot_name, cache=True, until=None):
     system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name, bar=BAR)
     mark = lambda text: [{"type": "text", "text": text, **({"cache_control": CACHE} if cache else {})}]
     messages = [{"role": "system", "content": mark(system) if cache else system},
@@ -341,7 +344,8 @@ def render(log, bot_name, cache=True):
             messages.append({"role": "user", "content": people_turn(pending, clock)})
             pending.clear()
 
-    for e in log.events:
+    end = next((i + 1 for i in range(len(log.events) - 1, -1, -1) if log.events[i] is until), len(log.events))
+    for e in log.events[:end]:
         if e["type"] == "rocky":
             flush()
             m = {"role": "assistant", "content": e["text"] or None}
@@ -512,6 +516,11 @@ def said(content, bot_name):
 # it's sent, and nothing stops it but a message, so shown while it decided, it lingered after a turn that only reacted.
 async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     turn = Turn()
+    # Already in one of its turns' requests, before what it said: it's had its answer. Its messages from outside a turn
+    # (spoke_elsewhere) don't count — a status posted while a message waited doesn't answer it
+    after = next((i for i, e in enumerate(log.events) if e is waking), len(log.events))
+    if any(e["type"] == "rocky" and not e.get("elsewhere") for e in log.events[after + 1:]):
+        return turn
     waking["woke"] = True  # and stays, so the turn it's in reads the same in every later request
     now = datetime.now(timezone.utc)
     if log.asked and (now - log.asked).total_seconds() > CACHE_HOURS * 3600:
@@ -520,11 +529,19 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     token = j.trace.set({"cost": 0.0, "requests": 0}) if j.trace.get() is None else None
     t = j.trace.get()
     cost = t["cost"]
+    # Where its turn goes: what came while it was deciding comes after, has its own turn, and isn't in its follow-ups.
+    # Put before, the next turn's request ended with Rocky's, and Haiku 5.5 refused it (no prefill)
+    began = log.events[-1]
     try:
         for request in range(1 + FOLLOW_UPS):
+            seen = turn.events[-1] if turn.events else began
             async with typing() if typing and request else contextlib.nullcontext():
-                message = await j.llm_message(model, render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks"))),
-                                              MAX_TOKENS, tools=TOOLS, reasoning=REASONING)
+                messages = render(log, bot_name, cache=bool(j.LLMS[model].get("cache_marks")), until=seen)
+                # A request can't end with Rocky (Haiku 5.5 takes it as a prefill, and refuses it): when one of its messages
+                # from outside a turn came after the one that woke it. Not a str, so the cache mark stays on people's turn
+                if messages[-1]["role"] == "assistant":
+                    messages.append({"role": "user", "content": [{"type": "text", "text": "(Your turn.)"}]})
+                message = await j.llm_message(model, messages, MAX_TOKENS, tools=TOOLS, reasoning=REASONING)
             if message is None:
                 break
             turn.requests += 1
@@ -541,15 +558,16 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
                 text = ""
             if not text and not calls:
                 break  # nothing said or done — an empty turn isn't one the model can be shown later
-            e = log.add("rocky", text=text, calls=calls, reasoning=message.get("reasoning_details"))
+            e = log.add("rocky", after=seen, text=text, calls=calls, reasoning=message.get("reasoning_details"))
             turn.events.append(e)
             for c in calls:
                 if c["name"] == "look":
-                    on, result, seen = await look(log, c["arguments"], waking)
-                    turn.events.append(log.add("result", id=c["id"], content=result, on=on, pictures=seen))
+                    on, result, found = await look(log, c["arguments"], waking)
+                    turn.events.append(log.add("result", after=turn.events[-1], id=c["id"], content=result, on=on,
+                                               pictures=found))
                     continue
                 done, result = use(log, {"function": {"name": c["name"], "arguments": c["arguments"]}}, waking)
-                turn.events.append(log.add("result", id=c["id"], content=result))
+                turn.events.append(log.add("result", after=turn.events[-1], id=c["id"], content=result))
                 if done and done[0] == "react":
                     turn.reactions.append(done[1:])
                 elif done:
@@ -773,7 +791,7 @@ def spoke_elsewhere(channel, text, sent):
     if channel.id not in j.LONG_CHAT_CHANNELS:
         return
     log = log_for(channel)
-    log.add("rocky", text=text, calls=[], id=sent.id, at=sent.created_at)
+    log.add("rocky", text=text, calls=[], id=sent.id, at=sent.created_at, elsewhere=True)
     log.ids[str(sent.id)] = "you"
     changed(log)
 

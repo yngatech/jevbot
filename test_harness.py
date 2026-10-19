@@ -4,6 +4,7 @@ The model's answers are synthetic.
     uv run --with-requirements requirements.txt python -m unittest test_harness
 """
 
+import contextlib
 import json
 import os
 import subprocess
@@ -271,6 +272,75 @@ class TurnTests(_Case):
         self.assertEqual(len(self.log.events), events + 1)  # just the message — an empty turn isn't kept
         turn, llm = await self.turn(answer(calls=[("note", {"text": "picked 4"}), ("react", {"emoji": "🤫"})]))
         self.assertEqual((turn.reactions, llm.await_count), ([(3, "🤫")], 1))
+
+    async def test_a_message_that_comes_while_it_waits_goes_after_its_turn(self):
+        first = self.said("pip", "rocky soup?", 0, to_bot=True)
+        meanwhile = []
+
+        async def llm(model, messages, *args, **kwargs):
+            if not meanwhile:  # a second message to it arrives during the first request, as live
+                meanwhile.append(self.said("moss", "rocky also tea?", 0, to_bot=True))
+                return answer("Soup good.", [("remember", {"about": "pip", "fact": "likes soup"})])
+            self.assertEqual(messages[-1]["role"], "user")  # Haiku 5.5 refuses a request ending with Rocky's turn
+            return answer("Tea good too.")
+
+        with patch.object(j, "llm_message", AsyncMock(side_effect=llm)) as called:
+            turn = await rh.take_turn(self.log, first)
+            self.assertEqual(turn.text, "Soup good.")
+            self.assertEqual([e["type"] for e in self.log.events], ["message", "rocky", "result", "message"])
+            turn = await rh.take_turn(self.log, meanwhile[0])
+        self.assertEqual((turn.text, called.await_count), ("Tea good too.", 2))
+        self.assertIn("also tea?", j.text_of(called.call_args.args[1][-1]["content"]))
+
+    async def test_a_message_that_comes_during_its_tool_calls_still_has_its_own_turn(self):
+        first = self.said("pip", "rocky soup?", 0, to_bot=True)
+        meanwhile = []
+
+        @contextlib.asynccontextmanager
+        async def typing():  # Discord's typing is a request too: a message can arrive while it's sent
+            meanwhile.append(self.said("kettle", "rocky biscuit?", 0, to_bot=True))
+            yield
+
+        async def llm(model, messages, *args, **kwargs):
+            text = "".join(j.text_of(m["content"]) for m in messages if m["role"] == "user")
+            if "biscuit" in text:  # only a later turn sees it
+                self.assertEqual(messages[-1]["role"], "user")
+                return answer("Tea good, biscuit good.")
+            if messages[-1]["role"] != "tool":
+                meanwhile.append(self.said("moss", "rocky also tea?", 0, to_bot=True))  # during the first request
+                return answer("", [("look", {})])
+            self.assertNotIn("also tea?", text)  # its follow-up is the turn it began, nothing since
+            return answer("Soup good.")
+
+        with patch.object(j, "llm_message", AsyncMock(side_effect=llm)) as called, \
+                patch.object(rh, "pictures", AsyncMock(return_value=[])):
+            turn = await rh.take_turn(self.log, first, typing=typing)
+            self.assertEqual(turn.text, "Soup good.")
+            self.assertEqual([e["type"] for e in self.log.events],
+                             ["message", "rocky", "result", "rocky", "message", "message"])
+            tea = await rh.take_turn(self.log, meanwhile[0])
+            biscuit = await rh.take_turn(self.log, meanwhile[1])
+        self.assertTrue(tea.requests == 1 and biscuit.requests == 0)  # tea's request saw biscuit: one answer for both
+        self.assertEqual(called.await_count, 3)
+
+    async def test_with_nothing_new_since_its_turn_it_makes_no_request(self):
+        first = self.said("pip", "rocky soup?", 0, to_bot=True)
+        second = self.said("moss", "rocky also tea?", 0, to_bot=True)  # in the first turn's request
+        llm = AsyncMock(side_effect=[answer("Soup good, tea good.")])
+        with patch.object(j, "llm_message", llm):
+            await rh.take_turn(self.log, first)
+            turn = await rh.take_turn(self.log, second)
+        self.assertEqual((turn.text, turn.requests, llm.await_count), ("", 0, 1))
+        self.assertNotIn("woke", second)
+
+    async def test_a_status_posted_while_a_message_waits_doesnt_answer_it(self):
+        q = self.said("pip", "rocky soup?", 0, to_bot=True)
+        self.log.add("rocky", text="Mood: soup.", calls=[], id=901, elsewhere=True)  # as spoke_elsewhere adds it
+        llm = AsyncMock(side_effect=[answer("Soup good.")])
+        with patch.object(j, "llm_message", llm):
+            turn = await rh.take_turn(self.log, q)
+        self.assertEqual((turn.text, llm.await_count), ("Soup good.", 1))
+        self.assertEqual(llm.await_args.args[1][-1]["role"], "user")  # never ending with Rocky's
 
 
 class LookTests(_Case):
