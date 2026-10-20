@@ -1,8 +1,8 @@
 """
 Jev Discord Bot — tournament sampling + history.
 
-This is the version that produced "I depends on on situation of circumstances."
-20K vocab, bucket tournament, empty descriptions, 3-turn history.
+Jev writes word by word, picking each from a bucket tournament over the vocab; !model can hand the writing to an
+LLM, and !model rocky makes the channel Rocky's own conversation (rocky_harness).
 """
 
 import io
@@ -84,7 +84,7 @@ NOTHING = {"dunno", "no", "crickets", "chirping", "silence", "silent", "empty", 
 NOTHING_PENALTY = 3.0
 VOCAB_SIZE = 10_000             # vocab.txt is ordered most common first — every word costs ~7 input tokens on every step
 REACT_THRESHOLD = 0.4           # react when P(message is a question/request for jev) is below this — questions ~0.8-0.98, chatty ~0.03-0.45
-STATUS_EVERY = 180              # minutes between new statuses (~$0.02-0.04 each) — 0 to leave the status alone
+STATUS_EVERY = 180              # minutes between new statuses — 0 to leave the status alone; /settings changes it
 STATUS_MIN_WORDS = 4            # a short status is just "Fine thanks" — the soup comes from making it keep going
 STATUS_MAX_WORDS = 12
 STATUS_CHAT = 8                 # recent messages from the latest active channel, in view for every other status — 0 for none
@@ -1766,8 +1766,8 @@ async def on_message_edit(before, after):
 
 
 # !why: what jev weighed for one of its answers, from the logs — the reply the !why is a Discord reply to (or the
-# message it reacted to), or on its own jev's latest answer in the channel, as why_chart's chart. Costs nothing: no
-# API calls.
+# message it reacted to), or on its own jev's latest answer in the channel: why_chart's chart of Jev's words or emoji,
+# or for an LLM's reply a line saying there's nothing to chart. Costs nothing: no API calls.
 WHY_DAYS = 7  # how many days of logs it looks back through
 EXPLANATION_CACHE_ENTRIES = 100
 EXPLANATION_EXPIRY_MARGIN = 60  # seconds for Discord to send the embed and the client to load it
@@ -1955,10 +1955,8 @@ async def send_cached_explanation(send, response):
         await send(response.content, **embed_options(embeds))
     elif response.url is None:
         await send(response.content)
-    elif response.filename.endswith(".png"):
+    else:  # a chart, uploaded before
         await send(response.content, embed=discord.Embed().set_image(url=response.url))
-    else:
-        await send(f"{response.content}\n[{response.filename}]({response.url})")
 
 def embed_options(embeds):
     return {"embed": embeds[0]} if len(embeds) == 1 else {"embeds": list(embeds)} if embeds else {}

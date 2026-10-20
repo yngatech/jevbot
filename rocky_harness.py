@@ -399,10 +399,6 @@ class Turn:
     shown: list = field(default_factory=list)      # what it did that's shown under its message: kept, and orders
     spoke: dict = None                             # the log's event for its message, to give it its Discord id
     requests: int = 0
-    cost: float = 0.0
-    prompt_tokens: int = 0
-    cached_tokens: int = 0
-    raw: list = field(default_factory=list)        # each response's message, for looking into
     events: list = field(default_factory=list)     # its events in the log — its turns and their calls' results
 
 
@@ -536,8 +532,6 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
         tidy(log)  # the cache has gone, so this request is read in full anyway
     log.asked = now
     token = j.trace.set({"cost": 0.0, "requests": 0}) if j.trace.get() is None else None
-    t = j.trace.get()
-    cost = t["cost"]
     # Where its turn goes: what came while it was deciding comes after, has its own turn, and isn't in its follow-ups.
     # Put before, the next turn's request ended with Rocky's, and Haiku 5.5 refused it (no prefill)
     began = log.events[-1]
@@ -554,9 +548,6 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             if message is None:
                 break
             turn.requests += 1
-            turn.prompt_tokens += t.get("llm_prompt_tokens") or 0
-            turn.cached_tokens += t.get("llm_cached_tokens") or 0
-            turn.raw.append(message)
             calls = [{"id": c["id"], "name": c["function"]["name"], "arguments": c["function"]["arguments"] or "{}"}
                      for c in message.get("tool_calls") or []]
             text = said(message.get("content"), bot_name)
@@ -591,7 +582,6 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
             # so do the bar and a look, for what it then says
             if not waits and any(c["name"] == "react" for c in calls) and all(c["name"] in ("react", "note") for c in calls):
                 break
-        turn.cost = t["cost"] - cost
     finally:
         if token is not None:
             j.trace.reset(token)
@@ -841,30 +831,3 @@ def sync(log, entries):
 def unaddressed(text, author):
     return re.sub(rf"^@{re.escape(author)}(?![\w])[\s,:.!-]*", "", text, flags=re.I).strip() or text
 
-
-# A log from the bot's history entries, for jev_eval's scenarios and replays: people's messages, Rocky's replies under
-# them, its reactions, and people's reactions to its replies. Rocky's reactions become react calls, as if made here.
-def from_history(channel, history, bot_name="rocky"):
-    log = Log(channel)
-    calls = 0
-    for h in history or []:
-        if h["role"] == "assistant":
-            log.add("rocky", text=h["content"], calls=[], at=h.get("at"))
-            for emoji, n in (h.get("reactions") or {}).items():
-                for name in list((h.get("reactors") or {}).get(emoji, {}).values())[:n] or ["someone"] * n:
-                    log.add("reaction", on="you", you_said=h["content"], emoji=emoji, author=name, at=h.get("at"))
-            continue
-        e = log.message(h["name"], j.unrender(h["content"]), h.get("at") or datetime.now(timezone.utc),
-                        to_bot=h.get("to_bot", True))
-        if "reply" in h:
-            log.add("rocky", text=h["reply"], calls=[], at=h.get("reply_at") or h.get("at"))
-            for emoji, n in (h.get("reply_reactions") or {}).items():
-                names = list((h.get("reply_reactors") or {}).get(emoji, {}).values())
-                for name in names[:n] or ["someone"] * n:
-                    log.add("reaction", on="you", you_said=h["reply"], emoji=emoji, author=name, at=h.get("at"))
-        elif "reaction" in h:
-            calls += 1
-            log.add("rocky", text="", calls=[{"id": f"call_{calls}", "name": "react",
-                                              "arguments": json.dumps({"emoji": h["reaction"], "message": e["n"]})}])
-            log.add("result", id=f"call_{calls}", content="Reacted.")
-    return log
