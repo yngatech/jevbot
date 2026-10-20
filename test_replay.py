@@ -14,13 +14,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
-import jev_bot as j  # noqa: E402
-import rocky_harness as rh  # noqa: E402
-import rocky_replay  # noqa: E402
-from test_harness import answer  # noqa: E402
+from fakes import answer, isolate_rocky, patch_all
+import jev_bot as j
+import rocky_harness as rh
+import rocky_replay
 
 CHANNEL = 300
 FACT = {"n": 1, "about": "kettle", "fact": "likes soup"}
@@ -39,15 +36,10 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         (self.live / "rocky_logs" / f"{CHANNEL}.json").write_text(json.dumps(LOG))
         (self.live / "rocky_memories.json").write_text(json.dumps(MEMORIES))
         (self.live / "rocky_lines.txt").write_text("# a comment\nAmaze, amaze, amaze!\n")
-        for obj, attr, value in [(rh, "logs", {}), (rh, "log_saves", {}), (rh, "memories", {}),
-                                 (rh, "memories_loaded", False), (rh, "head", lambda: None),
-                                 (rh, "LOG_DIR", rh.LOG_DIR), (rh, "MEMORY_PATH", rh.MEMORY_PATH),
-                                 (rh, "save_log", rh.save_log), (rh, "save_memories", rh.save_memories),
-                                 (rh, "clock", rh.clock), (j, "ROCKY_LINES", []), (j, "HEADERS", dict(j.HEADERS)),
-                                 (j, "TIMEZONE", j.ZoneInfo("UTC")), (rocky_replay, "live_dir", lambda: self.live)]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        isolate_rocky(self, d.name)  # put back after, as the replay points them at its copy
+        patch_all(self, [(rh, "save_log", rh.save_log), (rh, "save_memories", rh.save_memories), (rh, "clock", rh.clock),
+                         (rh, "pictures", rh.pictures), (j, "ROCKY_LINES", []), (j, "HEADERS", dict(j.HEADERS)),
+                         (j, "TIMEZONE", j.ZoneInfo("UTC")), (rocky_replay, "live_dir", lambda: self.live)])
         self.before = {p: p.read_text() for p in self.live.rglob("*") if p.is_file()}
 
     async def run_main(self, *argv, env=None):

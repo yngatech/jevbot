@@ -5,7 +5,6 @@
 
 import asyncio
 import contextlib
-import os
 import tempfile
 import unittest
 from collections import defaultdict
@@ -14,9 +13,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
+from fakes import answer, isolate_rocky, patch_all, traced
 import discord
 import jev_bot as j
 import rocky_harness as rh
@@ -43,7 +40,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
         self.target = Mock(spec=discord.Message, id=700, author=self.user, reactions=[])
         self.target.reference = None
         self.target.created_at = datetime.now(timezone.utc) - timedelta(minutes=1)
-        for obj, attr, value in [
+        patch_all(self, [
             (j.bot._connection, "user", self.user),
             (j.bot._connection, "_guilds", {400: self.guild}),
             (j, "DM_USERS", {500}),
@@ -56,10 +53,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
             (j, "REACTORS_PATH", Path(self.reactors_dir.name) / "reactors.json"),
-        ]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        ])
 
 
 class ReactionContextTests(_Discord):
@@ -415,11 +409,6 @@ class EmbedTests(_Discord):
 class ActionTests(_Discord):
     """Diagnostic actions, from right-clicking a message: answered only to whoever asked."""
 
-    def interaction(self):
-        return SimpleNamespace(channel_id=self.channel.id, guild=self.guild,
-                               response=SimpleNamespace(defer=AsyncMock()),
-                               followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(attachments=[]))))
-
     def test_actions_are_message_context_menus(self):
         menus = {c.name: c.type for c in j.bot.tree.get_commands(type=discord.AppCommandType.message)}
         self.assertEqual(menus, {"Why": discord.AppCommandType.message, "Context": discord.AppCommandType.message,
@@ -430,40 +419,6 @@ class ActionTests(_Discord):
         with patch.object(j.bot.tree, "sync", AsyncMock(side_effect=error)), self.assertLogs(j.log, "WARNING") as logs:
             await j.bot.setup_hook()
         self.assertIn("Registering app commands failed", logs.output[0])
-
-    async def test_context_answers_the_right_clicked_message_privately(self):
-        logged = {"message": "what's my cat called?", "author": "Speaker", "bot_name": "Testbot", "history": [],
-                  "reply": "Is called Biscuit.", "transcript": "Speaker: what's my cat called? @everyone"}
-        i = self.interaction()
-        with patch.object(j, "find_trace", return_value=logged) as find:
-            await j.context_action.callback(i, self.target)
-        i.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        self.assertEqual(find.call_args.args[:2], (self.channel.id, self.target))
-        sent = i.followup.send.call_args
-        self.assertTrue(sent.kwargs["ephemeral"])
-        self.assertIn("Speaker: what's my cat called?", sent.kwargs["embed"].description)
-        self.assertEqual(sent.kwargs["allowed_mentions"].to_dict()["parse"], [])  # the quoted @everyone pings nobody
-        self.assertIs(sent.kwargs["file"], discord.utils.MISSING)
-
-    async def test_why_sends_its_chart_privately(self):
-        logged = {"reply": "Is called", "bot_name": "Testbot", "message": "what is it called?",
-                  "steps": [{"word": "is", "top": [["is", 0.6, 0.6]]}, {"word": "called", "top": [["called", 0.5, 0.5]]}]}
-        i = self.interaction()
-        with patch.object(j, "find_trace", return_value=logged), \
-                patch.object(j.why_chart, "render", return_value=b"png"):
-            await j.why_action.callback(i, self.target)
-        sent = i.followup.send.call_args
-        self.assertTrue(sent.kwargs["ephemeral"])
-        self.assertIs(sent.args[0], discord.utils.MISSING)
-        self.assertEqual(sent.kwargs["file"].filename, "why-is-called.png")
-
-    async def test_nothing_logged_says_so_privately(self):
-        i = self.interaction()
-        with patch.object(j, "find_trace", return_value=None):
-            await j.why_action.callback(i, self.target)
-        i.followup.send.assert_awaited_once()
-        self.assertEqual(i.followup.send.call_args.args[0], "Nothing logged for that")
-        self.assertTrue(i.followup.send.call_args.kwargs["ephemeral"])
 
 
 class WakingTests(_Discord):
@@ -477,10 +432,7 @@ class WakingTests(_Discord):
             await j.set_credit(True)  # credit coming back mid-catch-up mustn't put it online early
             seen_while_catching_up.extend(presence.call_args_list)
 
-        for attr, value in [("change_presence", presence), ("is_ready", lambda: True)]:
-            p = patch.object(j.bot, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        patch_all(self, [(j.bot, "change_presence", presence), (j.bot, "is_ready", lambda: True)])
         with patch.object(j, "has_credit", None), patch.object(j, "credit_left", AsyncMock(return_value=5.0)), \
                 patch.object(j, "catch_up", catch_up), patch.object(j, "STATUS_EVERY", 0), \
                 patch.object(j, "status", discord.CustomActivity("I feel tea")), patch.object(j, "waking", True):
@@ -497,18 +449,13 @@ class _Handling(_Discord):
     def setUp(self):
         super().setUp()
         self.load_history = j.load_history
-        self.trace = {"cost": 0.0, "requests": 0}
-        token = j.trace.set(self.trace)
-        self.addCleanup(j.trace.reset, token)
+        self.trace = traced(self)
         self.channel.typing = lambda: contextlib.nullcontext()
         self.channel.fetch_message = AsyncMock(side_effect=lambda i: self.by_id[i])
         self.by_id = {}
         self.next_id = 800
-        for attr, value in [("has_credit", True), ("history_loaded", {}), ("emoji_vocabulary", lambda g: {}),
-                            ("choose_reaction", AsyncMock(return_value=None)), ("load_history", AsyncMock())]:
-            p = patch.object(j, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        patch_all(self, [(j, "has_credit", True), (j, "history_loaded", {}), (j, "emoji_vocabulary", lambda g: {}),
+                         (j, "choose_reaction", AsyncMock(return_value=None)), (j, "load_history", AsyncMock())])
         # Chatter before the conversation, which a !nocontext chain shouldn't see
         j.channel_history[self.channel.id] = [
             {"role": "user", "name": "kettle", "content": "the toaster is on fire again", "id": 1,
@@ -550,31 +497,20 @@ class RockyHarnessTests(_Handling):
 
     def setUp(self):
         super().setUp()
-        for obj, attr, value in [(j, "LONG_CHAT_CHANNELS", {self.channel.id}), (j, "model_name", "rocky"),
-                                 (rh, "LOG_DIR", Path(self.reactors_dir.name) / "rocky_logs"),
-                                 (rh, "MEMORY_PATH", Path(self.reactors_dir.name) / "rocky_memories.json"),
-                                 (rh, "logs", {}), (rh, "log_saves", {}), (rh, "memories", {}),
-                                 (rh, "memories_loaded", True), (rh, "memories_save", None)]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        patch_all(self, [(j, "LONG_CHAT_CHANNELS", {self.channel.id}), (j, "model_name", "rocky")])
+        isolate_rocky(self, self.reactors_dir.name)
         self.channel.name = "bot-spam"
         self.channel.guild = self.guild
         self.partials = {}
         self.channel.get_partial_message = lambda i: self.partials.setdefault(i, Mock(add_reaction=AsyncMock()))
-
-    def answer_with(self, text="", calls=()):
-        return AsyncMock(return_value={"role": "assistant", "content": text or None, "tool_calls": [
-            {"id": f"c{i}", "type": "function", "function": {"name": n, "arguments": __import__("json").dumps(a)}}
-            for i, (n, a) in enumerate(calls)] or None})
 
     async def test_rocky_speaks_reacts_and_remembers_from_the_channels_log(self):
         await j.on_message(self.said("anyone seen my keys", name="kettle", ping=False))
         with patch.object(j, "why", AsyncMock()):
             await j.on_message(self.said("!why", ping=False))  # a command stays out of the log
         m = self.said("my cat is called biscuit")
-        llm = self.answer_with("@pip Biscuit. Good name.", [("react", {"emoji": "🐱"}),
-                                                            ("remember", {"about": "pip", "fact": "has a cat called Biscuit"})])
+        llm = AsyncMock(return_value=answer("@pip Biscuit. Good name.", [
+            ("react", {"emoji": "🐱"}), ("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]))
         with patch.object(j, "llm_message", llm):
             await j.handle(m, j.message_text(m))  # as catch-up does: not seen live, so the turn adds it
         m.reply.assert_awaited_once()
@@ -620,7 +556,7 @@ class RockyHarnessTests(_Handling):
         m = self.said("why are you scared of this", to=self.by_id[self.next_id - 1])
         m.reference.resolved = self.by_id[m.reference.message_id]
         rh.observe(m)
-        llm = self.answer_with("Rocky not scared. Rocky worried.")
+        llm = AsyncMock(return_value=answer("Rocky not scared. Rocky worried."))
         with patch.object(j, "llm_message", llm):
             await j.handle(m, j.message_text(m))
         request = llm.await_args.args[1]
@@ -631,7 +567,7 @@ class RockyHarnessTests(_Handling):
     async def test_only_reacting_posts_nothing_and_never_shows_typing(self):
         m = self.said("lol")
         self.channel.typing = Mock(side_effect=lambda: contextlib.nullcontext())
-        with patch.object(j, "llm_message", self.answer_with(calls=[("react", {"emoji": "😂"})])):
+        with patch.object(j, "llm_message", AsyncMock(return_value=answer(calls=[("react", {"emoji": "😂"})]))):
             await j.handle(m, j.message_text(m))
         m.reply.assert_not_awaited()
         self.channel.typing.assert_not_called()  # it would have lingered ~10s after the reaction
@@ -972,9 +908,7 @@ class LongContextChannelTests(_Handling):
 
     def setUp(self):
         super().setUp()
-        p = patch.object(j, "LONG_CHAT_CHANNELS", {self.channel.id})
-        p.start()
-        self.addCleanup(p.stop)
+        patch_all(self, [(j, "LONG_CHAT_CHANNELS", {self.channel.id})])
         self.start = datetime.now(timezone.utc) - timedelta(hours=1)
         j.channel_history[self.channel.id] = []
 

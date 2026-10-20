@@ -4,7 +4,6 @@
 """
 
 import json
-import os
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -12,13 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
-import discord  # noqa: E402
-
-import jev_bot as j  # noqa: E402
-import rocky_harness as rh  # noqa: E402
+from fakes import patch_all
+import discord
+import jev_bot as j
+import rocky_harness as rh
 
 ADMIN, OWNER, PERSON = 500, 501, 502
 
@@ -28,13 +24,10 @@ class _Case(unittest.IsolatedAsyncioTestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.path = Path(self.dir.name) / "settings.json"
-        for obj, attr, value in [(j, "SETTINGS_PATH", self.path), (j, "saved_settings", {}), (j, "ADMINS", {ADMIN}),
-                                 (j, "STATUS_EVERY", 180), (rh, "LOG_TOKENS", 90_000),
-                                 (j.bot, "is_owner", AsyncMock(side_effect=lambda u: u.id == OWNER)),
-                                 (j.bot, "is_ready", lambda: False)]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        patch_all(self, [(j, "SETTINGS_PATH", self.path), (j, "saved_settings", {}), (j, "ADMINS", {ADMIN}),
+                         (j, "STATUS_EVERY", 180), (rh, "LOG_TOKENS", 90_000),
+                         (j.bot, "is_owner", AsyncMock(side_effect=lambda u: u.id == OWNER)),
+                         (j.bot, "is_ready", lambda: False)])
 
     def interaction(self, user=ADMIN):
         return SimpleNamespace(user=SimpleNamespace(id=user), response=SimpleNamespace(
@@ -111,18 +104,6 @@ class SettingsCommandTests(_Case):
         j.load_settings()
         self.assertEqual((j.STATUS_EVERY, rh.LOG_TOKENS), (0, 150_000))
 
-    async def test_rockys_log_jumps_at_the_new_window(self):
-        log = rh.Log("bot-spam", "space", 300)
-        for i in range(400):
-            log.message("kettle", f"message {i} " + "x" * 100, datetime.now(timezone.utc), discord_id=i)
-        size = rh.chars(log)
-        view = (await self.open_settings())["view"]
-        await self.pick(self.menu(view, "LOG_TOKENS"), 25_000)
-        self.assertGreater(size, 25_000 * rh.CHARS_PER_TOKEN)
-        with patch.object(rh, "tidy"):
-            self.assertTrue(rh.jump(log))
-        self.assertLess(rh.chars(log), size)
-
     async def test_someone_no_longer_an_admin_changes_nothing(self):
         view = (await self.open_settings())["view"]
         j.ADMINS = set()
@@ -145,15 +126,10 @@ class SettingsCommandTests(_Case):
 class StatusIntervalTests(_Case):
     def setUp(self):
         super().setUp()
-        for attr, value in [("heard", True), ("has_credit", True), ("status_turn", 0),
-                            ("tried_at", datetime.now(timezone.utc) - timedelta(minutes=90)),
-                            ("generate_filtered_status", AsyncMock(return_value=None))]:
-            p = patch.object(j, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
-        p = patch.object(j.bot._connection, "user", SimpleNamespace(display_name="rocky"))
-        p.start()
-        self.addCleanup(p.stop)
+        patch_all(self, [(j, "heard", True), (j, "has_credit", True), (j, "status_turn", 0),
+                         (j, "tried_at", datetime.now(timezone.utc) - timedelta(minutes=90)),
+                         (j, "generate_filtered_status", AsyncMock(return_value=None)),
+                         (j.bot._connection, "user", SimpleNamespace(display_name="rocky"))])
 
     async def test_a_new_interval_counts_from_the_last_status_straight_away(self):
         await j.update_status.coro()

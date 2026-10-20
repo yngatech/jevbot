@@ -15,44 +15,28 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
-import jev_bot as j  # noqa: E402
-import rocky_harness as rh  # noqa: E402
+from fakes import answer, isolate_rocky, patch_all, session, traced
+import jev_bot as j
+import rocky_harness as rh
 
 T0 = datetime(2026, 10, 12, 18, 0, tzinfo=timezone.utc)
-
-
-def answer(text="", calls=(), reasoning=None):
-    return {"role": "assistant", "content": text or None, "reasoning_details": reasoning,
-            "tool_calls": [{"id": f"call_{i}", "type": "function",
-                            "function": {"name": name, "arguments": json.dumps(args)}}
-                           for i, (name, args) in enumerate(calls)] or None}
+git_head = rh.head  # the real one, for KeepingTests.repo
 
 
 class _Case(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.trace = {"cost": 0.0, "requests": 0}
-        token = j.trace.set(self.trace)
-        self.addCleanup(j.trace.reset, token)
-        for obj, attr, value in [(rh, "LOG_DIR", Path(self.dir.name) / "logs"),
-                                 (rh, "MEMORY_PATH", Path(self.dir.name) / "memories.json"),
-                                 (rh, "logs", {}), (rh, "log_saves", {}), (rh, "memories", {}),
-                                 (rh, "memories_loaded", True), (rh, "memories_save", None),
-                                 (j, "TIMEZONE", j.ZoneInfo("UTC")), (j, "ROCKY_LINES", ["Amaze, amaze, amaze!"])]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
-        self.no_git = patch.object(rh, "head", lambda: None)  # the checkout's own commits aren't for tests
-        self.no_git.start()
-        self.addCleanup(self.no_git.stop)
+        self.trace = traced(self)
+        isolate_rocky(self, self.dir.name)
+        patch_all(self, [(j, "TIMEZONE", j.ZoneInfo("UTC")), (j, "ROCKY_LINES", ["Amaze, amaze, amaze!"])])
         self.log = rh.Log("bot-spam", "400", 300)
 
     def said(self, author, text, minutes, to_bot=False, **kwargs):
         return self.log.message(author, text, T0 + timedelta(minutes=minutes), to_bot=to_bot, **kwargs)
+
+    def remember_soup(self):  # in the server's memories
+        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
 
 
 class RenderTests(_Case):
@@ -106,7 +90,7 @@ class RenderTests(_Case):
         self.assertEqual(follow_up[-1]["role"], "tool")
 
     def test_memories_are_the_servers_not_the_channels(self):
-        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        self.remember_soup()
         other = rh.Log("general", "400", 301)
         other.reorganise()
         self.assertIn("pip: likes soup", rh.memories_text(other))
@@ -143,9 +127,7 @@ class ToolTests(_Case):
         self.assertIn('[note] [react {"emoji": "🤫"}]', readable)
 
     def bar_at(self, at):
-        p = patch.object(rh, "clock", lambda: at)
-        p.start()
-        self.addCleanup(p.stop)
+        patch_all(self, [(rh, "clock", lambda: at)])
 
     def day(self, shut=False, out=False):  # the first day from T0 that's like this
         return next(d for d in (T0.date() + timedelta(days=i) for i in range(365))
@@ -214,29 +196,27 @@ class TurnTests(_Case):
         self.assertEqual(rocky["reasoning"], [{"type": "reasoning.text", "text": "a cat fact"}])
         self.assertEqual([e["content"] for e in self.log.events if e["type"] == "result"], ["Reacted.", "Remembered as [1]."])
 
-    async def test_after_only_remembering_it_gets_a_turn_to_speak(self):
-        typed = []
+    async def test_after_only_remembering_or_a_note_it_gets_a_turn_to_speak(self):
+        for call, result in [(("remember", {"about": "pip", "fact": "has a cat called Biscuit"}), "Remembered as [1]."),
+                             (("note", {"text": "picked 4"}), "Noted.")]:
+            with self.subTest(call=call[0]):
+                typed = []
 
-        @__import__("contextlib").asynccontextmanager
-        async def typing():
-            typed.append(llm.await_count)
-            yield
+                @contextlib.asynccontextmanager
+                async def typing():
+                    typed.append(llm.await_count)
+                    yield
 
-        q = self.said("pip", "rocky my cat is called biscuit", 0, to_bot=True)
-        llm = AsyncMock(side_effect=[answer(calls=[("remember", {"about": "pip", "fact": "has a cat called Biscuit"})]),
-                                     answer("Biscuit. Good name.")])
-        with patch.object(j, "llm_message", llm):
-            turn = await rh.take_turn(self.log, q, typing=typing)
-        self.assertEqual(typed, [1])  # typing only for the request after the first: it's going to speak
-        self.assertEqual((turn.text, turn.requests), ("Biscuit. Good name.", 2))
-        # Both its responses and the result between them, for the day's log (and rocky_viewer)
-        self.assertEqual([e["type"] for e in turn.events], ["rocky", "result", "rocky"])
-        self.assertEqual(turn.events, self.log.events[-3:])
-        self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": "Remembered as [1]."})
-
-    async def test_after_only_a_note_it_gets_a_turn_to_speak(self):
-        turn, llm = await self.turn(answer(calls=[("note", {"text": "picked 4"})]), answer("Rocky pick. Not tell."))
-        self.assertEqual((turn.text, turn.requests), ("Rocky pick. Not tell.", 2))
+                q = self.said("pip", "rocky my cat is called biscuit", 0, to_bot=True)
+                llm = AsyncMock(side_effect=[answer(calls=[call]), answer("Biscuit. Good name.")])
+                with patch.object(j, "llm_message", llm):
+                    turn = await rh.take_turn(self.log, q, typing=typing)
+                self.assertEqual(typed, [1])  # typing only for the request after the first: it's going to speak
+                self.assertEqual((turn.text, turn.requests), ("Biscuit. Good name.", 2))
+                # Both its responses and the result between them, for the day's log (and rocky_viewer)
+                self.assertEqual([e["type"] for e in turn.events], ["rocky", "result", "rocky"])
+                self.assertEqual(turn.events, self.log.events[-3:])
+                self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": result})
 
     async def test_at_the_bar_it_sees_what_happened_before_it_speaks(self):
         with patch.object(rh, "bar_state", lambda now=None: (True, "The Hail Mary is open until 23:00. Menu: Blip-A Lager £4.90.")):
@@ -335,22 +315,16 @@ class TurnTests(_Case):
         self.assertTrue(first["woke"] and second["woke"])
         self.assertEqual(j.text_of(llm.await_args.args[1][-1]["content"]).count('woke_you="yes"'), 2)
 
-    async def test_a_message_answered_elsewhere_or_already_isnt_this_turns(self):
+    async def test_a_message_answered_elsewhere_isnt_this_turns_nor_does_a_status_answer_one(self):
         earlier = self.said("kettle", "rocky biscuit?", 0, to_bot=True)  # answered while another !model was chosen
         self.log.add("rocky", text="Biscuit good.", calls=[], id=901, elsewhere=True)
         chatter = self.said("moss", "tea anyone", 1)
         q = self.said("pip", "rocky soup?", 2, to_bot=True)
-        llm = AsyncMock(side_effect=[answer("Soup good.")])
-        with patch.object(j, "llm_message", llm):
-            await rh.take_turn(self.log, q)
-        self.assertEqual(("woke" in earlier, "woke" in chatter, q["woke"]), (False, False, True))
-
-    async def test_a_status_posted_while_a_message_waits_doesnt_answer_it(self):
-        q = self.said("pip", "rocky soup?", 0, to_bot=True)
-        self.log.add("rocky", text="Mood: soup.", calls=[], id=901, elsewhere=True)  # as spoke_elsewhere adds it
+        self.log.add("rocky", text="Mood: soup.", calls=[], id=902, elsewhere=True)  # a status, as spoke_elsewhere adds it
         llm = AsyncMock(side_effect=[answer("Soup good.")])
         with patch.object(j, "llm_message", llm):
             turn = await rh.take_turn(self.log, q)
+        self.assertEqual(("woke" in earlier, "woke" in chatter, q["woke"]), (False, False, True))
         self.assertEqual((turn.text, llm.await_count), ("Soup good.", 1))
         self.assertEqual(llm.await_args.args[1][-1]["role"], "user")  # never ending with Rocky's
 
@@ -410,34 +384,23 @@ class LookTests(_Case):
             stickers=[SimpleNamespace(url="https://cdn/sticker.png", format=SimpleNamespace(name="png")),
                       SimpleNamespace(url="https://cdn/lottie.json", format=SimpleNamespace(name="lottie"))])
         channel = SimpleNamespace(fetch_message=AsyncMock(return_value=m))
-        fetched = []
 
-        class Response:
-            def __init__(self, url):
-                self.status, self.content = 200, SimpleNamespace(read=AsyncMock(return_value=files[url]))
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *a):
-                return False
+        def get(url, **k):
+            r = session()  # a response is its own `async with` too
+            r.status, r.content.read = 200, AsyncMock(return_value=files[url])
+            return r
 
-        class Session:
-            def __init__(self, *a, **k):
-                pass
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *a):
-                return False
-            def get(self, url, **k):
-                fetched.append(url)
-                return Response(url)
+        s = session()
+        s.get.side_effect = get
 
         self.said("pip", "look [photo]", 0, discord_id=900)
         bot = SimpleNamespace(get_channel=lambda i: channel if i == 300 else None)
-        with patch.object(j, "bot", bot), patch.object(j.aiohttp, "ClientSession", Session):
+        with patch.object(j, "bot", bot), patch.object(j.aiohttp, "ClientSession", return_value=s):
             found = await rh.pictures(self.log, 1)
             self.assertIsNone(await rh.pictures(self.log, 2))  # not in the log
         channel.fetch_message.assert_awaited_once_with(900)
-        self.assertEqual(fetched, ["https://cdn/a.png", "https://tenor/thumb.png", "https://cdn/sticker.png"])
+        self.assertEqual([c.args[0] for c in s.get.call_args_list],
+                         ["https://cdn/a.png", "https://tenor/thumb.png", "https://cdn/sticker.png"])
         sizes = [rh.Image.open(__import__("io").BytesIO(__import__("base64").b64decode(u.split(",", 1)[1]))).size
                  for u in found]
         self.assertEqual(sizes, [(1024, 512), (40, 40), (160, 160)])
@@ -468,49 +431,39 @@ class LongMessageTests(_Case):
         self.assertEqual(j.message_parts("word " * 500, limit=100)[0], ("word " * 20).strip())  # no sentences: spaces
         self.assertEqual(j.message_parts("x" * 250, limit=100), ["x" * 100, "x" * 100, "x" * 50])
 
-    async def test_its_parts_are_sent_in_turn_and_are_one_message_in_the_log(self):
-        text = ("Rocky like beer. " * 150).strip()
-        sent = [SimpleNamespace(id=900 + i, created_at=T0) for i in range(2)]
+    async def rocky_turn(self, text, shown=()):
+        # j.rocky_turn answering pip, with Rocky's turn saying `text` and showing `shown`, through a fake channel
+        posted = lambda i, content, **kwargs: SimpleNamespace(id=i, created_at=T0, content=content)
         channel = SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400), typing=None,
-                                  send=AsyncMock(return_value=sent[1]))
+                                  send=AsyncMock(side_effect=lambda *a, **k: posted(901, *a, **k)))
         m = SimpleNamespace(id=5, channel=channel, guild=channel.guild, author=SimpleNamespace(display_name="pip"),
-                            reply=AsyncMock(return_value=sent[0]))
-        q = self.said("pip", "rocky tell me everything", 0, to_bot=True)
+                            reply=AsyncMock(side_effect=lambda *a, **k: posted(900, *a, **k)))
+        q = self.said("pip", "rocky tell me", 0, to_bot=True)
 
         async def take_turn(log, waking, *args, **kwargs):
-            return rh.Turn(text=text, spoke=log.add("rocky", text=text, calls=[]), requests=1)
+            return rh.Turn(text=text, spoke=log.add("rocky", text=text, calls=[]), requests=1, shown=list(shown))
 
-        entry = {"name": "pip", "content": "rocky tell me everything", "users": {}}
-        with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
-                patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
-                patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "message_text", lambda x: "part"), \
-                patch.object(j, "message_users", lambda x: {str(x.id): "pip"}), \
-                patch.object(j, "mention_targets", lambda *a, **k: {}):
-            await j.rocky_turn(m, entry, "rocky", [])
-        first, rest = m.reply.call_args.args[0], channel.send.call_args.args[0]
-        self.assertEqual(f"{first} {rest}", text)
-        self.assertEqual((self.log.ids, entry["reply_id"]), ({"900": "you", "901": "you"}, 900))
-        self.assertEqual((entry["reply"], entry["reply_users"]), ("part part", {"900": "pip", "901": "pip"}))
-        self.assertEqual(self.log.rocky_text(901), text)  # a reaction to either part is to its message
-
-    async def test_what_it_did_goes_under_its_message_but_not_in_its_log(self):
-        sent = SimpleNamespace(id=900, created_at=T0)
-        channel = SimpleNamespace(id=300, name="bot-spam", guild=SimpleNamespace(id=400), typing=None, send=AsyncMock())
-        m = SimpleNamespace(id=5, channel=channel, guild=channel.guild, author=SimpleNamespace(display_name="pip"),
-                            reply=AsyncMock(return_value=sent))
-        q = self.said("pip", "rocky get me a stout", 0, to_bot=True)
-
-        async def take_turn(log, waking, *args, **kwargs):
-            return rh.Turn(text="Stout for Pip.", spoke=log.add("rocky", text="Stout for Pip.", calls=[]), requests=1,
-                           shown=[("order", "Eridani Stout", "pip"), ("remember", 1, "pip: likes stout")])
-
-        entry = {"name": "pip", "content": "rocky get me a stout", "users": {}}
+        entry = {"name": "pip", "content": "rocky tell me", "users": {}}
         with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
                 patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
                 patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "mention_targets", lambda *a, **k: {}), \
-                patch.object(j, "message_users", lambda x: {}), \
-                patch.object(j, "message_text", lambda x: j.ACTION_LINES.sub("", m.reply.call_args.args[0]).strip()):
+                patch.object(j, "message_users", lambda x: {str(x.id): "pip"}), \
+                patch.object(j, "message_text", lambda x: j.ACTION_LINES.sub("", x.content).strip()):
             await j.rocky_turn(m, entry, "rocky", [])
+        return m, channel, entry
+
+    async def test_its_parts_are_sent_in_turn_and_are_one_message_in_the_log(self):
+        text = ("Rocky like beer. " * 150).strip()
+        m, channel, entry = await self.rocky_turn(text)
+        first, rest = m.reply.call_args.args[0], channel.send.call_args.args[0]
+        self.assertEqual(f"{first} {rest}", text)
+        self.assertEqual((self.log.ids, entry["reply_id"]), ({"900": "you", "901": "you"}, 900))
+        self.assertEqual((entry["reply"], entry["reply_users"]), (text, {"900": "pip", "901": "pip"}))
+        self.assertEqual(self.log.rocky_text(901), text)  # a reaction to either part is to its message
+
+    async def test_what_it_did_goes_under_its_message_but_not_in_its_log(self):
+        m, channel, entry = await self.rocky_turn("Stout for Pip.", [("order", "Eridani Stout", "pip"),
+                                                                     ("remember", 1, "pip: likes stout")])
         self.assertEqual(m.reply.call_args.args[0],
                          "Stout for Pip.\n-# 🍺 ordered Eridani Stout for pip\n-# 🧠 remembered: pip likes stout")
         self.assertEqual(self.log.events[-1]["text"], "Stout for Pip.")  # it has its calls in the log
@@ -568,13 +521,9 @@ class KeepingTests(_Case):
         self.assertEqual((rh.log_saves, rh.memories_save), ({}, None))
 
     def repo(self):
-        self.no_git.stop()
-        self.addCleanup(self.no_git.start)  # stopped again by its own cleanup
         here = Path(self.dir.name) / "repo"
         here.mkdir()
-        p = patch.object(rh, "HERE", here)
-        p.start()
-        self.addCleanup(p.stop)
+        patch_all(self, [(rh, "HERE", here), (rh, "head", git_head)])
         git = lambda *a, **env: subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *a],
                                                cwd=here, check=True, capture_output=True, text=True,
                                                env={**os.environ, **env}).stdout.strip()
@@ -633,7 +582,7 @@ class KeepingTests(_Case):
         self.assertEqual([m["role"] for m in rendered[2:5]], ["user", "assistant", "tool"])
 
     def test_memories_come_back_after_a_restart(self):
-        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        self.remember_soup()
         rh.save_memories()
         rh.memories.clear()
         rh.memories_loaded = False
@@ -667,7 +616,7 @@ class KeepingTests(_Case):
         self.said("kettle", "oops", 1, discord_id=901)
         self.log.add("rocky", text="Hunter. Is name.", calls=[], id=902)
         self.log.ids["902"] = "you"
-        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        self.remember_soup()
         before = [j.text_of(m.get("content")) for m in rh.render(self.log, "rocky")]
         rh.deleted(300, 900)
         rh.deleted(300, 902)
@@ -704,7 +653,7 @@ class KeepingTests(_Case):
             self.said("pip", "x" * 100, i, discord_id=1000 + i)
             self.log.add("rocky", text="", calls=[{"id": f"c{i}", "name": "react", "arguments": "{}"}])
             self.log.add("result", id=f"c{i}", content="Reacted.")
-        rh.use(self.log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        self.remember_soup()
         with patch.object(rh, "LOG_TOKENS", (rh.chars(self.log) - 1) / rh.CHARS_PER_TOKEN):
             self.assertTrue(rh.jump(self.log))
         self.assertEqual(self.log.events[0]["type"], "message")
