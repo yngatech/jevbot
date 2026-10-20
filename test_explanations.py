@@ -212,7 +212,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                  transcript="Synthetic chat that Stats should not quote")
         j.write_trace(t)
         interaction = self.interaction()
-        with patch.object(j, "model_name", "flash"), patch.object(j, "stats_response", wraps=j.stats_response) as stats, \
+        with patch.object(j, "model_name", "jev"), patch.object(j, "stats_response", wraps=j.stats_response) as stats, \
                 patch.object(j, "llm", new_callable=AsyncMock) as llm, \
                 patch.object(j, "post", new_callable=AsyncMock) as post:
             await j.stats_action.callback(interaction, self.target(t))
@@ -346,10 +346,10 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("not recorded", self.embeds()[0].footer.text)
 
     async def test_diagnostics_count_failed_attempts_and_do_not_price_unknown_failures_as_free(self):
-        t = dict(self.logged, llm="kimi", cost=.001, requests=1, api_calls=[
-            {"model": j.LLMS["kimi"]["id"], "purpose": "reply", "status": 429, "attempt": 0,
+        t = dict(self.logged, llm="haiku", cost=.001, requests=1, api_calls=[
+            {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 429, "attempt": 0,
              "router_cost": None, "is_byok": False, "key_cost": 0},
-            {"model": j.LLMS["kimi"]["id"], "purpose": "reply", "status": 200, "attempt": 1,
+            {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "attempt": 1,
              "router_cost": .001, "is_byok": False, "key_cost": 0}])
         j.write_trace(t)
         await j.diagnostics_action.callback(self.interaction(), self.target(t))
@@ -454,8 +454,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[-1][0], "Nothing logged for that")
 
     async def test_why_command_and_actions_find_a_converted_user_mention(self):
-        logged = dict(self.logged, reply="@Moss knows", sent="<@100000000000000002> knows", llm="deepseek",
-                      llm_tokens=[{"token": "@Moss", "p": .8, "top": [["@Moss", .8]]}])
+        logged = dict(self.logged, reply="@Moss knows", sent="<@100000000000000002> knows")
         j.write_trace(logged)
         target = self.target(logged)
         target.content = logged["sent"]
@@ -482,17 +481,15 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         target.id += 1
         self.assertIsNone(j.find_trace(self.channel.id, target))
 
-    async def test_llm_and_status_charts_are_cached(self):
-        llm = dict(self.logged, llm="deepseek", llm_tokens=[{"token": "Tea", "p": .8, "top": [["Tea", .8]]}])
+    async def test_reply_and_status_charts_are_cached(self):
         status = {"at": self.logged["at"], "status": "I feel tea is good", "status_id": 40,
                   "bot_name": "Testbot", "transcript": "Testbot's diary, today: I feel",
                   "steps": [{"word": "tea", "top": [["tea", .8, .8]]}]}
         with patch.object(j, "STATUS_CHANNEL", self.channel.id), \
                 patch.object(j.why_chart, "render", wraps=j.why_chart.render) as render:
-            j.write_trace(llm)
+            j.write_trace(self.logged)
             await j.why(self.command())
-            await self.explain(llm)
-            self.assertTrue(render.call_args.kwargs["tokens"])
+            await self.explain(self.logged)
             j.write_trace(status)
             await j.why(self.command())
             await j.why(self.command())
@@ -520,7 +517,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_legacy_reaction_and_llm_without_tokens_reuse_their_text(self):
         for fields, expected in [({"reaction": "👍", "reaction_candidates": ["👍", "👎"], "steps": []}, "Reacted 👍"),
-                                 ({"llm": "kimi"}, "kimi doesn't say how likely its words were")]:
+                                 ({"llm": "haiku"}, "haiku doesn't say how likely its words were")]:
             with self.subTest(fields=fields), patch.object(j.why_chart, "render") as render, \
                     patch.object(j, "why_response", wraps=j.why_response) as prepare:
                 j.write_trace(dict(self.logged, **fields))

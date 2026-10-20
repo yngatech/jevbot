@@ -446,8 +446,8 @@ class ActionTests(_Discord):
         self.assertIs(sent.kwargs["file"], discord.utils.MISSING)
 
     async def test_why_sends_its_chart_privately(self):
-        logged = {"llm": "deepseek", "reply": "Is called", "bot_name": "Testbot",
-                  "llm_tokens": [{"token": "Is", "p": 0.6, "top": [["Is", 0.6]]}]}
+        logged = {"reply": "Is called", "bot_name": "Testbot", "message": "what is it called?",
+                  "steps": [{"word": "is", "top": [["is", 0.6, 0.6]]}, {"word": "called", "top": [["called", 0.5, 0.5]]}]}
         i = self.interaction()
         with patch.object(j, "find_trace", return_value=logged), \
                 patch.object(j.why_chart, "render", return_value=b"png"):
@@ -692,7 +692,7 @@ class OutgoingMentionTests(_Handling):
             m.clean_content = discord.Message.clean_content.function(m)
             with self.subTest(model=model), patch.object(j, "model_name", model), \
                     patch.object(j, "loom", new_callable=AsyncMock, return_value=["@Moss!"]), \
-                    patch.object(j, "llm", new_callable=AsyncMock, return_value=("@Moss!", [])):
+                    patch.object(j, "llm", new_callable=AsyncMock, return_value="@Moss!"):
                 await j.handle(m, j.message_text(m))
                 self.assertEqual(m.reply.call_args.args[0], expected)
                 allowed = m.reply.call_args.kwargs["allowed_mentions"].to_dict()
@@ -742,7 +742,7 @@ class AppHistoryTests(_Handling):
         question = self.said("say congrats")
         question.reply = AsyncMock(return_value=self.said("Congrats, synthetic-user!", to=question, bot=True))
         with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", new_callable=AsyncMock,
-                                                              return_value=("Congrats, synthetic-user!", [])) as llm:
+                                                              return_value="Congrats, synthetic-user!") as llm:
             await j.handle(question, j.message_text(question))
         chat = llm.call_args.args[1][1]["content"]
         self.assertIn("Milestone App: [embed: Contribution milestone synthetic-user passed 1,000 contributions.]", chat)
@@ -942,7 +942,7 @@ class LongHistoryTests(_Handling):
 
         async def llm(name, messages, **kwargs):
             asked.append(messages[1]["content"])
-            return "Is good.", []
+            return "Is good."
 
         with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", side_effect=llm):
             await j.handle(m := self.said("what now?"), j.message_text(m))
@@ -983,7 +983,7 @@ class LongContextChannelTests(_Handling):
 
         async def llm(name, messages, **kwargs):
             asked.append(messages)
-            return "Is good.", []
+            return "Is good."
 
         m = self.said("what now?")
         m.reply = AsyncMock(return_value=self.said("Is good.", to=m, bot=True))
