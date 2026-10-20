@@ -3,6 +3,7 @@
     uv run --with-requirements requirements.txt python -m unittest test_llm
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -329,6 +330,59 @@ class ReplyTests(_Case):
             self.assertIn("one short sentence at most", ask)
             self.assertEqual('no ", question?" tag' in ask, tagless)
             prompt.assert_called_with("rocky", True)
+
+
+class CreditTests(_Case):
+    """A request OpenRouter won't pay for: out of credit, or over the key's limit or its workspace's budget."""
+
+    BUDGET = {"error": {"code": 403, "message": "Workspace budget exceeded",
+                        "metadata": {"limit_source": "openrouter_workspace_budget", "limit_usd": 1, "spend_usd": 1}}}
+
+    def session(self, status, body):
+        response = SimpleNamespace(status=status, text=AsyncMock(return_value=json.dumps(body)),
+                                   json=AsyncMock(return_value=body))
+        session = MagicMock()
+        session.__aenter__.return_value = session
+        session.post.return_value.__aenter__.return_value = response
+        return session
+
+    async def test_a_spent_budget_or_credit_stops_without_retrying(self):
+        for status, body in [(403, self.BUDGET), (402, {"error": {"code": 402, "message": "Insufficient credits"}}),
+                             (402, "not json")]:
+            for call in ("llm", "post"):
+                with self.subTest(status=status, body=body, call=call):
+                    session = self.session(status, body)
+                    with patch.object(j.aiohttp, "ClientSession", return_value=session), \
+                            patch.object(j, "set_credit", AsyncMock()) as set_credit, \
+                            patch.object(j.asyncio, "sleep", AsyncMock()):
+                        if call == "llm":
+                            self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "cat?"}]), ("", []))
+                        else:
+                            self.assertEqual(await j.post(session, "state", {"asked": {}}), {})
+                    self.assertEqual(session.post.call_count, 1)
+                    set_credit.assert_awaited_once_with(False)
+
+    async def test_any_other_forbidden_is_retried(self):
+        body = {"error": {"code": 403, "message": "Flagged", "metadata": {"reasons": ["synthetic"]}}}
+        session = self.session(403, body)
+        with patch.object(j.aiohttp, "ClientSession", return_value=session), \
+                patch.object(j, "set_credit", AsyncMock()) as set_credit, patch.object(j.asyncio, "sleep", AsyncMock()):
+            await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+        self.assertEqual(session.post.call_count, 3)
+        set_credit.assert_not_awaited()
+
+    async def test_credit_left_is_the_lowest_of_credit_key_limit_and_budget(self):
+        for key, want in [({"limit_remaining": None}, 7.5), ({"limit_remaining": 4.0}, 4.0),
+                          ({"limit_remaining": 4.0, "effective_budget": {"remaining_usd": 0.25}}, 0.25),
+                          ({"limit_remaining": None, "effective_budget": None}, 7.5)]:
+            with self.subTest(key=key):
+                replies = iter([{"data": {"total_credits": 10, "total_usage": 2.5}}, {"data": key}])
+                session = MagicMock()
+                session.__aenter__.return_value = session
+                session.get.return_value.__aenter__.side_effect = lambda: SimpleNamespace(
+                    json=AsyncMock(return_value=next(replies)))
+                with patch.object(j.aiohttp, "ClientSession", return_value=session):
+                    self.assertEqual(await j.credit_left(), want)
 
 
 class StatusTests(_Case):

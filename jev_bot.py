@@ -361,6 +361,18 @@ def stopped_early(call):  # why a logged request stopped, if not by finishing: a
         return call.get("native_finish_reason") or call["finish_reason"]
 
 
+# Whether OpenRouter refused a request for want of money, so retrying won't help: 402 when the account's credit or
+# the key's limit is used up, 403 when a workspace or guardrail budget is. text: the error response.
+def out_of_credit(status, text):
+    if status == 402:
+        return True
+    try:
+        source = json.loads(text)["error"]["metadata"]["limit_source"]
+    except (ValueError, TypeError, KeyError):
+        return False
+    return status == 403 and str(source).endswith("_budget")
+
+
 async def post(session, state, questions):
     body = {"model": MODEL, "state": state, "questions": questions}
     purpose = ("decision" if "asked" in questions or any(q.get("instructions") == "Reaction?"
@@ -380,12 +392,13 @@ async def post(session, state, questions):
                         t["requests"] += 1
                     await set_credit(True)
                     return data.get("answers", {})
-                if r.status == 402:  # out of credit — retrying won't help
-                    log.warning(f"API 402: {(await r.text())[:300]}")
+                text = await r.text()
+                if out_of_credit(r.status, text):
+                    log.warning(f"API {r.status}: {text[:300]}")
                     note(error="out of credit")
                     await set_credit(False)
                     return {}
-                log.warning(f"API {r.status} {attempt}: {(await r.text())[:300]}")
+                log.warning(f"API {r.status} {attempt}: {text[:300]}")
                 await asyncio.sleep(1 + 2 * attempt)
         except Exception as e:
             status = "error"
@@ -880,8 +893,8 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
             try:
                 async with session.post(LLM_URL, json=request, timeout=aiohttp.ClientTimeout(total=60)) as r:
                     status = r.status
-                    if r.status == 402:  # out of credit — retrying won't help
-                        log.warning(f"LLM 402: {(await r.text())[:300]}")
+                    if r.status in (402, 403) and out_of_credit(r.status, text := await r.text()):
+                        log.warning(f"LLM {r.status}: {text[:300]}")
                         note(error="out of credit")
                         await set_credit(False)
                         return None
@@ -1143,7 +1156,8 @@ async def show_credit():
     except Exception as e:
         log.warning(f"Changing status failed: {e}")
 
-# What's left to spend: the account's credit, or the key's own limit if that's lower. None if the check failed.
+# What's left to spend: the account's credit, or the key's own limit or its workspace's budget if that's lower. None if
+# the check failed.
 async def credit_left():
     try:
         async with aiohttp.ClientSession(headers=HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as session:
@@ -1157,6 +1171,8 @@ async def credit_left():
     left = credits["total_credits"] - credits["total_usage"]
     if key.get("limit_remaining") is not None:
         left = min(left, key["limit_remaining"])
+    if (budget := key.get("effective_budget")) and budget.get("remaining_usd") is not None:
+        left = min(left, budget["remaining_usd"])  # the budget that blocks requests first
     return left
 
 async def wait_for_credit():
