@@ -7,11 +7,12 @@ with today's penalty() given the words picked before it. Only the first step tha
 after it jev would have seen a different reply, so its later candidates are unknown (`jev_eval.py --replies`
 shows what it goes on to say).
 
-    python test_penalty.py      # or: uv run --with pytest --with-requirements requirements.txt pytest test_penalty.py
+    python test_penalty.py      # with the replays' changes; the suite runs its tests too
 """
 
 import asyncio
 import os
+import unittest
 from unittest.mock import AsyncMock, patch
 
 os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
@@ -233,6 +234,13 @@ def test_endings_pool():
     assert pick({END: .02, "?": .05, "cat": .06}, True) == ("?", True, [END])
     assert pick({".": .04, "?": .03, "cat": .06}, False) == ("cat", False, [])  # can't stop yet
 
+
+# For unittest, which only runs a TestCase's tests: these, as they are
+class PenaltyTests(unittest.TestCase):
+    pass
+
+for _name in [name for name in globals() if name.startswith("test_")]:
+    setattr(PenaltyTests, _name, staticmethod(globals()[_name]))
 
 if __name__ == "__main__":
     for reply, steps in REPLAYS.items():
