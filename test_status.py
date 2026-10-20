@@ -4,27 +4,18 @@
 """
 
 import asyncio
-import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
-import jev_bot as j  # noqa: E402
+from fakes import patch_all, traced
+import jev_bot as j
 
 
 class _StatusCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.parent = {"cost": 0.0, "requests": 0}
-        self.token = j.trace.set(self.parent)
-        self.credit_patch = patch.object(j, "has_credit", True)
-        self.credit_patch.start()
-        self.addCleanup(self.credit_patch.stop)
-
-    async def asyncTearDown(self):
-        j.trace.reset(self.token)
+        self.parent = traced(self)
+        patch_all(self, [(j, "has_credit", True)])
 
     def candidates(self, moods, scores):
         moods, scores = iter(moods), iter(scores)
@@ -151,20 +142,12 @@ class StatusUpdateTests(_StatusCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
         self.old = j.discord.CustomActivity("I feel rested today")
-        for name, value in (("status", self.old), ("status_turn", 0), ("heard", True), ("tried_at", None),
-                            ("STATUS_EVERY", 180), ("gen_lock", asyncio.Lock())):
-            patcher = patch.object(j, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        patcher = patch.object(j.bot._connection, "user", SimpleNamespace(display_name="Testbot"))
-        patcher.start()
-        self.addCleanup(patcher.stop)
         self.saved, self.shown, self.posted, self.written = Mock(), AsyncMock(), AsyncMock(), Mock()
-        for name, mock in (("save_status", self.saved), ("show_credit", self.shown),
-                           ("post_status", self.posted), ("write_trace", self.written)):
-            patcher = patch.object(j, name, mock)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+        patch_all(self, [(j, "status", self.old), (j, "status_turn", 0), (j, "heard", True), (j, "tried_at", None),
+                         (j, "STATUS_EVERY", 180), (j, "gen_lock", asyncio.Lock()),
+                         (j.bot._connection, "user", SimpleNamespace(display_name="Testbot")),
+                         (j, "save_status", self.saved), (j, "show_credit", self.shown),
+                         (j, "post_status", self.posted), (j, "write_trace", self.written)])
 
     async def test_generation_judging_and_publishing_flow(self):
         # Exercise the real loom/render path and the real judge, replacing only API results and Discord writes.

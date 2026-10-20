@@ -3,43 +3,32 @@
     uv run --with-requirements requirements.txt python -m unittest test_llm
 """
 
-import json
-import os
 import tempfile
 import unittest
 from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
-import jev_bot as j  # noqa: E402
+from fakes import openrouter, patch_all, session, traced
+import jev_bot as j
 
 
 class _Case(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
-        self.trace = {"cost": 0.0, "requests": 0}
-        token = j.trace.set(self.trace)
-        self.addCleanup(j.trace.reset, token)
-        for obj, attr, value in [(j, "MODEL_PATH", Path(self.dir.name) / "model.json"), (j, "model_name", "jev"),
-                                 (j, "has_credit", True), (j, "channel_history", defaultdict(list)),
-                                 (j, "TIMEZONE", j.ZoneInfo("UTC"))]:  # not whatever .env sets
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        self.trace = traced(self)
+        patch_all(self, [(j, "MODEL_PATH", Path(self.dir.name) / "model.json"), (j, "model_name", "jev"),
+                         (j, "has_credit", True), (j, "channel_history", defaultdict(list)),
+                         (j, "TIMEZONE", j.ZoneInfo("UTC"))])  # not whatever .env sets
 
 
 class ModelCommandTests(_Case):
     def setUp(self):
         super().setUp()
         self.user = SimpleNamespace(id=100, bot=True, display_name="rocky")
-        p = patch.object(j.bot._connection, "user", self.user)
-        p.start()
-        self.addCleanup(p.stop)
+        patch_all(self, [(j.bot._connection, "user", self.user)])
 
     def message(self, content):
         return SimpleNamespace(id=600, content=content, guild=None, channel=SimpleNamespace(id=300),
@@ -87,25 +76,27 @@ class ModelCommandTests(_Case):
 class ReplyTests(_Case):
     async def test_reply_records_the_jev_decision_and_haiku_generation_separately(self):
         j.model_name = "haiku"
-        responses = []
-        for data in [{"answers": {"asked": {"noul": .9}}, "usage": {"cost": .000081}},
-                     {"choices": [{"message": {"content": "Coffee first. Then walk."}}],
-                      "usage": {"cost": 0, "is_byok": True,
-                                "cost_details": {"upstream_inference_cost": .000577}}}]:
-            response = MagicMock()
-            response.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value=data))
-            responses.append(response)
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.side_effect = responses
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+        with openrouter((200, {"answers": {"asked": {"noul": .9}}, "usage": {"cost": .000081}}),
+                        (200, {"id": "gen-synthetic-2", "provider": "Anthropic",
+                               "choices": [{"message": {"content": "Coffee first. Then walk."}, "finish_reason": "stop",
+                                            "native_finish_reason": "stop"}],
+                               "usage": {"cost": 0, "is_byok": True,
+                                         "cost_details": {"upstream_inference_cost": .000577}}})), \
+                patch.object(j.log, "warning") as warning:
             self.assertIsNone(await j.choose_reaction("coffee?", "Moss", "Rocky", ["☕"]))
             reply = await j.generate_reply("coffee?", "Moss", "Rocky", history=[])
         self.assertEqual(reply, "Coffee first. Then walk.")
-        self.assertEqual([r["purpose"] for r in self.trace["api_calls"]], ["decision", "reply"])
-        self.assertEqual([r["is_byok"] for r in self.trace["api_calls"]], [False, True])
-        self.assertNotIn("finish_reason", self.trace["api_calls"][0])  # Jev's decisions don't have one
-        self.assertIn("finish_reason", self.trace["api_calls"][1])
+        decision, call = self.trace["api_calls"]
+        self.assertEqual([r["purpose"] for r in (decision, call)], ["decision", "reply"])
+        self.assertEqual([r["is_byok"] for r in (decision, call)], [False, True])
+        self.assertEqual(call["model"], j.LLMS["haiku"]["id"])
+        # What each cost, and only the reply's on our own Anthropic key
+        self.assertEqual([round(r["router_cost"] + r["key_cost"], 6) for r in (decision, call)], [.000081, .000577])
+        self.assertAlmostEqual(self.trace["byok_cost"], .000577)
+        self.assertNotIn("finish_reason", decision)  # Jev's decisions don't have one
+        self.assertEqual((call["finish_reason"], call["provider"], call["id"]), ("stop", "Anthropic", "gen-synthetic-2"))
+        self.assertIsNone(j.stopped_early(call))  # an ordinary ending, without a warning
+        warning.assert_not_called()
         self.assertEqual(self.trace["requests"], 2)
         self.assertAlmostEqual(self.trace["cost"], .000658)
 
@@ -129,15 +120,11 @@ class ReplyTests(_Case):
 
     async def test_reply_logs_the_prompt_size_for_context(self):
         j.model_name = "haiku"
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
-            "choices": [{"message": {"content": "Is Biscuit."}}],
-            "usage": {"prompt_tokens": 3_100, "completion_tokens": 18, "cost": 0.001,
-                      "prompt_tokens_details": {"cached_tokens": 2_900}}}))
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+        with openrouter((200, {"choices": [{"message": {"content": "Is Biscuit."}}],
+                               "usage": {"prompt_tokens": 3_100, "completion_tokens": 18, "cost": 0.001,
+                                         "prompt_tokens_details": {"cached_tokens": 2_900}}})) as s:
             await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
-        messages = session.post.call_args.kwargs["json"]["messages"]
+        messages = s.post.call_args.kwargs["json"]["messages"]
         self.assertEqual(self.trace["llm_window"], 1_000_000)
         self.assertEqual(self.trace["llm_prompt_tokens"], 3_100)
         self.assertEqual(self.trace["llm_completion_tokens"], 18)
@@ -147,60 +134,24 @@ class ReplyTests(_Case):
         self.assertIn(chat, messages[1]["content"])
         self.assertEqual(self.trace["llm_chat_chars"], len(chat))
 
-    async def test_a_request_on_our_own_anthropic_key_counts_what_it_cost_there(self):
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        for usage, cost, byok in [({"cost": 0.0002}, 0.0002, None),
-                                  ({"cost": 0, "is_byok": True, "cost_details": {"upstream_inference_cost": 0.0004}},
-                                   0.0004, 0.0004)]:
-            with self.subTest(byok=byok):
-                self.trace.clear()
-                self.trace.update(cost=0.0, requests=0)
-                session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(
-                    return_value={"choices": [{"message": {"content": "Is Biscuit."}}], "usage": usage}))
-                with patch.object(j.aiohttp, "ClientSession", return_value=session), \
-                        patch.object(j, "set_credit", AsyncMock()):
-                    await j.llm("haiku", [{"role": "user", "content": "cat?"}])
-                self.assertAlmostEqual(self.trace["cost"], cost)
-                self.assertEqual(self.trace.get("byok_cost"), byok)
-                request, = self.trace["api_calls"]
-                self.assertEqual(request["model"], j.LLMS["haiku"]["id"])
-                self.assertEqual(request["purpose"], "reply")
-                self.assertEqual(request["is_byok"], bool(byok))
-                self.assertAlmostEqual(request["router_cost"] + request["key_cost"], cost)
-
     async def test_a_rate_limited_request_is_tried_again(self):
-        replies = iter([SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
-                        SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
-                        SimpleNamespace(status=200, json=AsyncMock(return_value={
-                            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))])
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
-                patch.object(j.asyncio, "sleep", AsyncMock()):
+        limited = (429, {"error": {"code": 429}})
+        with openrouter(limited, limited, (200, {"choices": [{"message": {"content": "Is Biscuit."}}],
+                                                 "usage": {"prompt_tokens": 10}})):
             text = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
         self.assertEqual(text, "Is Biscuit.")
         self.assertEqual([r["status"] for r in self.trace["api_calls"]], [429, 429, 200])
         self.assertEqual([r["attempt"] for r in self.trace["api_calls"]], [0, 1, 2])
         self.assertTrue(all(r["router_cost"] is None for r in self.trace["api_calls"]))
-        # Why each stopped: nothing for the failures, which had no answer
-        self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, None])
 
     async def test_a_refusal_is_recorded_and_warned_about_without_what_was_said(self):
-        replies = iter([SimpleNamespace(status=502, json=AsyncMock(return_value={"error": {"code": 502}})),
-                        SimpleNamespace(status=200, json=AsyncMock(return_value={
-                            "id": "gen-synthetic-1", "provider": "Anthropic",
-                            "choices": [{"message": {"content": "Secret refusal words."},
-                                         "finish_reason": "content_filter", "native_finish_reason": "refusal"}],
-                            "usage": {"cost": .0001}}))])
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
-                patch.object(j.asyncio, "sleep", AsyncMock()), self.assertLogs(j.log, "WARNING") as logs:
+        with openrouter((502, {"error": {"code": 502}}),
+                        (200, {"id": "gen-synthetic-1", "provider": "Anthropic",
+                               "choices": [{"message": {"content": "Secret refusal words."},
+                                            "finish_reason": "content_filter", "native_finish_reason": "refusal"}],
+                               "usage": {"cost": .0001}})), self.assertLogs(j.log, "WARNING") as logs:
             await j.llm("haiku", [{"role": "user", "content": "cat?"}])
-        failed, refused = self.trace["api_calls"]
+        failed, refused = self.trace["api_calls"]  # nothing on why the failure stopped: it had no answer
         self.assertEqual({k: failed[k] for k in ["finish_reason", "native_finish_reason", "id", "provider"]},
                          dict.fromkeys(["finish_reason", "native_finish_reason", "id", "provider"]))
         self.assertEqual((refused["finish_reason"], refused["native_finish_reason"], refused["id"],
@@ -212,34 +163,11 @@ class ReplyTests(_Case):
         self.assertNotIn("Secret", "".join(logs.output))
 
     async def test_an_odd_response_is_still_retried(self):
-        replies = iter([SimpleNamespace(status=502, json=AsyncMock(return_value={"choices": [None]})),
-                        SimpleNamespace(status=200, json=AsyncMock(return_value=["not", "a", "completion"])),
-                        SimpleNamespace(status=200, json=AsyncMock(return_value={
-                            "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop"}],
-                            "usage": {}}))])
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
-                patch.object(j.asyncio, "sleep", AsyncMock()):
+        with openrouter((502, {"choices": [None]}), (200, ["not", "a", "completion"]),
+                        (200, {"choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop"}], "usage": {}})):
             reply = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
         self.assertEqual(reply, "Is Biscuit.")
         self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, "stop"])
-
-    async def test_an_ordinary_ending_is_recorded_without_a_warning(self):
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
-            "id": "gen-synthetic-2", "provider": "Anthropic",
-            "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop",
-                         "native_finish_reason": "stop"}], "usage": {}}))
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
-                patch.object(j.log, "warning") as warning:
-            await j.llm("haiku", [{"role": "user", "content": "cat?"}])
-        call, = self.trace["api_calls"]
-        self.assertEqual((call["finish_reason"], call["provider"], call["id"]), ("stop", "Anthropic", "gen-synthetic-2"))
-        self.assertIsNone(j.stopped_early(call))
-        warning.assert_not_called()
 
     async def test_transcript_shows_the_local_time_when_the_minute_changes_and_a_line_per_day(self):
         j.model_name = "haiku"
@@ -314,38 +242,25 @@ class CreditTests(_Case):
     BUDGET = {"error": {"code": 403, "message": "Workspace budget exceeded",
                         "metadata": {"limit_source": "openrouter_workspace_budget", "limit_usd": 1, "spend_usd": 1}}}
 
-    def session(self, status, body):
-        response = SimpleNamespace(status=status, text=AsyncMock(return_value=json.dumps(body)),
-                                   json=AsyncMock(return_value=body))
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.return_value = response
-        return session
-
     async def test_a_spent_budget_or_credit_stops_without_retrying(self):
         for status, body in [(403, self.BUDGET), (402, {"error": {"code": 402, "message": "Insufficient credits"}}),
                              (402, "not json")]:
             for call in ("llm", "post"):
                 with self.subTest(status=status, body=body, call=call):
-                    session = self.session(status, body)
-                    with patch.object(j.aiohttp, "ClientSession", return_value=session), \
-                            patch.object(j, "set_credit", AsyncMock()) as set_credit, \
-                            patch.object(j.asyncio, "sleep", AsyncMock()):
+                    with openrouter((status, body)) as s:
                         if call == "llm":
                             self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "cat?"}]), "")
                         else:
-                            self.assertEqual(await j.post(session, "state", {"asked": {}}), {})
-                    self.assertEqual(session.post.call_count, 1)
-                    set_credit.assert_awaited_once_with(False)
+                            self.assertEqual(await j.post(s, "state", {"asked": {}}), {})
+                    self.assertEqual(s.post.call_count, 1)
+                    s.set_credit.assert_awaited_once_with(False)
 
     async def test_any_other_forbidden_is_retried(self):
         body = {"error": {"code": 403, "message": "Flagged", "metadata": {"reasons": ["synthetic"]}}}
-        session = self.session(403, body)
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), \
-                patch.object(j, "set_credit", AsyncMock()) as set_credit, patch.object(j.asyncio, "sleep", AsyncMock()):
+        with openrouter((403, body)) as s:
             await j.llm("haiku", [{"role": "user", "content": "cat?"}])
-        self.assertEqual(session.post.call_count, 3)
-        set_credit.assert_not_awaited()
+        self.assertEqual(s.post.call_count, 3)
+        s.set_credit.assert_not_awaited()
 
     async def test_credit_left_is_the_lowest_of_credit_key_limit_and_budget(self):
         for key, want in [({"limit_remaining": None}, 7.5), ({"limit_remaining": 4.0}, 4.0),
@@ -353,35 +268,29 @@ class CreditTests(_Case):
                           ({"limit_remaining": None, "effective_budget": None}, 7.5)]:
             with self.subTest(key=key):
                 replies = iter([{"data": {"total_credits": 10, "total_usage": 2.5}}, {"data": key}])
-                session = MagicMock()
-                session.__aenter__.return_value = session
-                session.get.return_value.__aenter__.side_effect = lambda: SimpleNamespace(
-                    json=AsyncMock(return_value=next(replies)))
-                with patch.object(j.aiohttp, "ClientSession", return_value=session):
+                s = session()
+                s.get.return_value.__aenter__.side_effect = lambda: SimpleNamespace(json=AsyncMock(return_value=next(replies)))
+                with patch.object(j.aiohttp, "ClientSession", return_value=s):
                     self.assertEqual(await j.credit_left(), want)
 
 
 class StatusTests(_Case):
     async def test_rejected_status_preserves_all_request_purposes_and_accepted_context(self):
         j.model_name = "haiku"
-        responses = []
-        for size, score in [(2_000, .1), (3_000, .9)]:
-            for data in [{"choices": [{"message": {"content": "I feel coffee is good."}}],
-                          "usage": {"prompt_tokens": size, "completion_tokens": 18, "cost": 0,
-                                    "is_byok": True, "cost_details": {"upstream_inference_cost": .0004}}},
-                         {"answers": {"acceptable": {"noul": score}}, "usage": {"cost": .00004}}]:
-                response = MagicMock()
-                response.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value=data))
-                responses.append(response)
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.side_effect = responses
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
+        replies = [(200, data) for size, score in [(2_000, .1), (3_000, .9)] for data in [
+            {"choices": [{"message": {"content": "I feel coffee is good."}}],
+             "usage": {"prompt_tokens": size, "completion_tokens": 18, "cost": 0, "is_byok": True,
+                       "prompt_tokens_details": {"cached_tokens": size - 500},
+                       "cost_details": {"upstream_inference_cost": .0004}}},
+            {"answers": {"acceptable": {"noul": score}}, "usage": {"cost": .00004}}]]
+        with openrouter(*replies):
             mood = await j.generate_filtered_status("Rocky", ["i", "feel"], "Moss: coffee")
         self.assertEqual(mood, "I feel coffee is good.")
         self.assertEqual([r["purpose"] for r in self.trace["api_calls"]],
                          ["status", "status_check", "status", "status_check"])
-        self.assertEqual(self.trace["llm_prompt_tokens"], 3_000)
+        # the accepted one's usage, and the cost of all of them
+        self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("Moss: coffee")))
+        self.assertEqual((self.trace["llm_cached_tokens"], self.trace["llm_completion_tokens"]), (2_500, 18))
         self.assertEqual(self.trace["requests"], 4)
         self.assertAlmostEqual(self.trace["cost"], .00088)
         self.assertAlmostEqual(self.trace["byok_cost"], .0008)
@@ -398,29 +307,6 @@ class StatusTests(_Case):
                 self.assertEqual(mood, want)
         self.assertIn("kettle: my cat knocked my tea over", self.trace["transcript"])
         self.assertEqual(self.trace["llm"], "haiku")
-
-    async def test_accepted_status_keeps_its_usage_and_sums_own_key_costs_across_retries(self):
-        j.model_name = "haiku"
-        sizes = iter([2_000, 3_000])
-        async def llm(name, messages):
-            size = next(sizes)
-            j.note(llm_window=1, llm_prompt_tokens=size, llm_prompt_chars=1,
-                   llm_cached_tokens=size - 500, llm_completion_tokens=18)
-            t = j.trace.get()
-            t["cost"] += .0004
-            t["byok_cost"] = t.get("byok_cost", 0) + .0004
-            t["requests"] += 1
-            return "I feel cat is tiny disaster."
-        with patch.object(j, "llm", llm), patch.object(j, "status_score", AsyncMock(side_effect=[0.1, 0.9])):
-            mood = await j.generate_filtered_status("rocky", ["i", "feel"], "kettle: cat")
-        self.assertEqual(mood, "I feel cat is tiny disaster.")
-        self.assertEqual(self.trace["llm"], "haiku")
-        self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("kettle: cat")))
-        self.assertEqual(self.trace["llm_cached_tokens"], 2_500)
-        self.assertEqual(self.trace["llm_completion_tokens"], 18)
-        self.assertAlmostEqual(self.trace["cost"], .0008)
-        self.assertAlmostEqual(self.trace["byok_cost"], .0008)
-        self.assertEqual(self.trace["requests"], 2)
 
 
 class WhyTests(_Case):

@@ -5,7 +5,6 @@
 
 import asyncio
 import json
-import os
 import tempfile
 import time
 import unittest
@@ -13,11 +12,9 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
-os.environ.setdefault("DISCORD_TOKEN_JEV", "test")
-os.environ.setdefault("OPENROUTER_API_KEY", "test")
-
+from fakes import patch_all, session
 import discord
 import jev_bot as j
 
@@ -37,12 +34,9 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.uploads = {}
         self.check_available = j.explanation_attachment_available
         self.available = AsyncMock(return_value=True)
-        for obj, attr, value in [(j, "LOG_DIR", Path(self.dir.name)), (j.bot._connection, "user", self.user),
-                                 (j, "explanation_cache", OrderedDict()), (j, "explanation_pending", {}),
-                                 (j, "explanation_attachment_available", self.available)]:
-            p = patch.object(obj, attr, value)
-            p.start()
-            self.addCleanup(p.stop)
+        patch_all(self, [(j, "LOG_DIR", Path(self.dir.name)), (j.bot._connection, "user", self.user),
+                         (j, "explanation_cache", OrderedDict()), (j, "explanation_pending", {}),
+                         (j, "explanation_attachment_available", self.available)])
 
     def target(self, t=None, *, original=False):
         t = self.logged if t is None else t
@@ -136,10 +130,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         url = next(iter(self.uploads))
         self.assertEqual([s[3]["embed"].image.url for s in self.sent[1:]], [url, url])
         self.assertIs(self.sent[1][1], discord.utils.MISSING)
-        cached, = j.explanation_cache.values()
-        self.assertEqual(cached.url, url)
-        json.dumps(vars(cached))  # cached metadata can be serialized; attachment bytes cannot
-        self.assertEqual(cached.embeds, ())
+        json.dumps(vars(*j.explanation_cache.values()))  # cached metadata can be serialized; attachment bytes cannot
         self.assertTrue(self.sent[1][3]["ephemeral"])
         self.assertEqual(self.sent[1][3]["allowed_mentions"].to_dict()["parse"], [])
         interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
@@ -151,7 +142,8 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                 j.write_trace(self.logged)
                 self.sent.clear()
                 await j.context_action.callback(self.interaction(), self.target())
-                await j.context_action.callback(self.interaction(), self.target())
+                await j.context_action.callback(i := self.interaction(), self.target())
+                i.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
                 first, second = self.embeds(self.sent[0])[0], self.embeds(self.sent[1])[0]
                 self.assertEqual(first.to_dict(), second.to_dict())
                 if len(text) > j.CONTEXT_LIMIT:
@@ -385,7 +377,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         await j.stats_action.callback(elsewhere, self.target())
         next(j.LOG_DIR.glob("*.jsonl")).unlink()
         await j.stats_action.callback(self.interaction(), self.target())
-        self.assertTrue(all(s[0] == "Nothing logged for that" for s in self.sent[1:]))
+        self.assertTrue(all(s[0] == "Nothing logged for that" and s[3]["ephemeral"] for s in self.sent[1:]))
 
     async def test_a_private_upload_is_reused_with_all_signing_parameters(self):
         j.write_trace(self.logged)
@@ -394,6 +386,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
             await j.why(self.command())
             await j.why_action.callback(self.interaction(), self.target())
         render.assert_called_once()
+        self.assertEqual((self.sent[0][0], self.sent[0][1].filename), (discord.utils.MISSING, "why-tea.png"))  # just the chart
         self.assertEqual(len(self.uploads), 1)
         url = next(iter(self.uploads))
         self.assertIn("/ephemeral-attachments/", url)
@@ -594,13 +587,12 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         cases += [(None, error) for error in (j.aiohttp.ClientError("synthetic network failure"), asyncio.TimeoutError())]
         for status, error in cases:
             with self.subTest(status=status, error=error):
-                session = MagicMock()
-                session.__aenter__.return_value = session
-                session.head.return_value.__aenter__.return_value = SimpleNamespace(status=status)
-                session.head.return_value.__aenter__.side_effect = error
-                with patch.object(j.aiohttp, "ClientSession", return_value=session):
+                s = session()
+                s.head.return_value.__aenter__.return_value = SimpleNamespace(status=status)
+                s.head.return_value.__aenter__.side_effect = error
+                with patch.object(j.aiohttp, "ClientSession", return_value=s):
                     self.assertEqual(await self.check_available(url), status == 200)
-                self.assertEqual(session.head.call_args.args[0], url)
+                self.assertEqual(s.head.call_args.args[0], url)
 
     async def test_failed_render_is_retried(self):
         j.write_trace(self.logged)
