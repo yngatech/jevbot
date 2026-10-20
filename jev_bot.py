@@ -741,7 +741,7 @@ async def generate_filtered_status(bot_name, start, chat=""):
             if attempt["accepted"]:
                 # Diagnostics use the accepted generation, while the full retry history stays local.
                 if parent is not None:
-                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model", "llm_tokens",
+                    parent.update({k: attempt[k] for k in ("transcript", "steps", "stop", "llm", "llm_model",
                                                            "llm_window", "llm_prompt_tokens", "llm_completion_tokens",
                                                            "llm_cached_tokens", "llm_prompt_chars", "llm_chat_chars")
                                    if k in attempt})
@@ -763,33 +763,17 @@ async def generate_filtered_status(bot_name, start, chat=""):
 
 # Instead of Jev, an ordinary LLM can write the replies and statuses, told to talk like Rocky, the Eridian engineer
 # from Project Hail Mary who the bot is named after — !model switches. Jev still decides between replying and
-# reacting, and picks the emoji. Tried on jev_eval's conversations: DeepSeek V4 Pro gave the best Rocky ("Is called
-# Biscuit. Small predator, no respect for hot liquid.") for ~$0.0005 a reply, against Jev's ~$0.014.
+# reacting, and picks the emoji.
 #   shuffle: the example lines in a fresh order every call — Claude ignores temperature, so the same chat got the same
-#     reply word for word; DeepSeek is prompt-cached, which a shuffle would break (4.7× the cost)
+#     reply word for word
 #   question_dice: the chance a reply may end a question with ", question?" — a model can't count how often it said
 #     it, and Haiku put it on 40 of 46 replies even when told to only use it for real questions
 #   tail: said at the end of the request, where Claude heeds it — in the system prompt, Haiku still wrote 16 words
-#   logprobs: ask for each token's top alternatives, for !why — only some of a model's providers give them
-#   providers: OpenRouter's providers to try, in order (others only on the last try, llm) — a model's prompt cache is the
-#     provider's, so sent to whichever OpenRouter picked, DeepSeek never hit one: 0.36-0.91¢ a reply on a 7.8K-token
-#     chat. Of the providers taking all of its parameters (Parasail, Cloudflare, Novita), Parasail is the cheapest, and
-#     a repeat read 7.7K of it from the cache for 0.085¢. StreamLake would be 0.026¢, but has no frequency_penalty.
 #   window: its context length on OpenRouter, in tokens, for Context's usage
 LLM_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLMS = {
-    "deepseek": {"id": "deepseek/deepseek-v4-pro", "logprobs": True, "window": 1_048_576,
-                 "providers": ["parasail"]},
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
               "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000},
-    "kimi": {"id": "moonshotai/kimi-k2-0905", "window": 262_144},
-    # Newer ones to try live against the two above. On jev_eval's chats V4.1 Flash wrote as good a Rocky as Pro ("Is
-    # thief with paper.") for a fraction of the price; K3 had the best lines but drifts longer and into space talk.
-    # Both pinned to the cheapest provider taking all their parameters: Wafer for Flash (DeepSeek's own is barred by
-    # the account's no-training setting); Morph for K3, the same price cached or not, where others charge
-    # 2.55-3.00 $/M uncached.
-    "flash": {"id": "deepseek/deepseek-v4.1-flash", "logprobs": True, "window": 1_048_576, "providers": ["wafer"]},
-    "k3": {"id": "moonshotai/kimi-k3", "logprobs": True, "window": 1_048_576, "providers": ["morph"]},
 }
 # Haiku as Rocky itself, in the channels in LONG_CHAT_CHANNELS: the channel as its conversation, with tools to react
 # and remember (rocky_harness). Elsewhere it writes like haiku. cache_marks: mark where its log's cache ends — Claude
@@ -798,8 +782,7 @@ LLMS["rocky"] = LLMS["haiku"] | {"harness": True, "cache_marks": True}
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
 LLM_FREQUENCY_PENALTY = 0.5
-LLM_TOP_LOGPROBS = 5
-LLM_ATTEMPTS = 2                # tries for a reply that isn't empty (Kimi sometimes says nothing)
+LLM_ATTEMPTS = 2                # tries for a reply that isn't empty
 # Real lines of Rocky's from the book and film, one per line ("#" comments), shown to the LLM as examples. Gitignored:
 # they're quotes from copyrighted works, so they stay out of this public repo. Without the file it goes by the rules.
 ROCKY_LINES_PATH = Path(__file__).parent / "rocky_lines.txt"
@@ -840,35 +823,16 @@ def clean_llm(text, bot_name):
     text = re.sub(rf"^{re.escape(bot_name)}:\s*", "", (text or "").strip(), flags=re.I)
     return text.split(f"\n{bot_name}:")[0].split("\n\n")[0].strip().strip('"').strip()
 
-# The LLM's answer to messages, and its tokens with their top alternatives ([{"token", "p", "top": [[token, p]]}])
-# when the model gives them. Costs go on the trace like Jev's.
-# A response's logprobs as [{"token", "p", "top": [[token, p]]}]. Some providers give a token the previous one's
-# alternatives again ("ers" with "isk"'s list, after "Wh" "isk") — those show only the token itself. The end of the
-# reply comes as a token too ("<｜end▁of▁sentence｜>"), and isn't something rocky said.
-END_TOKEN = re.compile(r"<[^<>\s]*end[^<>\s]*>", re.IGNORECASE)
-
-def llm_tokens(content):
-    tokens = []
-    for x in content or []:
-        top = [[y["token"], round(math.exp(y["logprob"]), 4)] for y in x.get("top_logprobs", [])]
-        if tokens and x["token"] not in dict(top) and [w for w, _ in top] == [w for w, _ in tokens[-1]["top"]]:
-            top = []
-        tokens.append({"token": x["token"], "p": round(math.exp(x["logprob"]), 4), "top": top})
-    while tokens and END_TOKEN.fullmatch(tokens[-1]["token"]):
-        tokens.pop()
-    return tokens
-
 def text_of(content):  # a message's content: a string, a list of blocks, or nothing (a tool call's turn)
     return content if isinstance(content, str) else "".join(b.get("text", "") for b in content or [])
 
+# The LLM's answer to messages. Costs go on the trace like Jev's.
 async def llm(name, messages, max_tokens=LLM_MAX_TOKENS):
     message = await llm_message(name, messages, max_tokens)
-    if message is None:
-        return "", []
-    return message.get("content") or "", llm_tokens((message.get("logprobs") or {}).get("content"))
+    return (message or {}).get("content") or ""
 
-# A request and its whole answer: the message, with its tool calls and reasoning if there are any, and its logprobs
-# (as "logprobs") — or None if there was none. tools and reasoning: as OpenRouter takes them, for rocky_harness.
+# A request and its whole answer: the message, with its tool calls and reasoning if there are any — or None if there
+# was none. tools and reasoning: as OpenRouter takes them, for rocky_harness.
 async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, reasoning=None):
     spec = LLMS[name]
     body = {"model": spec["id"], "messages": messages, "max_tokens": max_tokens, "temperature": LLM_TEMPERATURE,
@@ -876,22 +840,11 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
             "usage": {"include": True}}
     if tools:
         body["tools"] = tools
-    if spec.get("logprobs"):
-        # Only to providers that give them — some of DeepSeek's don't
-        body |= {"logprobs": True, "top_logprobs": LLM_TOP_LOGPROBS, "provider": {"require_parameters": True}}
-    if providers := spec.get("providers"):
-        body["provider"] = body.get("provider", {}) | {"order": providers}
     async with aiohttp.ClientSession(headers=HEADERS) as session:
         for attempt in range(3):
-            request = body
-            if providers:
-                # A pinned provider that's rate-limited or failing is tried again rather than left for another, which
-                # doesn't have its prompt cache: Parasail's rate limits sent DeepSeek replies to Cloudflare at full
-                # price. Only the last try lets OpenRouter go elsewhere, so a reply still comes.
-                request = body | {"provider": body["provider"] | {"allow_fallbacks": attempt == 2}}
             status, usage, data = "error", None, None
             try:
-                async with session.post(LLM_URL, json=request, timeout=aiohttp.ClientTimeout(total=60)) as r:
+                async with session.post(LLM_URL, json=body, timeout=aiohttp.ClientTimeout(total=60)) as r:
                     status = r.status
                     if r.status in (402, 403) and out_of_credit(r.status, text := await r.text()):
                         log.warning(f"LLM {r.status}: {text[:300]}")
@@ -936,7 +889,7 @@ async def llm_message(name, messages, max_tokens=LLM_MAX_TOKENS, tools=None, rea
             if choice.get("finish_reason") == "length" and tools:  # its tool calls are cut off where it stopped
                 log.warning(f"LLM {name} ran out of tokens with tools: {str(choice['message'])[:300]}")
                 note(llm_cut_off=True)
-            return choice["message"] | ({"logprobs": choice["logprobs"]} if choice.get("logprobs") else {})
+            return choice["message"]
     return None
 
 # name: one of LLMS — passed in, since !model can switch while a reply is being written
@@ -957,10 +910,7 @@ async def llm_reply(name, message, author, bot_name, history=None, at=None):
     messages = [{"role": "system", "content": system}, {"role": "user", "content": blocks}]
     for attempt in range(LLM_ATTEMPTS):
         note(llm_attempts=attempt + 1)
-        text, tokens = await llm(name, messages)
-        if reply := clean_llm(text, bot_name):
-            if tokens:
-                note(llm_tokens=tokens)
+        if reply := clean_llm(await llm(name, messages), bot_name):
             log.info(f"  {name}: {reply}")
             return reply
         if has_credit is False:
@@ -972,13 +922,11 @@ async def llm_status(name, bot_name, start, chat=""):
     opener = render(start)
     ask = (f"Recent chat in the server:\n{chat}\n\n" if chat else "") + LLM_STATUS.format(bot=bot_name, start=opener)
     note(transcript=ask, llm=name, llm_model=spec["id"], llm_chat_chars=len(chat))
-    text, tokens = await llm(name, [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
-                              {"role": "user", "content": ask}])
+    text = await llm(name, [{"role": "system", "content": rocky_prompt(bot_name, spec.get("shuffle"))},
+                            {"role": "user", "content": ask}])
     mood = " ".join(clean_llm(text, bot_name).split())  # one line
     if not mood:
         return None
-    if tokens:
-        note(llm_tokens=tokens)
     if not mood.lower().startswith(opener.lower()):
         mood = f"{opener} {mood[0].lower()}{mood[1:]}"
     return mood[:128]  # Discord's custom status limit
@@ -1864,19 +1812,6 @@ def why_panels(t):
             words.append(s["word"])
     return panels
 
-# One why_chart panel per token an LLM wrote (the first WHY_TOKENS), with the alternatives it gave, likeliest first
-WHY_TOKENS = 24
-
-def llm_why_panels(tokens):
-    panels, so_far = [], ""
-    for t in tokens[:WHY_TOKENS]:
-        top = dict(t["top"])
-        top.setdefault(t["token"], t["p"])  # sampled from outside its top few
-        rows = sorted(([w, p, p] for w, p in top.items()), key=lambda r: -r[1])
-        panels.append({"so_far": so_far, "picked": t["token"], "ends": False, "pooled": [], "rows": rows})
-        so_far += t["token"]
-    return panels
-
 # The message a command is a Discord reply to: None if it isn't a reply, False (having said so) if it can't be seen
 async def command_target(m):
     if not (m.reference and m.reference.message_id):
@@ -2056,18 +1991,9 @@ def jev_reacted(t):
 # Prepared content, attachment bytes and filename, without any Discord objects tied to a particular send.
 async def why_response(t, guild, bot_name):
     if t.get("llm") and t.get("reply"):
-        if not t.get("llm_tokens"):
-            log.info(f"[WHY] no tokens from {t['llm']}")
-            return (f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
-                    " — Context shows what it saw", None, None)
-        said = t.get("reply") or t.get("status") or ""
-        n = len(t["llm_tokens"])
-        model = t.get("llm_model") or LLMS.get(t["llm"], {}).get("id", t["llm"])  # from before llm_model was logged
-        note = f"Model: {model}" + (f" — its first {WHY_TOKENS} of {n} tokens" if n > WHY_TOKENS else "")
-        png = await asyncio.to_thread(why_chart.render, bot_name, said, llm_why_panels(t["llm_tokens"]), note=note,
-                                      tokens=True)
-        log.info(f"[WHY] token chart for {said!r}")
-        return None, png, why_filename(said)
+        log.info(f"[WHY] no chart for {t['llm']}")
+        return (f"{t['llm']} doesn't say how likely its words were, so there's nothing to chart"
+                " — Context shows what it saw", None, None)
     elif t.get("steps"):
         said = t.get("reply") or t.get("status") or ""
         png = await asyncio.to_thread(why_chart.render, bot_name, said, why_panels(t), note=asked_note(t, bot_name))

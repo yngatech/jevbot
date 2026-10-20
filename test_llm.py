@@ -17,9 +17,6 @@ os.environ.setdefault("OPENROUTER_API_KEY", "test")
 
 import jev_bot as j  # noqa: E402
 
-TOKENS = [{"token": "Is", "p": 0.6, "top": [["Is", 0.6], ["Biscuit", 0.3]]},
-          {"token": " called", "p": 0.02, "top": [[" Biscuit", 0.9], [" cat", 0.05]]}]
-
 
 class _Case(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -50,14 +47,14 @@ class ModelCommandTests(_Case):
                                mentions=[], role_mentions=[], reference=None, reply=AsyncMock())
 
     def test_command_takes_model_with_or_without_a_name(self):
-        for content, want in [("!model", "!model"), ("!model deepseek", "!model"), ("!MODEL Haiku", "!model"),
-                              ("!model deepseek please", None), ("!why", "!why"), ("!why now", None),
+        for content, want in [("!model", "!model"), ("!model haiku", "!model"), ("!MODEL Haiku", "!model"),
+                              ("!model haiku please", None), ("!why", "!why"), ("!why now", None),
                               ("what model are you", None)]:
             with self.subTest(content=content):
                 self.assertEqual(j.command(self.message(content)), want)
 
     async def test_on_message_routes_model_without_answering(self):
-        m = self.message("!model kimi")
+        m = self.message("!model haiku")
         with patch.object(j, "DM_USERS", {500}), patch.object(j, "model_command", new_callable=AsyncMock) as cmd, \
                 patch.object(j, "respond", new_callable=AsyncMock) as respond:
             await j.on_message(m)
@@ -65,20 +62,20 @@ class ModelCommandTests(_Case):
         respond.assert_not_awaited()
 
     async def test_switching_is_kept_and_unknown_names_change_nothing(self):
-        m = self.message("!model deepseek")
+        m = self.message("!model haiku")
         await j.model_command(m)
-        self.assertEqual(j.model_name, "deepseek")
-        self.assertEqual(j.load_model(), "deepseek")  # what a restart would pick up
-        self.assertIn("Now writing with **deepseek** (deepseek/deepseek-v4-pro)", m.reply.call_args.args[0])
+        self.assertEqual(j.model_name, "haiku")
+        self.assertEqual(j.load_model(), "haiku")  # what a restart would pick up
+        self.assertIn("Now writing with **haiku** (anthropic/claude-haiku-5.5)", m.reply.call_args.args[0])
 
         m = self.message("!model gpt9")
         await j.model_command(m)
-        self.assertEqual(j.model_name, "deepseek")
+        self.assertEqual(j.model_name, "haiku")
         self.assertIn("No model called 'gpt9'", m.reply.call_args.args[0])
 
         m = self.message("!model")
         await j.model_command(m)
-        self.assertIn("Writing with **deepseek**", m.reply.call_args.args[0])
+        self.assertIn("Writing with **haiku**", m.reply.call_args.args[0])
 
     def test_unknown_or_unreadable_saved_model_falls_back_to_jev(self):
         for saved in ['{"model": "gpt9"}', "not json"]:
@@ -113,25 +110,25 @@ class ReplyTests(_Case):
         self.assertAlmostEqual(self.trace["cost"], .000658)
 
     async def test_reply_goes_to_the_chosen_model_and_is_cleaned(self):
-        j.model_name = "deepseek"
-        llm = AsyncMock(return_value=('rocky: "Is called Biscuit. Small predator."\nrocky: more', TOKENS))
+        j.model_name = "haiku"
+        llm = AsyncMock(return_value='rocky: "Is called Biscuit. Small predator."\nrocky: more')
         with patch.object(j, "llm", llm), patch.object(j, "loom", new_callable=AsyncMock) as loom:
             r = await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
         self.assertEqual(r, "Is called Biscuit. Small predator.")
         loom.assert_not_awaited()
         name, messages = llm.call_args.args
-        self.assertEqual(name, "deepseek")
+        self.assertEqual(name, "haiku")
         self.assertIn("talk like Rocky", messages[0]["content"])
         self.assertRegex(messages[1]["content"],
                          r"^The chat so far, times in UTC:\n\n--- \w+ \d+ \w+\n\d\d:\d\d kettle: what's my cat called\?\n\n")
         self.assertNotIn("rocky: \n", messages[1]["content"])  # its empty turn is asked for, not shown
         self.assertIn("Write rocky's reply to kettle's last message.", messages[1]["content"])  # who it answers
-        self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
-        self.assertEqual(self.trace["llm_model"], "deepseek/deepseek-v4-pro")
+        self.assertEqual(self.trace["llm"], "haiku")
+        self.assertEqual(self.trace["llm_model"], "anthropic/claude-haiku-5.5")
         self.assertIn("kettle: what's my cat called?", self.trace["transcript"])  # for Context
 
     async def test_reply_logs_the_prompt_size_for_context(self):
-        j.model_name = "kimi"
+        j.model_name = "haiku"
         session = MagicMock()
         session.__aenter__.return_value = session
         session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
@@ -141,7 +138,7 @@ class ReplyTests(_Case):
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
             await j.generate_reply("what's my cat called?", "kettle", "rocky", history=[])
         messages = session.post.call_args.kwargs["json"]["messages"]
-        self.assertEqual(self.trace["llm_window"], 262_144)
+        self.assertEqual(self.trace["llm_window"], 1_000_000)
         self.assertEqual(self.trace["llm_prompt_tokens"], 3_100)
         self.assertEqual(self.trace["llm_completion_tokens"], 18)
         self.assertEqual(self.trace["llm_cached_tokens"], 2_900)
@@ -172,28 +169,18 @@ class ReplyTests(_Case):
                 self.assertEqual(request["is_byok"], bool(byok))
                 self.assertAlmostEqual(request["router_cost"] + request["key_cost"], cost)
 
-    async def test_a_rate_limited_pinned_provider_is_tried_again_before_any_other(self):
-        sent = []
+    async def test_a_rate_limited_request_is_tried_again(self):
         replies = iter([SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
                         SimpleNamespace(status=429, json=AsyncMock(return_value={"error": {"code": 429}})),
                         SimpleNamespace(status=200, json=AsyncMock(return_value={
                             "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))])
         session = MagicMock()
         session.__aenter__.return_value = session
-
-        def post(url, json, **kwargs):
-            sent.append(json["provider"])
-            response = MagicMock()
-            response.__aenter__.return_value = next(replies)
-            return response
-
-        session.post.side_effect = post
+        session.post.return_value.__aenter__.side_effect = lambda: next(replies)
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
                 patch.object(j.asyncio, "sleep", AsyncMock()):
-            text, _ = await j.llm("deepseek", [{"role": "user", "content": "cat?"}])
+            text = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
         self.assertEqual(text, "Is Biscuit.")
-        self.assertEqual([p.get("allow_fallbacks") for p in sent], [False, False, True])
-        self.assertTrue(all(p["order"] == ["parasail"] and p["require_parameters"] for p in sent))
         self.assertEqual([r["status"] for r in self.trace["api_calls"]], [429, 429, 200])
         self.assertEqual([r["attempt"] for r in self.trace["api_calls"]], [0, 1, 2])
         self.assertTrue(all(r["router_cost"] is None for r in self.trace["api_calls"]))
@@ -235,7 +222,7 @@ class ReplyTests(_Case):
         session.post.return_value.__aenter__.side_effect = lambda: next(replies)
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
                 patch.object(j.asyncio, "sleep", AsyncMock()):
-            reply, _ = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
+            reply = await j.llm("haiku", [{"role": "user", "content": "cat?"}])
         self.assertEqual(reply, "Is Biscuit.")
         self.assertEqual([r["finish_reason"] for r in self.trace["api_calls"]], [None, None, "stop"])
 
@@ -243,30 +230,19 @@ class ReplyTests(_Case):
         session = MagicMock()
         session.__aenter__.return_value = session
         session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
-            "id": "gen-synthetic-2", "provider": "Parasail",
+            "id": "gen-synthetic-2", "provider": "Anthropic",
             "choices": [{"message": {"content": "Is Biscuit."}, "finish_reason": "stop",
                          "native_finish_reason": "stop"}], "usage": {}}))
         with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()), \
                 patch.object(j.log, "warning") as warning:
-            await j.llm("deepseek", [{"role": "user", "content": "cat?"}])
+            await j.llm("haiku", [{"role": "user", "content": "cat?"}])
         call, = self.trace["api_calls"]
-        self.assertEqual((call["finish_reason"], call["provider"], call["id"]), ("stop", "Parasail", "gen-synthetic-2"))
+        self.assertEqual((call["finish_reason"], call["provider"], call["id"]), ("stop", "Anthropic", "gen-synthetic-2"))
         self.assertIsNone(j.stopped_early(call))
         warning.assert_not_called()
 
-    async def test_deepseek_goes_to_its_pinned_providers_with_logprobs(self):
-        session = MagicMock()
-        session.__aenter__.return_value = session
-        session.post.return_value.__aenter__.return_value = SimpleNamespace(status=200, json=AsyncMock(return_value={
-            "choices": [{"message": {"content": "Is Biscuit."}}], "usage": {"prompt_tokens": 10}}))
-        with patch.object(j.aiohttp, "ClientSession", return_value=session), patch.object(j, "set_credit", AsyncMock()):
-            for name, provider in [("deepseek", {"require_parameters": True, "order": ["parasail"], "allow_fallbacks": False}),
-                                   ("kimi", None)]:
-                await j.llm(name, [{"role": "user", "content": "cat?"}])
-                self.assertEqual(session.post.call_args.kwargs["json"].get("provider"), provider)
-
     async def test_transcript_shows_the_local_time_when_the_minute_changes_and_a_line_per_day(self):
-        j.model_name = "deepseek"
+        j.model_name = "haiku"
         utc = j.timezone.utc
         history = [{"role": "user", "name": "pip", "content": "night all", "to_bot": False,
                     "at": j.datetime(2026, 10, 9, 22, 50, tzinfo=utc)},
@@ -275,7 +251,7 @@ class ReplyTests(_Case):
                    {"role": "user", "name": "kettle", "content": "nice", "at": j.datetime(2026, 10, 9, 22, 59, tzinfo=utc)},
                    {"role": "user", "name": "pip", "content": "old reply", "at": j.datetime(2026, 10, 9, 23, 30, tzinfo=utc),
                     "reply": "No time on this one."}]
-        llm = AsyncMock(return_value=("Is morning. Go.", []))
+        llm = AsyncMock(return_value="Is morning. Go.")
         with patch.object(j, "llm", llm), patch.object(j, "TIMEZONE", j.ZoneInfo("Europe/London")):
             await j.generate_reply("morning", "kettle", "rocky", history=history,
                                    at=j.datetime(2026, 10, 10, 7, 5, tzinfo=utc))
@@ -299,22 +275,22 @@ class ReplyTests(_Case):
         llm.assert_not_awaited()
 
     async def test_switching_mid_reply_finishes_with_the_model_it_started_with(self):
-        j.model_name = "kimi"
+        j.model_name = "haiku"
 
         async def answer(name, messages):
             j.model_name = "jev"  # !model jev arrives while the request is out
-            return "First empty", []
+            return "First empty"
 
         with patch.object(j, "llm", side_effect=answer) as llm:
             await j.generate_reply("hi", "pip", "rocky", history=[])
-        self.assertEqual(llm.call_args.args[0], "kimi")
+        self.assertEqual(llm.call_args.args[0], "haiku")
 
     async def test_empty_answer_is_retried_then_gives_up_with_dots(self):
-        j.model_name = "kimi"
-        llm = AsyncMock(side_effect=[("", []), ("Hello friend.", [])])
+        j.model_name = "haiku"
+        llm = AsyncMock(side_effect=["", "Hello friend."])
         with patch.object(j, "llm", llm):
             self.assertEqual(await j.generate_reply("hi", "pip", "rocky", history=[]), "Hello friend.")
-        llm = AsyncMock(return_value=("  ", []))
+        llm = AsyncMock(return_value="  ")
         with patch.object(j, "llm", llm):
             self.assertEqual(await j.generate_reply("hi", "pip", "rocky", history=[]), "...")
         self.assertEqual(llm.await_count, j.LLM_ATTEMPTS)
@@ -324,7 +300,7 @@ class ReplyTests(_Case):
         for roll, tagless in [(0.1, False), (0.9, True)]:
             with self.subTest(roll=roll), patch.object(j.random, "random", return_value=roll), \
                     patch.object(j, "rocky_prompt", return_value="voice") as prompt, \
-                    patch.object(j, "llm", AsyncMock(return_value=("Biscuit.", []))) as llm:
+                    patch.object(j, "llm", AsyncMock(return_value="Biscuit.")) as llm:
                 await j.generate_reply("cat?", "kettle", "rocky", history=[])
             ask = llm.call_args.args[1][1]["content"]
             self.assertIn("one short sentence at most", ask)
@@ -356,7 +332,7 @@ class CreditTests(_Case):
                             patch.object(j, "set_credit", AsyncMock()) as set_credit, \
                             patch.object(j.asyncio, "sleep", AsyncMock()):
                         if call == "llm":
-                            self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "cat?"}]), ("", []))
+                            self.assertEqual(await j.llm("haiku", [{"role": "user", "content": "cat?"}]), "")
                         else:
                             self.assertEqual(await j.post(session, "state", {"asked": {}}), {})
                     self.assertEqual(session.post.call_count, 1)
@@ -411,20 +387,20 @@ class StatusTests(_Case):
         self.assertAlmostEqual(self.trace["byok_cost"], .0008)
 
     async def test_status_keeps_its_opener_on_one_line(self):
-        j.model_name = "deepseek"
+        j.model_name = "haiku"
         for answer, want in [("I wonder if sleep is same\nwhen no one watches.", "I wonder if sleep is same when no one watches."),
                              ("Why cat knock tea, question?", "I wonder why cat knock tea, question?"),
                              ("I wonder " + "very " * 40, None)]:
-            with self.subTest(answer=answer), patch.object(j, "llm", AsyncMock(return_value=(answer, TOKENS))):
+            with self.subTest(answer=answer), patch.object(j, "llm", AsyncMock(return_value=answer)):
                 mood = await j.generate_status("rocky", ["i", "wonder"], "kettle: my cat knocked my tea over")
             self.assertLessEqual(len(mood), 128)
             if want:
                 self.assertEqual(mood, want)
         self.assertIn("kettle: my cat knocked my tea over", self.trace["transcript"])
-        self.assertEqual(self.trace["llm"], "deepseek")
+        self.assertEqual(self.trace["llm"], "haiku")
 
     async def test_accepted_status_keeps_its_usage_and_sums_own_key_costs_across_retries(self):
-        j.model_name = "deepseek"
+        j.model_name = "haiku"
         sizes = iter([2_000, 3_000])
         async def llm(name, messages):
             size = next(sizes)
@@ -434,11 +410,11 @@ class StatusTests(_Case):
             t["cost"] += .0004
             t["byok_cost"] = t.get("byok_cost", 0) + .0004
             t["requests"] += 1
-            return "I feel cat is tiny disaster.", TOKENS
+            return "I feel cat is tiny disaster."
         with patch.object(j, "llm", llm), patch.object(j, "status_score", AsyncMock(side_effect=[0.1, 0.9])):
             mood = await j.generate_filtered_status("rocky", ["i", "feel"], "kettle: cat")
         self.assertEqual(mood, "I feel cat is tiny disaster.")
-        self.assertEqual((self.trace["llm"], self.trace["llm_tokens"]), ("deepseek", TOKENS))
+        self.assertEqual(self.trace["llm"], "haiku")
         self.assertEqual((self.trace["llm_prompt_tokens"], self.trace["llm_chat_chars"]), (3_000, len("kettle: cat")))
         self.assertEqual(self.trace["llm_cached_tokens"], 2_500)
         self.assertEqual(self.trace["llm_completion_tokens"], 18)
@@ -448,50 +424,14 @@ class StatusTests(_Case):
 
 
 class WhyTests(_Case):
-    def test_panels_add_a_token_sampled_from_outside_its_top_few(self):
-        first, second = j.llm_why_panels(TOKENS)
-        self.assertEqual((first["picked"], first["so_far"], first["rows"][0]), ("Is", "", ["Is", 0.6, 0.6]))
-        self.assertEqual((second["so_far"], second["picked"]), ("Is", " called"))
-        self.assertEqual([r[0] for r in second["rows"]], [" Biscuit", " cat", " called"])
-
-    async def test_why_charts_tokens_or_says_there_are_none(self):
+    async def test_why_says_an_llm_reply_has_nothing_to_chart(self):
         m = SimpleNamespace(channel=SimpleNamespace(id=300), guild=None,
                             reply=AsyncMock(return_value=SimpleNamespace(attachments=[])), reference=None)
-        logged = {"llm": "kimi", "reply": "Biscuit", "bot_name": "rocky"}
+        logged = {"llm": "haiku", "reply": "Biscuit", "bot_name": "rocky"}
         with patch.object(j, "find_trace", return_value=logged), patch.object(j.why_chart, "render") as render:
             await j.why(m)
         render.assert_not_called()
-        self.assertIn("kimi doesn't say how likely its words were", m.reply.call_args.args[0])
-
-        logged = {"llm": "deepseek", "reply": "Is called", "bot_name": "rocky", "llm_tokens": TOKENS}
-        with patch.object(j, "find_trace", return_value=logged), \
-                patch.object(j.why_chart, "render", return_value=b"png") as render:
-            await j.why(m)
-        self.assertTrue(render.call_args.kwargs["tokens"])
-        self.assertEqual(len(render.call_args.args[2]), 2)
-        self.assertEqual(render.call_args.kwargs["note"], "Model: deepseek/deepseek-v4-pro")  # logged before llm_model
-        self.assertEqual(m.reply.call_args.kwargs["file"].filename, "why-is-called.png")
-
-        logged["llm_model"] = "deepseek/deepseek-v4-flash"
-        with patch.object(j, "find_trace", return_value=logged), \
-                patch.object(j.why_chart, "render", return_value=b"png") as render:
-            await j.why(m)
-        self.assertEqual(render.call_args.kwargs["note"], "Model: deepseek/deepseek-v4-flash")
-
-    def test_repeated_alternatives_and_the_end_token_are_dropped(self):
-        lp = lambda p: __import__("math").log(p)
-        raw = [{"token": "Wh", "logprob": lp(0.94), "top_logprobs": [{"token": "Wh", "logprob": lp(0.94)},
-                                                                   {"token": "M", "logprob": lp(0.02)}]},
-               {"token": "isk", "logprob": lp(0.9), "top_logprobs": [{"token": "isk", "logprob": lp(0.9)},
-                                                                    {"token": "is", "logprob": lp(0.06)}]},
-               {"token": "ers", "logprob": lp(0.99), "top_logprobs": [{"token": "isk", "logprob": lp(0.9)},
-                                                                     {"token": "is", "logprob": lp(0.06)}]},
-               {"token": "<｜end▁of▁sentence｜>", "logprob": lp(0.5), "top_logprobs": []}]
-        tokens = j.llm_tokens(raw)
-        self.assertEqual([t["token"] for t in tokens], ["Wh", "isk", "ers"])
-        self.assertEqual(tokens[1]["top"], [["isk", 0.9], ["is", 0.06]])
-        self.assertEqual(tokens[2]["top"], [])
-        self.assertEqual(j.llm_why_panels(tokens)[2]["rows"], [["ers", 0.99, 0.99]])
+        self.assertIn("haiku doesn't say how likely its words were", m.reply.call_args.args[0])
 
     def test_chart_files_are_named_after_what_they_show(self):
         self.assertEqual(j.why_filename("Day good. Rain make race more interesting."), "why-day-good-rain-make-race-more.png")
