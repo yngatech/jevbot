@@ -39,6 +39,7 @@ def bind(bot_module):
     j = bot_module
 
 LOG_TOKENS = 90_000         # a log's size before its oldest half goes — under Haiku's 100K price step; set in /settings
+MAX_LOG_TOKENS = 90_000     # the most /settings allows: past 100K, Haiku charges 5× for the whole prompt
 CHARS_PER_TOKEN = 2.2       # Haiku's, in our chat — a log is measured in characters, LOG_TOKENS turned into them
 MAX_TOKENS = 8000           # its thinking, its message and its tool calls, only to stop a runaway: live, ≤300 a request
 FOLLOW_UPS = 4              # requests after one with nothing to say yet, for what it then says — at the bar it has

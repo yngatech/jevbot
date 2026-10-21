@@ -993,7 +993,7 @@ async def is_admin(user):
 # Settings admins can change with /settings, over the defaults above, kept in SETTINGS_PATH (gitignored) so a restart keeps
 # them: how often there's a new status, and Rocky's context window — how much of its log of a channel it keeps.
 SETTINGS_PATH = Path(__file__).parent / "settings.json"
-SETTING_RANGES = {"STATUS_EVERY": (15, 7 * 24 * 60), "LOG_TOKENS": (10_000, 500_000)}
+SETTING_RANGES = {"STATUS_EVERY": (15, 7 * 24 * 60), "LOG_TOKENS": (10_000, rh.MAX_LOG_TOKENS)}
 saved_settings: dict[str, int] = {}  # only those /settings has changed
 
 def setting(key):
@@ -2252,7 +2252,7 @@ async def diagnostics_action(interaction: discord.Interaction, target: discord.M
 # each menu can have its name above it instead of in every option.
 SETTINGS_TIMEOUT = 15 * 60  # seconds
 STATUS_CHOICES = [0, 60, 120, 180, 360, 720, 1440]  # minutes
-CONTEXT_CHOICES = [25_000, 50_000, 90_000, 150_000, 200_000]  # tokens
+CONTEXT_CHOICES = [25_000, 50_000, 90_000]  # tokens
 
 def describe_status(minutes):
     if not minutes:
