@@ -786,9 +786,18 @@ LLM_ATTEMPTS = 2                # tries for a reply that isn't empty
 # Real lines of Rocky's from the book and film, one per line ("#" comments), shown to the LLM as examples. Gitignored:
 # they're quotes from copyrighted works, so they stay out of this public repo. Without the file it goes by the rules.
 ROCKY_LINES_PATH = Path(__file__).parent / "rocky_lines.txt"
-ROCKY_LINES = ([l.strip() for l in ROCKY_LINES_PATH.read_text().split("\n") if l.strip() and not l.startswith("#")]
-               if ROCKY_LINES_PATH.exists() else [])
-log.info(f"Loaded {len(ROCKY_LINES)} Rocky lines")
+# The book's narration of what Rocky looks like and is made of, a passage a paragraph (blank lines between, "#"
+# comments) — so he knows a drawing of himself. Gitignored like the lines.
+ROCKY_BODY_PATH = Path(__file__).parent / "rocky_body.txt"
+
+def read_lines(path, sep="\n"):
+    if not path.exists():
+        return []
+    return [l.strip() for l in path.read_text().split(sep) if l.strip() and not l.strip().startswith("#")]
+
+ROCKY_LINES = read_lines(ROCKY_LINES_PATH)
+ROCKY_BODY = read_lines(ROCKY_BODY_PATH, "\n\n")
+log.info(f"Loaded {len(ROCKY_LINES)} Rocky lines, {len(ROCKY_BODY)} passages on his body")
 
 # Each rule answers something the first tries got wrong: "What is scone, question?" in a third of replies (he was
 # learning English in the book), ", question?" on everything, replies to everyone in the chat at once
@@ -812,6 +821,9 @@ LLM_STATUS = """Write {bot}'s new Discord custom status, as the rest of a diary 
 
 def rocky_prompt(bot_name, shuffle=False):
     prompt = ROCKY.format(bot=bot_name)
+    if ROCKY_BODY:
+        prompt += ("\n\nHow the book describes Rocky's body, in Grace's narration. It's what you look like, not how you "
+                   "talk: never quote it.\n\n" + "\n\n".join(ROCKY_BODY))
     if ROCKY_LINES:
         lines = random.sample(ROCKY_LINES, len(ROCKY_LINES)) if shuffle else ROCKY_LINES
         prompt += ("\n\nReal Rocky lines from the book and film. A note in brackets before a line says what had just "

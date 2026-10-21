@@ -41,7 +41,7 @@ LONG_CONTEXT_CHANNEL_IDS=channel_ids_for_rocky
 ROCKY_VIEWER_PORT=8350
 ```
 
-For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments). A line can start with a note in brackets on what had just happened (`(a friend uses slang he doesn't know) No understand word.`), so the LLM sees when he says it; it's told the notes aren't his words. They're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes.
+For `!model`'s LLMs, put real Rocky lines in `rocky_lines.txt` (gitignored, next to `jev_bot.py`), one per line (`#` for comments). A line can start with a note in brackets on what had just happened (`(a friend uses slang he doesn't know) No understand word.`), so the LLM sees when he says it; it's told the notes aren't his words. They're quotes from copyrighted works, so they stay out of the repo. Without it the LLMs go by the voice rules alone. Restart the bot to pick up changes. `rocky_body.txt` (gitignored too) holds the book's narration of what Rocky looks like and is made of, a passage a paragraph with blank lines between, so he knows drawings of himself. It's shown apart from the lines, as narration and not his words.
 
 `TIMEZONE` (an IANA name, UTC if unset) is the clock the times in an LLM's transcript are shown on.
 
@@ -137,7 +137,7 @@ python jev_eval.py --compare before.json  # on your branch
 
 A run costs ~$0.21, on `OPENROUTER_API_KEY_EVAL`, and prints what OpenRouter billed for it. Add `--replies` to also generate a few full replies to judge by eye (~$0.05-0.10 each) — whether they're funny is still up to you.
 
-`rocky_replay.py` replays messages to `!model rocky` on a copy of the live channel log, its memories and `rocky_lines.txt`, and prints what Rocky did: its tool calls and their results, its reactions, and what it said. Nothing is written back, and its thinking isn't printed. Run it on master and on your branch to compare:
+`rocky_replay.py` replays messages to `!model rocky` on a copy of the live channel log, its memories, `rocky_lines.txt` and `rocky_body.txt`, and prints what Rocky did: its tool calls and their results, its reactions, and what it said. Nothing is written back, and its thinking isn't printed. Run it on master and on your branch to compare:
 
 ```bash
 python rocky_replay.py "@rocky how are you doing?" "lol rocky"
