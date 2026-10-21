@@ -219,7 +219,8 @@ class TurnTests(_Case):
                 self.assertEqual(llm.call_args.args[1][-1], {"role": "tool", "tool_call_id": "call_0", "content": result})
 
     async def test_at_the_bar_it_sees_what_happened_before_it_speaks(self):
-        with patch.object(rh, "bar_state", lambda now=None: (True, "The Hail Mary is open until 23:00. Menu: Blip-A Lager £4.90.")):
+        with patch.object(rh, "bar_state", lambda now=None: (True, "The Hail Mary is open until 23:00. Menu: Blip-A Lager £4.90.")), \
+                patch.object(rh, "bar_today", lambda d: (None, None)):  # nothing's run out, whatever the date
             turn, llm = await self.turn(answer("Rocky get beer!", [("bar", {}), ("react", {"emoji": "🍺"})]),
                                         answer(calls=[("order", {"drink": "Blip-A Lager"})]),
                                         answer("Rocky have beer. Good, good, good."))
