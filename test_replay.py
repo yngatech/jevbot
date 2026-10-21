@@ -36,9 +36,10 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         (self.live / "rocky_logs" / f"{CHANNEL}.json").write_text(json.dumps(LOG))
         (self.live / "rocky_memories.json").write_text(json.dumps(MEMORIES))
         (self.live / "rocky_lines.txt").write_text("# a comment\nAmaze, amaze, amaze!\n")
+        (self.live / "rocky_body.txt").write_text("# a comment\n\nHe has five legs\nand five hands.\n\nNo face.\n")
         isolate_rocky(self, d.name)  # put back after, as the replay points them at its copy
         patch_all(self, [(rh, "save_log", rh.save_log), (rh, "save_memories", rh.save_memories), (rh, "clock", rh.clock),
-                         (rh, "pictures", rh.pictures), (j, "ROCKY_LINES", []), (j, "HEADERS", dict(j.HEADERS)),
+                         (rh, "pictures", rh.pictures), (j, "ROCKY_LINES", []), (j, "ROCKY_BODY", []), (j, "HEADERS", dict(j.HEADERS)),
                          (j, "TIMEZONE", j.ZoneInfo("UTC")), (rocky_replay, "live_dir", lambda: self.live)])
         self.before = {p: p.read_text() for p in self.live.rglob("*") if p.is_file()}
 
@@ -56,6 +57,7 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         for call in llm.await_args_list:
             messages = call.args[1]
             self.assertIn("Amaze, amaze, amaze!", j.text_of(messages[0]["content"]))  # the live rocky_lines
+            self.assertIn("He has five legs\nand five hands.\n\nNo face.", j.text_of(messages[0]["content"]))  # and rocky_body
             self.assertIn("kettle: likes soup", j.text_of(messages[1]["content"]))  # the live <memories>
             text = j.text_of(messages[-1]["content"])
             self.assertIn("soup tonight?", text)

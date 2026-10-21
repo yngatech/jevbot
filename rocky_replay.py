@@ -11,7 +11,7 @@ calls and their results, its reactions, and what it said. Nothing is written bac
     python rocky_replay.py "@rocky soup?" --with "fern: @rocky tea?"  # another to it, there before its turn
 
 Run on master and on your branch to compare. It reads the live checkout's files (where this checkout's .env links to,
-or this one's): its Rocky log, memories and rocky_lines.txt. A message comes 2 minutes after the log's last event,
+or this one's): its Rocky log, memories, rocky_lines.txt and rocky_body.txt. A message comes 2 minutes after the log's last event,
 unless --at says when. On OPENROUTER_API_KEY_EVAL, one request at a time: a turn on the live log is ~70K tokens, and
 the first of a run writes it to the cache, which counts towards Anthropic's input tokens a minute.
 """
@@ -46,9 +46,10 @@ def load(live, channel_id, fresh, at):
     # Read from the live checkout, and nothing written anywhere
     rh.LOG_DIR, rh.MEMORY_PATH = live / "rocky_logs", live / "rocky_memories.json"
     rh.save_log = rh.save_memories = lambda *a: None
-    lines = live / "rocky_lines.txt"
-    if lines.exists():
-        j.ROCKY_LINES = [l.strip() for l in lines.read_text().split("\n") if l.strip() and not l.startswith("#")]
+    if (live / "rocky_lines.txt").exists():
+        j.ROCKY_LINES = j.read_lines(live / "rocky_lines.txt")
+    if (live / "rocky_body.txt").exists():
+        j.ROCKY_BODY = j.read_lines(live / "rocky_body.txt", "\n\n")
     try:
         memories = json.loads(rh.MEMORY_PATH.read_text())
     except FileNotFoundError:
@@ -128,7 +129,7 @@ async def main():
     live = live_dir()
     base, memories, when = load(live, channel, args.fresh, at)
     print(f"{'fresh chat' if args.fresh else f'{live.name} log: {len(base.events)} events'}, "
-          f"{len(j.ROCKY_LINES)} Rocky lines, at {when:%a %d %b %H:%M}")
+          f"{len(j.ROCKY_LINES)} Rocky lines, {len(j.ROCKY_BODY)} body passages, at {when:%a %d %b %H:%M}")
     spent = {"cost": 0.0, "requests": 0}
     j.trace.set(spent)
     for text in messages:
