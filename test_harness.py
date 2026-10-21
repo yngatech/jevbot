@@ -388,7 +388,9 @@ class LookTests(_Case):
 
         def get(url, **k):
             r = session()  # a response is its own `async with` too
-            r.status, r.content.read = 200, AsyncMock(return_value=files[url])
+            # in pieces, as it arrives, then b"" at its end
+            chunks = [files[url][i:i + 1000] for i in range(0, len(files[url]), 1000)]
+            r.status, r.content.read = 200, AsyncMock(side_effect=chunks + [b""])
             return r
 
         s = session()
