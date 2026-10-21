@@ -87,6 +87,16 @@ class ReplayTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("anyone watching the match tonight", text)
         self.assertIn('at="19:00"', text)
 
+    async def test_a_picture_gets_one_photo_tag(self):
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        image = Path(d.name) / "dot.png"
+        rh.Image.new("RGB", (8, 8), "red").save(image)
+        for said in ("rocky look", "rocky [photo]"):
+            llm, _ = await self.run_main("--fresh", "--image", str(image), said)
+            text = j.text_of(llm.await_args.args[1][-1]["content"])
+            self.assertEqual(text.count("[photo]"), 1, said)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -73,7 +73,9 @@ async def replay(base, memories, text, when, author, picture=None, also=()):
     rh.memories.update(copy.deepcopy(memories))
     rh.memories_loaded = True
     rh.clock = lambda: when
-    sent = log.message(author, f"{text} [photo]" if picture else text, when, to_bot=True)
+    # One [photo] tag for its one picture — not a second when the message already has one, or it looks for that too
+    tagged = picture and "[photo]" not in text
+    sent = log.message(author, f"{text} [photo]" if tagged else text, when, to_bot=True)
     for who, said in also:  # came while it waited, so they're in its turn
         log.message(who, said, when + timedelta(seconds=2), to_bot=True)
     # Only the replayed message has a picture to see — the log's have no Discord to fetch theirs from
