@@ -466,9 +466,17 @@ async def pictures(log, n):
             if len(found) == PICTURES:
                 break
             async with session.get(url, timeout=j.aiohttp.ClientTimeout(total=30)) as r:
-                if r.status == 200 and (picture := shrunk(await r.content.read(PICTURE_BYTES))):
+                if r.status == 200 and (picture := shrunk(await body(r))):
                     found.append(picture)
     return found
+
+# A response's body, up to PICTURE_BYTES. One content.read gives only what's arrived so far, and a photo cut short
+# isn't a picture
+async def body(r):
+    data = bytearray()
+    while len(data) < PICTURE_BYTES and (chunk := await r.content.read(PICTURE_BYTES - len(data))):
+        data += chunk
+    return bytes(data)
 
 # A picture as a JPEG data: URL, no bigger than PICTURE_SIDE — a gif's first frame. None if it isn't one.
 def shrunk(data):
