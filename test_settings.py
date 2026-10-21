@@ -78,7 +78,7 @@ class SettingsCommandTests(_Case):
                 self.assertEqual([o.label for o in status.options if o.default], ["Every 3 hours"])
                 self.assertEqual([o.label for o in status.options][:2], ["Off", "Every hour"])
                 self.assertEqual([o.label for o in self.menu(view, "LOG_TOKENS").options],
-                                 ["25K tokens", "50K tokens", "90K tokens", "150K tokens", "200K tokens"])
+                                 ["25K tokens", "50K tokens", "90K tokens"])
 
     async def test_the_same_whichever_model_is_writing(self):
         for model in ("jev", "haiku", "rocky"):
@@ -87,22 +87,22 @@ class SettingsCommandTests(_Case):
                 self.assertEqual([m.key for m in self.menus(view)], ["STATUS_EVERY", "LOG_TOKENS"])
 
     async def test_a_value_not_in_the_menu_still_shows_as_chosen(self):
-        rh.LOG_TOKENS = 120_000
+        rh.LOG_TOKENS = 75_000
         view = (await self.open_settings())["view"]
-        self.assertEqual([o.label for o in self.menu(view, "LOG_TOKENS").options if o.default], ["120K tokens"])
+        self.assertEqual([o.label for o in self.menu(view, "LOG_TOKENS").options if o.default], ["75K tokens"])
 
     async def test_picking_saves_it_and_redraws_the_answer(self):
         view = (await self.open_settings())["view"]
-        i = await self.pick(self.menu(view, "LOG_TOKENS"), 150_000)
-        self.assertEqual(rh.LOG_TOKENS, 150_000)
+        i = await self.pick(self.menu(view, "LOG_TOKENS"), 50_000)
+        self.assertEqual(rh.LOG_TOKENS, 50_000)
         redrawn = i.response.edit_message.call_args.kwargs
-        self.assertEqual([o.value for o in self.menu(redrawn["view"], "LOG_TOKENS").options if o.default], ["150000"])
+        self.assertEqual([o.value for o in self.menu(redrawn["view"], "LOG_TOKENS").options if o.default], ["50000"])
 
         await self.pick(self.menu(view, "STATUS_EVERY"), 0)
-        self.assertEqual(json.loads(self.path.read_text()), {"LOG_TOKENS": 150_000, "STATUS_EVERY": 0})
+        self.assertEqual(json.loads(self.path.read_text()), {"LOG_TOKENS": 50_000, "STATUS_EVERY": 0})
         j.STATUS_EVERY, rh.LOG_TOKENS = 180, 90_000  # as a restart would start
         j.load_settings()
-        self.assertEqual((j.STATUS_EVERY, rh.LOG_TOKENS), (0, 150_000))
+        self.assertEqual((j.STATUS_EVERY, rh.LOG_TOKENS), (0, 50_000))
 
     async def test_someone_no_longer_an_admin_changes_nothing(self):
         view = (await self.open_settings())["view"]
@@ -114,7 +114,7 @@ class SettingsCommandTests(_Case):
         self.assertFalse(self.path.exists())
 
     def test_saved_values_out_of_range_are_ignored(self):
-        self.path.write_text(json.dumps({"STATUS_EVERY": 1, "LOG_TOKENS": "lots", "MODEL": "x"}))
+        self.path.write_text(json.dumps({"STATUS_EVERY": 1, "LOG_TOKENS": 150_000, "MODEL": "x"}))
         with self.assertLogs(j.log, level="WARNING"):
             j.load_settings()
         self.assertEqual((j.STATUS_EVERY, rh.LOG_TOKENS), (180, 90_000))
