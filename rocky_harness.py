@@ -29,6 +29,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image, UnidentifiedImageError
 
@@ -291,6 +292,10 @@ class Log:
     def discord_id(self, n):
         return next((int(i) for i, v in self.ids.items() if v == n), None)
 
+    # The channel message n is in: the log's, but for a thread's first, the message it's on, in the channel
+    def channel_of(self, n):
+        return next((e.get("in") for e in self.events if e["type"] == "message" and e["n"] == n), None) or self.channel_id
+
     def rocky_text(self, discord_id):
         return next((e["text"] for e in reversed(self.events) if e["type"] == "rocky" and
                      (e.get("id") == discord_id or discord_id in e.get("more_ids", []))), "")
@@ -470,7 +475,8 @@ def use(log, call, waking):
 async def pictures(log, n):
     if not isinstance(n, int) or not (discord_id := log.discord_id(n)):
         return None
-    channel = j.bot.get_channel(log.channel_id) or await j.bot.fetch_channel(log.channel_id)
+    channel_id = log.channel_of(n)
+    channel = j.bot.get_channel(channel_id) or await j.bot.fetch_channel(channel_id)
     m = await channel.fetch_message(discord_id)
     urls = [a.url for a in m.attachments if (a.content_type or "").startswith("image/")]
     urls += [x.url for e in m.embeds for x in (e.image, e.thumbnail) if x and x.url]
@@ -707,6 +713,8 @@ def log_for(channel, memories=True):
         saved = json.loads((LOG_DIR / f"{channel.id}.json").read_text())
         log.next_n, log.ids, log.shown, log.seeded = saved["next_n"], saved["ids"], saved["shown"], saved["seeded"]
         log.space = saved.get("space", log.space)
+        if not getattr(channel, "name", None):  # only its id: a thread's log, found by its first message
+            log.channel = saved.get("channel", log.channel)
         log.asked = saved.get("asked") and datetime.fromisoformat(saved["asked"])
         log.events = [e | {"at": datetime.fromisoformat(e["at"])} if e.get("at") else e for e in saved["events"]]
         log.code = saved.get("code")
@@ -720,7 +728,23 @@ def log_for(channel, memories=True):
 
 # A !nocontext thread: every message in it is to Rocky, and its log has no memories
 def no_memories(channel):
-    return isinstance(channel, j.discord.Thread) and has_log(channel.id) and log_for(channel).space is None
+    return isinstance(channel, j.discord.Thread) and memoryless(channel.id)
+
+def memoryless(channel_id):
+    if (log := logs.get(channel_id)) is not None:
+        return log.space is None
+    try:
+        return json.loads((LOG_DIR / f"{channel_id}.json").read_text()).get("space", "") is None
+    except (OSError, ValueError):
+        return False
+
+# The logs a message is in: its channel's, and the !nocontext thread opened on it, which it starts — the thread has
+# the message's id
+def logs_with(channel_id, message_id):
+    found = [logs[channel_id]] if channel_id in logs else []
+    if message_id != channel_id and memoryless(message_id):
+        found.append(log_for(SimpleNamespace(id=message_id, name=None, guild=None)))
+    return found
 
 # A log for one answer, with nothing before it and no memories, never saved: a !nocontext message where there's no
 # thread for it — in a DM, or when one couldn't be opened
@@ -795,45 +819,48 @@ def observe(m, log=None):
         reply_to = log.ids.get(str(m.reference.message_id))
         if reply_to == "you":
             you_said = log.rocky_text(m.reference.message_id)
-        elif reply_to is None:
+        elif reply_to is None and log.space:  # a !nocontext one shows nothing from outside it
             older = replied_outside(m)
     e = log.message(m.author.display_name, text, m.created_at, to_bot=j.should_respond(m), reply_to=reply_to,
                     uid=m.author.id, discord_id=m.id, you_said=you_said, older=older)
+    if m.channel.id != log.channel_id:
+        e["in"] = m.channel.id
     changed(log)
     return e
 
 # Someone's reaction on a message in a log, added or taken off
 def reacted(channel_id, message_id, emoji, author, added=True):
-    if (log := logs.get(channel_id)) is None or (on := log.ids.get(str(message_id))) is None:
-        return
-    log.add("reaction", on=on, you_said=log.rocky_text(message_id) if on == "you" else None, emoji=emoji,
-            author=author or "someone", removed=not added)
-    changed(log)
+    for log in logs_with(channel_id, message_id):
+        if (on := log.ids.get(str(message_id))) is not None:
+            log.add("reaction", on=on, you_said=log.rocky_text(message_id) if on == "you" else None, emoji=emoji,
+                    author=author or "someone", removed=not added)
+            changed(log)
 
 def edited(m):
-    log = logs.get(m.channel.id)
-    if log is None or not isinstance(n := log.ids.get(str(m.id)), int):
-        return
-    text = j.message_text(m)
-    last = next((e["text"] for e in reversed(log.events)
-                 if e["type"] == "message" and e["n"] == n or e["type"] == "edit" and e["on"] == n), None)
-    if text and text != last:
-        log.add("edit", on=n, text=text)
-        changed(log)
+    for log in logs_with(m.channel.id, m.id):
+        if not isinstance(n := log.ids.get(str(m.id)), int):
+            continue
+        text = j.message_text(m)
+        last = next((e["text"] for e in reversed(log.events)
+                     if e["type"] == "message" and e["n"] == n or e["type"] == "edit" and e["on"] == n), None)
+        if text and text != last:
+            log.add("edit", on=n, text=text)
+            changed(log)
 
 # A message deleted: marked now, and blanked at the next tidy
 def deleted(channel_id, message_id):
-    if (log := logs.get(channel_id)) is None or (on := log.ids.get(str(message_id))) is None:
-        return
-    if on == "you":
-        log.add("deleted", on="you", you_said=log.rocky_text(message_id))
-    else:
-        message = next((e for e in log.events if e["type"] == "message" and e["n"] == on), None)
-        if message is None or message.get("deleted"):
-            return
-        message["deleted"] = True  # not shown until tidy, so nothing earlier in the request changes yet
-        log.add("deleted", on=on)
-    changed(log)
+    for log in logs_with(channel_id, message_id):
+        if (on := log.ids.get(str(message_id))) is None:
+            continue
+        if on == "you":
+            log.add("deleted", on="you", you_said=log.rocky_text(message_id))
+        else:
+            message = next((e for e in log.events if e["type"] == "message" and e["n"] == on), None)
+            if message is None or message.get("deleted"):
+                continue
+            message["deleted"] = True  # not shown until tidy, so nothing earlier in the request changes yet
+            log.add("deleted", on=on)
+        changed(log)
 
 # One of Rocky's messages from outside a turn (written while another !model was chosen, or a status posted in
 # STATUS_CHANNEL), so the log has it — loaded if nothing's been said there since a restart
