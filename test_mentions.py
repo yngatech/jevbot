@@ -46,8 +46,6 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "DM_USERS", {500}),
             (j, "channel_history", defaultdict(list)),
             (j, "heard", False),
-            (j, "side_talk", {}),
-            (j, "side_of", {}),
             (j, "reactor_names", {}),
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
@@ -116,13 +114,11 @@ class ReactionContextTests(_Discord):
         self.entry = j.channel_history[self.channel.id][0]
         self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
 
-    async def test_side_chain_and_standalone_reply_names(self):
+    async def test_standalone_reply_names(self):
         question = MentionTests.message(self)
         reply = _Message(id=700, author=self.user, reference=SimpleNamespace(message_id=question.id), guild=None,
                          content="Hello", reactions=[self.reaction()], created_at=question.created_at,
                          mentions=[], role_mentions=[], embeds=[], attachments=[], stickers=[])
-        entries = await j.chain_entries([question, reply])
-        self.assertEqual(entries[0]["reply_reactors"]["😂"], {"501": "Moss", "502": "Pip"})
         standalone = {"role": "assistant", "content": "Hello"}
         await j.attach_reactions(standalone, reply, prefix="")
         self.assertIn("Hello (😂 by @Moss, @Pip)",
@@ -456,14 +452,14 @@ class _Handling(_Discord):
         self.next_id = 800
         patch_all(self, [(j, "has_credit", True), (j, "history_loaded", {}), (j, "emoji_vocabulary", lambda g: {}),
                          (j, "choose_reaction", AsyncMock(return_value=None)), (j, "load_history", AsyncMock())])
-        # Chatter before the conversation, which a !nocontext chain shouldn't see
+        # Chatter before the conversation, which a !nocontext thread shouldn't see
         j.channel_history[self.channel.id] = [
             {"role": "user", "name": "kettle", "content": "the toaster is on fire again", "id": 1,
              "at": datetime.now(timezone.utc) - timedelta(minutes=10), "to_bot": False}]
 
-    def said(self, content, *, to=None, bot=False, name="pip", ping=True):
+    def said(self, content, *, to=None, bot=False, name="pip", ping=True, channel=None):
         m = Mock(spec=discord.Message, id=self.next_id, content=(f"<@{self.user.id}> " if ping and not bot else "") + content,
-                 guild=self.guild, channel=self.channel, mentions=[self.user] if ping and not bot else [],
+                 guild=self.guild, channel=channel or self.channel, mentions=[self.user] if ping and not bot else [],
                  role_mentions=[], created_at=datetime.now(timezone.utc), reactions=[], attachments=[], stickers=[],
                  embeds=[], author=self.user if bot else SimpleNamespace(id=500, bot=False, display_name=name))
         m.clean_content = discord.Message.clean_content.function(m)
@@ -639,7 +635,7 @@ class RockyHarnessTests(_Handling):
         self.assertEqual(texts[texts.index("@Testbot old question") + 1], "Old answer.")  # its reply under it
         self.assertEqual(texts[-2:], ["@Testbot what did I miss", "Hi."])
 
-    async def test_an_edit_and_a_side_conversation(self):
+    async def test_an_edit_and_a_nocontext_message(self):
         m = self.said("rocky soup or stew", ping=False)
         await j.on_message(m)
         m.content = "rocky soup or salad"
@@ -650,9 +646,10 @@ class RockyHarnessTests(_Handling):
         await j.on_raw_message_delete(SimpleNamespace(channel_id=self.channel.id, message_id=m.id))
         self.assertEqual(rh.logs[self.channel.id].events[-1]["type"], "deleted")
         side = self.said("!nocontext secret soup")
-        with patch.object(j, "llm_message") as llm, patch.object(j, "generate_reply", AsyncMock(return_value="Ok.")):
+        side.create_thread = AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "no threads"))
+        with patch.object(j, "llm_message", AsyncMock(return_value=answer("Soup good."))):
             await j.on_message(side)
-        llm.assert_not_called()  # a side conversation is answered the old way, and never in the log
+        side.reply.assert_awaited_once()  # answered alone, with no thread to answer in
         self.assertNotIn(str(side.id), rh.logs[self.channel.id].ids)
 
 
@@ -687,31 +684,29 @@ class OutgoingMentionTests(_Handling):
                 self.assertEqual(allowed["parse"], [])
                 self.assertFalse(m.reply.call_args.kwargs["mention_author"])
 
-    async def test_mentions_survive_channel_and_side_thread_restarts(self):
+    async def test_mentions_survive_a_restart(self):
         uid = 100000000000000002
-        for side in (False, True):
-            with self.subTest(side=side), patch.object(j, "model_name", "haiku"):
-                j.channel_history[self.channel.id], j.side_talk, j.side_of = [], {}, {}
-                root = self.said(("!nocontext " if side else "") + f"ask <@{uid}>")
-                root.mentions.append(SimpleNamespace(id=uid, display_name="Moss"))
-                root.clean_content = discord.Message.clean_content.function(root)
-                await self.answer(root, "@moss!")
-                live = j.entries_with(self.channel.id, root.id)[0].copy()
-                reply = self.sent
-                j.channel_history[self.channel.id], j.side_talk, j.side_of = [], {}, {}
-                if not side:
-                    async def history(**kwargs):
-                        for message in (reply, root):
-                            yield message
-                    self.channel.history = history
-                    await self.load_history(SimpleNamespace(channel=self.channel))
-                question = self.said("again", to=reply)
-                await self.answer(question, "@Moss!")
-                rebuilt = j.entries_with(self.channel.id, root.id)[0]
-                self.assertEqual(live["reply"], rebuilt["reply"])
-                self.assertEqual(live["reply_users"], rebuilt["reply_users"])
-                marker = f" [↳](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{root.id})" if side else ""
-                self.assertEqual(question.reply.call_args.args[0], f"<@{uid}>!" + marker)
+        with patch.object(j, "model_name", "haiku"):
+            j.channel_history[self.channel.id] = []
+            root = self.said(f"ask <@{uid}>")
+            root.mentions.append(SimpleNamespace(id=uid, display_name="Moss"))
+            root.clean_content = discord.Message.clean_content.function(root)
+            await self.answer(root, "@moss!")
+            live = j.channel_history[self.channel.id][0].copy()
+            reply = self.sent
+            j.channel_history[self.channel.id] = []
+
+            async def history(**kwargs):
+                for message in (reply, root):
+                    yield message
+            self.channel.history = history
+            await self.load_history(SimpleNamespace(channel=self.channel))
+            question = self.said("again", to=reply)
+            await self.answer(question, "@Moss!")
+            rebuilt = j.channel_history[self.channel.id][0]
+            self.assertEqual(live["reply"], rebuilt["reply"])
+            self.assertEqual(live["reply_users"], rebuilt["reply_users"])
+            self.assertEqual(question.reply.call_args.args[0], f"<@{uid}>!")
 
 
 class AppHistoryTests(_Handling):
@@ -763,139 +758,109 @@ class AppHistoryTests(_Handling):
         self.assertIn(("Milestone App", "[embed: Contribution milestone synthetic-user passed 2,000 contributions.]", None), seen)
 
 
-class NoContextChainTests(_Handling):
-    """A "@jev !nocontext ..." message and the replies under it are a side conversation: they see all of it and
-    nothing else, and the rest of the channel doesn't see them."""
+class NoContextThreadTests(_Handling):
+    """"@jev !nocontext ..." opens a thread on the message, a channel of its own: answered there with nothing from
+    before, every message in it to jev, and for Rocky without memories."""
 
-    async def test_replies_link_to_root_without_putting_marker_in_context(self):
+    def setUp(self):
+        super().setUp()
+        self.channel.name, self.channel.guild = "bot-spam", self.guild
+        self.threads = {}
+        self.partials = {}
+        self.channel.get_partial_message = lambda i: self.partials.setdefault(i, Mock(add_reaction=AsyncMock()))
+
+    # A !nocontext message to jev, which a thread can be opened on — with the message's id, as Discord's are
+    def asked(self, content):
+        m = self.said(content)
+
+        async def create_thread(name, **kwargs):
+            t = Mock(spec=discord.Thread, id=m.id, guild=self.guild)
+            t.name = name
+            t.typing = lambda: contextlib.nullcontext()
+            t.send = AsyncMock(side_effect=lambda content, **kwargs: self.said(content, bot=True, channel=t))
+            self.threads[m.id] = t
+            return t
+        m.create_thread = AsyncMock(side_effect=create_thread)
+        return m
+
+    async def test_jev_answers_in_the_thread_and_carries_on_there(self):
+        q = self.asked("!nocontext favourite rock?")
+        with patch.object(j, "model_name", "haiku"):
+            self.assertEqual(await self.answer(q, "Granite."), [])
+            thread = self.threads[q.id]
+            self.assertEqual(q.create_thread.call_args.kwargs["name"], "favourite rock?")
+            q.reply.assert_not_awaited()
+            thread.send.assert_awaited_once()
+            self.assertEqual(thread.send.call_args.args[0], "Granite.")
+            self.assertEqual((self.trace["no_context"], self.trace["channel_id"]), (True, thread.id))
+            # in the thread, nobody needs to tag jev, and it has the thread so far
+            follow = self.said("why granite", ping=False, channel=thread)
+            self.assertTrue(j.should_respond(follow))
+            self.assertEqual(await self.answer(follow, "Very good."), [("pip", "@Testbot favourite rock?", "Granite.")])
+            self.assertEqual(follow.reply.call_args.args[0], "Very good.")
+        # and the channel it came from never sees any of it
+        self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]], ["the toaster is on fire again"])
+        self.assertFalse(j.should_respond(self.said("anyone?", ping=False)))
+
+    async def test_rocky_in_the_thread_has_no_memories(self):
+        rh.use(rh.Log("bot-spam", "400", self.channel.id),
+               {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes soup"}'}}, {"n": 1})
+        q = self.asked("!nocontext what do you know about me")
+        llm = AsyncMock(return_value=answer("Nothing. New friend.", [("react", {"emoji": "🪨"})]))
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", llm):
+            await j.handle(q, j.message_text(q))
+        thread = self.threads[q.id]
+        self.assertEqual(thread.send.call_args.args[0], "Nothing. New friend.")
+        self.partials[q.id].add_reaction.assert_awaited_once_with("🪨")  # on the message the thread is on
+        request, tools = llm.await_args.args[1], llm.await_args.kwargs["tools"]
+        self.assertNotIn("soup", str(request))
+        self.assertNotIn("<memories>", str(request))
+        self.assertNotIn("remember", [t["function"]["name"] for t in tools])
+        log = rh.logs[thread.id]
+        self.assertEqual([(e["type"], e.get("text")) for e in log.events],
+                         [("message", "@Testbot what do you know about me"), ("rocky", "Nothing. New friend."),
+                          ("result", None)])
+        self.assertFalse(rh.has_log(self.channel.id))  # the channel's own log isn't started, or given it
+
+        rh.flush()
+        rh.logs.clear()  # a restart: the thread's log is still one without memories
+        follow = self.said("ok remember I like rocks", ping=False, channel=thread)
+        llm = AsyncMock(return_value=answer("Rocks good."))
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", llm):
+            await j.on_message(follow)
+        self.assertEqual(follow.reply.call_args.args[0], "Rocks good.")
+        self.assertNotIn("<memories>", str(llm.await_args.args[1]))
+        self.assertIsNone(rh.logs[thread.id].space)
+        self.assertEqual(rh.memory("400")["facts"][0]["fact"], "likes soup")
+
+    async def test_in_a_dm_its_answered_alone(self):
         q = self.said("!nocontext favourite rock?")
-        await self.answer(q, "Granite.")
-        marker = f" [↳](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{q.id})"
-        self.assertEqual(self.sent.content, "Granite." + marker)
-        self.assertEqual(self.trace["sent"], "Granite." + marker)
-        self.assertEqual(j.message_text(self.sent), "Granite.")
-        # Rebuild from Discord rather than relying on the in-memory entry.
-        a = self.sent
-        j.side_talk.clear()
-        j.side_of.clear()
-        seen = await self.answer(self.said("why?", to=a), "Very good.")
-        self.assertEqual(seen, [("pip", "@Testbot favourite rock?", "Granite.")])
-        self.assertEqual(self.sent.content, "Very good." + marker)
+        q.guild = None
+        rh.log_for(self.channel)  # a DM Rocky's talked in
+        llm = AsyncMock(return_value=answer("Granite."))
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", llm):
+            await j.handle(q, j.message_text(q))
+        self.assertEqual(q.reply.call_args.args[0], "Granite.")
+        people = [m for m in llm.await_args.args[1] if m["role"] == "user"]
+        self.assertEqual(len(people), 1)  # just the question: no memories, nothing from before
+        self.assertIn("favourite rock?", j.text_of(people[0]["content"]))
+        self.assertEqual(rh.logs[self.channel.id].events, [])  # nor is it in the DM's log
+        rh.flush()
+        self.assertEqual(list(Path(rh.LOG_DIR).glob("*")), [])  # and its own is never saved
 
     async def test_normal_reply_has_no_marker(self):
         await self.answer(self.said("favourite rock?"), "Granite.")
         self.assertEqual(self.sent.content, "Granite.")
 
-    def test_previous_thread_label_stays_out_of_context(self):
-        m = self.said("Granite. [↳ thread](https://discord.com/channels/400/300/800)", bot=True)
-        self.assertEqual(j.message_text(m), "Granite.")
+    def test_old_side_conversation_links_stay_out_of_context(self):
+        for text in ("Granite. [↳ thread](https://discord.com/channels/400/300/800)",
+                     "Granite. [↳](https://discord.com/channels/@me/300/800)"):
+            self.assertEqual(j.message_text(self.said(text, bot=True)), "Granite.")
 
     def test_what_rocky_did_under_its_message_stays_out_of_context(self):
         m = self.said("Stout for Pip.\n-# 🍺 ordered Eridani Stout for pip\n-# 🧠 remembered: pip likes stout", bot=True)
         self.assertEqual(j.message_text(m), "Stout for Pip.")
         self.assertIn("-# 🍺 ordered a lager", j.message_text(self.said("-# 🍺 ordered a lager")))  # only Rocky's
-
-    async def test_dm_side_reply_links_to_dm_root(self):
-        q = self.said("!nocontext favourite rock?")
-        q.guild = None
-        await self.answer(q, "Granite.")
-        self.assertEqual(self.sent.content,
-                         f"Granite. [↳](https://discord.com/channels/@me/{self.channel.id}/{q.id})")
-        self.assertEqual(j.message_text(self.sent), "Granite.")
-
-    async def test_every_branch_sees_the_whole_side_conversation(self):
-        self.assertEqual(await self.answer(self.said("!nocontext favourite rock?"),
-                                           "Rock music or geology rock, question?"), [])
-        a = self.sent
-        q = ("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")
-        self.assertEqual(await self.answer(self.said("geology", to=a), "Granite. Very good."), [q])
-        granite = self.sent
-        # Another branch, also answering a: sees the first
-        self.assertEqual(await self.answer(self.said("music", to=a, name="mossy"), "Loud. Good."),
-                         [q, ("pip", "@Testbot geology", "Granite. Very good.")])
-        # Back on the first branch: sees the second
-        self.assertEqual(await self.answer(self.said("why granite", to=granite)),
-                         [q, ("pip", "@Testbot geology", "Granite. Very good."), ("mossy", "@Testbot music", "Loud. Good.")])
-
-    async def test_channel_doesnt_see_the_side_conversation(self):
-        await self.answer(self.said("!nocontext favourite rock?"), "Rock music or geology rock, question?")
-        await self.answer(self.said("geology", to=self.sent), "Granite.")
-        self.assertEqual(await self.answer(self.said("what's up")), [("kettle", "the toaster is on fire again", None)])
-
-    async def test_unpinged_reply_joins_the_side_conversation(self):
-        await self.answer(self.said("!nocontext favourite rock?"), "Rock music or geology rock, question?")
-        a = self.sent
-        with patch.object(j, "respond", new_callable=AsyncMock) as respond:
-            await j.on_message(self.said("basalt obviously", to=a, name="mossy", ping=False))
-        respond.assert_not_awaited()
-        self.assertNotIn("basalt obviously", [e["content"] for e in j.channel_history[self.channel.id]])
-        self.assertEqual(await self.answer(self.said("geology", to=a)),
-                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
-                          ("mossy", "basalt obviously", None)])
-
-    async def test_restart_rebuilds_side_conversations_from_discord(self):
-        q = self.said("!nocontext favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        b = self.said("music", to=a, name="mossy", ping=False)
-        chatter = self.said("anyone seen my keys", name="kettle", ping=False)
-
-        async def history(**kwargs):
-            for m in (chatter, b, a, q):  # newest first, like Discord
-                yield m
-
-        self.channel.history.side_effect = history
-        j.channel_history[self.channel.id] = []
-        m = self.said("geology", to=a)
-        with patch.object(j, "load_history", self.load_history):
-            got = await self.answer(m)
-        self.assertEqual(got, [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
-                               ("mossy", "music", None)])
-        self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]], ["anyone seen my keys"])
-
-    async def test_reply_in_chain_sees_only_the_chain(self):
-        q = self.said("!nocontext favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        self.assertEqual(await self.answer(self.said("geology", to=a)),
-                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")])
-        self.assertTrue(self.trace["no_context"])
-
-    async def test_deeper_reply_and_other_people_in_chain(self):
-        q = self.said("!nocontext favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        b = self.said("geology", to=a, name="mossy")
-        c = self.said("Granite. Very good, very good.", to=b, bot=True)
-        self.assertEqual(await self.answer(self.said("why granite", to=c)),
-                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?"),
-                          ("mossy", "@Testbot geology", "Granite. Very good, very good.")])
-
-    async def test_chain_starts_at_latest_nocontext(self):
-        q = self.said("what's up")
-        a = self.said("Nothing.", to=q, bot=True)
-        r = self.said("!nocontext favourite rock?", to=a)
-        b = self.said("Rock music or geology rock, question?", to=r, bot=True)
-        self.assertEqual(await self.answer(self.said("geology", to=b)),
-                         [("pip", "@Testbot favourite rock?", "Rock music or geology rock, question?")])
-
-    async def test_nocontext_in_the_reply_itself_still_sees_nothing(self):
-        q = self.said("!nocontext favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        self.assertEqual(await self.answer(self.said("!nocontext geology", to=a)), [])
-
-    async def test_chain_without_nocontext_sees_channel(self):
-        q = self.said("favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        history = await self.answer(self.said("geology", to=a))
-        self.assertIn(("kettle", "the toaster is on fire again", None), history)
-        self.assertEqual(history[-1], (self.user.display_name, "Rock music or geology rock, question?", None))
-        self.assertNotIn("no_context", self.trace)
-
-    async def test_deleted_message_ends_the_chain(self):
-        q = self.said("!nocontext favourite rock?")
-        a = self.said("Rock music or geology rock, question?", to=q, bot=True)
-        del self.by_id[q.id]
-        self.channel.fetch_message.side_effect = discord.NotFound(Mock(status=404), "gone")
-        history = await self.answer(self.said("geology", to=a))
-        self.assertIn(("kettle", "the toaster is on fire again", None), history)
 
 
 class LongHistoryTests(_Handling):

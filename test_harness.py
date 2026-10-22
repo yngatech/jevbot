@@ -96,6 +96,25 @@ class RenderTests(_Case):
         self.assertIn("pip: likes soup", rh.memories_text(other))
         self.assertNotIn("soup", rh.memories_text(rh.Log("dm", "dm-5", 5)))
 
+    def test_a_log_without_memories_has_none_and_cant_keep_any(self):
+        self.remember_soup()
+        log = rh.Log("favourite rock?", None, 900)
+        log.message("pip", "favourite rock?", T0, to_bot=True)["woke"] = True
+        log.reorganise()
+        system, first = rh.render(log, "rocky")  # no <memories> between them
+        prompt = system["content"][0]["text"]
+        self.assertIn(rh.NO_MEMORIES, prompt)
+        self.assertNotIn("<memories>", prompt)
+        self.assertNotIn("- remember:", prompt)
+        self.assertIn("favourite rock?", j.text_of(first["content"]))
+        self.assertEqual([t["function"]["name"] for t in rh.tools_for(log)], ["react", "note", "bar", "order", "look"])
+        self.assertEqual(rh.use(log, {"function": {"name": "remember", "arguments": '{"about": "pip", "fact": "likes rocks"}'}},
+                                {"n": 1}), (None, "No memories here."))
+        self.assertEqual([f["fact"] for f in rh.memory("400")["facts"]], ["likes soup"])
+        # and a server's log is as it was
+        self.assertIn("- remember:", j.text_of(rh.render(self.log, "rocky")[0]["content"]))
+        self.assertEqual(rh.tools_for(self.log), rh.TOOLS)
+
 
 class ToolTests(_Case):
     def call(self, name, **args):
@@ -448,7 +467,7 @@ class LongMessageTests(_Case):
 
         entry = {"name": "pip", "content": "rocky tell me", "users": {}}
         with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
-                patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
+                patch.object(rh, "observe", lambda m, log=None: q), patch.object(rh, "take_turn", take_turn), \
                 patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "mention_targets", lambda *a, **k: {}), \
                 patch.object(j, "message_users", lambda x: {str(x.id): "pip"}), \
                 patch.object(j, "message_text", lambda x: j.ACTION_LINES.sub("", x.content).strip()):
