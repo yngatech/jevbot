@@ -222,7 +222,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sent[0][3]["allowed_mentions"].to_dict()["parse"], [])
 
     async def test_stats_find_jev_replies_reactions_and_posted_statuses(self):
-        with patch.object(j, "STATUS_CHANNEL", self.channel.id), patch.object(j, "model_name", "haiku"):
+        with patch.object(j, "STATUS_CHANNEL", self.channel.id), patch.object(j, "model_name", "rocky"):
             for name, t, original in [
                     ("reply", dict(self.logged, cost=.02, requests=8), False),
                     ("reaction", dict(self.logged, reaction="👍", reply=None, cost=.00001, requests=2), True),
@@ -298,7 +298,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
                  llm_cached_tokens=14_533, llm_completion_tokens=24, api_calls=[
                      {"model": j.MODEL, "purpose": "decision", "status": 200, "attempt": 0,
                       "router_cost": .000081, "is_byok": False, "key_cost": 0},
-                     {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "attempt": 0,
+                     {"model": j.LLMS["rocky"]["id"], "purpose": "reply", "status": 200, "attempt": 0,
                       "router_cost": 0, "is_byok": True, "key_cost": .000577}])
         j.write_trace(t)
         with patch.object(j, "llm", new_callable=AsyncMock) as llm:
@@ -309,7 +309,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["Total time"], "2.5s")
         self.assertIn("Jev · 1 request · paid through OpenRouter", fields["Check whether to reply or react"])
         self.assertIn("$0.000081 USD", fields["Check whether to reply or react"])
-        self.assertIn("Haiku · 1 request · paid through Anthropic key", fields["Write the reply"])
+        self.assertIn("Rocky · 1 request · paid through Anthropic key", fields["Write the reply"])
         self.assertIn("$0.000577 USD", fields["Write the reply"])
         self.assertEqual(fields["Final generation"], "14,533 cached input tokens · 24 output tokens")  # no input count
         self.assertIn("Routed through OpenRouter", self.embeds()[0].footer.text)
@@ -339,9 +339,9 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_diagnostics_count_failed_attempts_and_do_not_price_unknown_failures_as_free(self):
         t = dict(self.logged, llm="haiku", cost=.001, requests=1, api_calls=[
-            {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 429, "attempt": 0,
+            {"model": j.LLMS["rocky"]["id"], "purpose": "reply", "status": 429, "attempt": 0,
              "router_cost": None, "is_byok": False, "key_cost": 0},
-            {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "attempt": 1,
+            {"model": j.LLMS["rocky"]["id"], "purpose": "reply", "status": 200, "attempt": 1,
              "router_cost": .001, "is_byok": False, "key_cost": 0}])
         j.write_trace(t)
         await j.diagnostics_action.callback(self.interaction(), self.target(t))
@@ -352,7 +352,7 @@ class ExplanationTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Stopped early", self.fields()["Write the reply"])  # older logs have no endings
 
     async def test_diagnostics_show_refusals_and_other_early_stops(self):
-        call = {"model": j.LLMS["haiku"]["id"], "purpose": "reply", "status": 200, "router_cost": 0,
+        call = {"model": j.LLMS["rocky"]["id"], "purpose": "reply", "status": 200, "router_cost": 0,
                 "is_byok": False, "key_cost": 0, "id": "gen-synthetic", "provider": "Anthropic"}
         t = dict(self.logged, llm="haiku", cost=0, requests=4, api_calls=[
             call | {"attempt": 0, "finish_reason": "content_filter", "native_finish_reason": "refusal"},
