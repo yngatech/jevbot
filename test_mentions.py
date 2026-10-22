@@ -49,11 +49,11 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "side_talk", {}),
             (j, "side_of", {}),
             (j, "reactor_names", {}),
-            (j, "LONG_CHAT_CHANNELS", set()),  # not whatever .env sets
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
             (j, "REACTORS_PATH", Path(self.reactors_dir.name) / "reactors.json"),
         ])
+        isolate_rocky(self, self.reactors_dir.name)  # no checkout's logs, and none left behind
 
 
 class ReactionContextTests(_Discord):
@@ -493,14 +493,14 @@ class _Handling(_Discord):
 
 
 class RockyHarnessTests(_Handling):
-    """!model rocky in a channel with a long chat: Rocky's turn from the channel's log, posted and acted on."""
+    """!model rocky: Rocky's turn from the channel's log, posted and acted on."""
 
     def setUp(self):
         super().setUp()
-        patch_all(self, [(j, "LONG_CHAT_CHANNELS", {self.channel.id}), (j, "model_name", "rocky")])
-        isolate_rocky(self, self.reactors_dir.name)
+        patch_all(self, [(j, "model_name", "rocky")])
         self.channel.name = "bot-spam"
         self.channel.guild = self.guild
+        rh.log_for(self.channel)  # a channel Rocky has talked in, so it follows what's said there
         self.partials = {}
         self.channel.get_partial_message = lambda i: self.partials.setdefault(i, Mock(add_reaction=AsyncMock()))
 
@@ -574,7 +574,7 @@ class RockyHarnessTests(_Handling):
         self.partials[m.id].add_reaction.assert_awaited_once_with("😂")
         self.assertEqual(j.channel_history[self.channel.id][-1]["reaction"], "😂")
 
-    async def test_other_models_and_other_channels_keep_their_way(self):
+    async def test_other_models_keep_their_way(self):
         with patch.object(j, "model_name", "haiku"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
             rh.observe(m := self.said("hello?"))
             await j.handle(m, j.message_text(m))
@@ -582,11 +582,62 @@ class RockyHarnessTests(_Handling):
         log = rh.logs[self.channel.id]
         self.assertEqual(log.events[-1]["text"], "Hello.")  # its message is in the log for when rocky's back
         self.assertEqual(log.ids[str(self.sent.id)], "you")
-        with patch.object(j, "LONG_CHAT_CHANNELS", set()), patch.object(j, "generate_reply", AsyncMock(return_value="Hi.")) as gen, \
-                patch.object(j, "llm_message") as llm:
-            await j.handle(m2 := self.said("hi"), j.message_text(m2))
-        llm.assert_not_called()
-        gen.assert_awaited_once()
+
+    async def test_a_channel_has_no_log_until_rocky_is_woken_there(self):
+        rh.logs.clear()
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
+            await j.on_message(self.said("anyone seen my keys", name="kettle", ping=False))
+            await j.handle(m := self.said("hello?"), j.message_text(m))
+        self.assertEqual((rh.logs, list(Path(rh.LOG_DIR).glob("*"))), ({}, []))
+        with patch.object(j, "llm_message", AsyncMock(return_value=answer("Hello again."))):
+            await j.handle(m := self.said("still there?"), j.message_text(m))
+        log = rh.logs[self.channel.id]
+        # the first log has what came before, haiku's reply too
+        self.assertEqual([(e["type"], e.get("text")) for e in log.events][-5:],
+                         [("message", "anyone seen my keys"), ("message", "@Testbot hello?"), ("rocky", "Hello."),
+                          ("message", "@Testbot still there?"), ("rocky", "Hello again.")])
+        await j.on_message(self.said("thanks", name="kettle", ping=False))  # and from then on, what's said there
+        self.assertEqual(log.events[-1]["text"], "thanks")
+
+    async def test_a_new_log_is_filled_from_further_back_in_the_channel(self):
+        rh.logs.clear()
+        start = datetime.now(timezone.utc) - timedelta(days=2)
+        scanned = []  # oldest first, ids in order like Discord's
+        for i in range(40):
+            scanned.append(self.said(f"old {i:02}", name="kettle", ping=False))
+            if i == 20:
+                scanned.append(self.said("!nocontext a secret", ping=False))
+            if i == 25:
+                scanned.append(asked := self.said("old question", name="kettle"))
+                scanned.append(self.said("Old answer.", to=asked, bot=True))
+        for k, m in enumerate(scanned):
+            m.created_at = start + timedelta(minutes=k)
+        befores = []
+
+        def history(limit=None, before=None, **kwargs):  # newest first
+            befores.append(before and before.id)
+            async def page():
+                for m in [m for m in reversed(scanned) if before is None or m.id < before.id][:limit]:
+                    yield m
+            return page()
+
+        self.channel.history = history
+        j.channel_history[self.channel.id] = []
+        target = 20 * (len("old 00") + rh.EVENT_CHARS)  # about 20 old messages' worth
+        with patch.object(j, "HISTORY_SCAN", 5), patch.object(j, "load_history", self.load_history), \
+                patch.object(rh, "LOG_TOKENS", target / rh.CHARS_PER_TOKEN / rh.FILL), \
+                patch.object(j, "llm_message", AsyncMock(return_value=answer("Hi."))):
+            await j.handle(m := self.said("what did I miss"), j.message_text(m))
+        texts = [e.get("text") for e in rh.logs[self.channel.id].events]
+        # read back from where the channel's history ends
+        self.assertEqual(befores, [m.id, min(e["id"] for e in j.channel_history[self.channel.id])])
+        first = int(texts[0].split()[1])
+        self.assertTrue(10 < first < 25, texts[0])  # not all of it: about the target, less what history had
+        olds = [t for t in texts if t.startswith("old ")]
+        self.assertEqual(olds, [f"old {i:02}" for i in range(first, 40)])
+        self.assertNotIn("!nocontext a secret", texts)
+        self.assertEqual(texts[texts.index("@Testbot old question") + 1], "Old answer.")  # its reply under it
+        self.assertEqual(texts[-2:], ["@Testbot what did I miss", "Hi."])
 
     async def test_an_edit_and_a_side_conversation(self):
         m = self.said("rocky soup or stew", ping=False)
@@ -848,7 +899,8 @@ class NoContextChainTests(_Handling):
 
 
 class LongHistoryTests(_Handling):
-    """An LLM writing gets the last LLM_HISTORY messages; Jev and the question check keep their short window."""
+    """An LLM writing gets the last LLM_HISTORY messages; Jev and the question check keep their short window. The
+    store keeps HISTORY_SCAN, for Rocky's log."""
 
     def setUp(self):
         super().setUp()
@@ -862,12 +914,15 @@ class LongHistoryTests(_Handling):
                 entry |= {"reply": f"answer {i}", "reply_id": 10_000 + i}
             j.add_history(self.channel.id, entry)
 
-    async def test_store_keeps_enough_for_both(self):
+    async def test_store_keeps_what_a_rebuild_reads(self):
+        for i in range(300, j.HISTORY_SCAN + 100):
+            j.add_history(self.channel.id, {"role": "user", "name": "kettle", "content": f"message {i}", "id": i + 1,
+                                            "at": datetime.now(timezone.utc), "to_bot": False})
         stored = [e["content"] for e in j.channel_history[self.channel.id]]
-        self.assertEqual(stored, [f"message {i}" for i in range(300 - j.LLM_HISTORY - 1, 300)])
+        self.assertEqual(stored, [f"message {i}" for i in range(100, j.HISTORY_SCAN + 100)])
 
-    async def test_store_keeps_jevs_messages_to_it_past_the_llm_window(self):
-        for i in range(j.LLM_HISTORY + 5):
+    async def test_store_keeps_jevs_messages_to_it_past_its_window(self):
+        for i in range(j.HISTORY_SCAN + 5):
             j.add_history(self.channel.id, {"role": "user", "name": "pip", "content": f"chatter {i}", "id": 1000 + i,
                                             "at": datetime.now(timezone.utc), "to_bot": False})
         to_bot = [e for e in j.channel_history[self.channel.id] if e["to_bot"]]
@@ -902,13 +957,12 @@ class LongHistoryTests(_Handling):
         self.assertNotIn("message 230\n", state)
 
 
-class LongContextChannelTests(_Handling):
-    """In a LONG_CHAT_CHANNELS channel another LLM sees the last LLM_HISTORY messages, as anywhere else; the channel's
-    history keeps everything a rebuild read, for Rocky's log."""
+class HistoryForRockyTests(_Handling):
+    """Another LLM sees the last LLM_HISTORY messages, though the channel's history keeps everything a rebuild read,
+    for Rocky's log."""
 
     def setUp(self):
         super().setUp()
-        patch_all(self, [(j, "LONG_CHAT_CHANNELS", {self.channel.id})])
         self.start = datetime.now(timezone.utc) - timedelta(hours=1)
         j.channel_history[self.channel.id] = []
 
@@ -938,7 +992,7 @@ class LongContextChannelTests(_Handling):
         self.assertIn(f"message {300 - j.LLM_HISTORY}\n", user["content"])
         self.assertEqual(self.trace["llm_messages"], j.LLM_HISTORY + 1)
 
-    async def test_a_rebuild_keeps_everything_it_read_only_in_these_channels(self):
+    async def test_a_rebuild_keeps_everything_it_read(self):
         scanned = []
         for i in range(j.HISTORY_SCAN):
             m = self.said(f"old {i}", name="kettle", ping=False)
@@ -953,11 +1007,6 @@ class LongContextChannelTests(_Handling):
         await self.load_history(SimpleNamespace(channel=self.channel))
         self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]],
                          [f"old {i}" for i in range(j.HISTORY_SCAN)])  # not just the latest LLM_HISTORY
-
-        j.channel_history[self.channel.id] = []
-        with patch.object(j, "LONG_CHAT_CHANNELS", set()):
-            await self.load_history(SimpleNamespace(channel=self.channel))
-        self.assertEqual(len(j.channel_history[self.channel.id]), j.LLM_HISTORY + 1)  # trimmed elsewhere
 
 if __name__ == "__main__":
     unittest.main()

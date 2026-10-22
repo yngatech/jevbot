@@ -41,8 +41,6 @@ TOKEN = os.environ["DISCORD_TOKEN_JEV"]
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
 STATUS_CHANNEL = int(os.environ.get("STATUS_CHANNEL_ID") or 0)  # where each new status is also posted — unset for nowhere
 TIMEZONE = ZoneInfo(os.environ.get("TIMEZONE") or "UTC")  # the clock an LLM's transcript shows times on (IANA name)
-# Channels where !model rocky is Rocky itself, the channel its conversation (rocky_harness) — comma-separated IDs
-LONG_CHAT_CHANNELS = {int(c) for c in (os.environ.get("LONG_CONTEXT_CHANNEL_IDS") or "").split(",") if c.strip()}
 VIEWER_PORT = int(os.environ.get("ROCKY_VIEWER_PORT") or 0)  # the page of Rocky's logs, on 127.0.0.1 — unset for none
 API_URL = "https://openrouter.ai/api/alpha/decisions"
 MODEL = "~typesafe/jev-latest"
@@ -57,6 +55,7 @@ HISTORY_TO_BOT = 6              # earlier messages to jev (mentions, pinged repl
 HISTORY_CHATTER = 8             # earlier channel messages not aimed at jev in the transcript — 0 to leave them out
 LLM_HISTORY = 200               # earlier channel messages, any kind, in an LLM's transcript (see !model) — ~300 lines with rocky's replies
 HISTORY_SCAN = 400              # recent messages read to rebuild a channel's history after a restart
+FILL_SCAN = 3000                # the most messages read back to fill a channel's new Rocky log (rocky_harness.FILL)
 CATCH_UP_WINDOW = 30            # minutes — on startup, answer each channel's latest message to jev from this long ago that it missed
 CHAIN_DEPTH = 20                # Discord replies followed back from a message, looking for a !nocontext it carries on — and messages kept per side conversation
 SIDE_TALKS = 50                 # side conversations (!nocontext and the replies under it) kept, the latest
@@ -156,11 +155,10 @@ def shown(entries, limit=None):
     return recent(keep[::-1]) if limit is None else keep[::-1][-limit:]
 
 # What a channel's history keeps: enough for both transcripts — Jev's can reach further back for messages to jev
-# when there's a lot of chatter. +1: the message being answered. In LONG_CHAT_CHANNELS, all a rebuild reads, so
-# Rocky's log starts with as much of the channel as there is, and gets everything it missed while jev was offline.
+# when there's a lot of chatter — and all a rebuild reads, so Rocky's log gets everything it missed while jev was
+# offline. An LLM's transcript shows the last LLM_HISTORY of them.
 def kept(entries, ch_id):
-    longest = HISTORY_SCAN if ch_id in LONG_CHAT_CHANNELS else LLM_HISTORY + 1
-    keep = {id(e) for e in recent(entries, HISTORY_TO_BOT + 1, HISTORY_CHATTER)} | {id(e) for e in entries[-longest:]}
+    keep = {id(e) for e in recent(entries, HISTORY_TO_BOT + 1, HISTORY_CHATTER)} | {id(e) for e in entries[-HISTORY_SCAN:]}
     return [e for e in entries if id(e) in keep]
 
 def add_history(ch_id, entry):
@@ -775,9 +773,9 @@ LLMS = {
     "haiku": {"id": "anthropic/claude-haiku-5.5", "shuffle": True, "question_dice": 0.33,
               "tail": " Like Rocky: a few words, one short sentence at most.", "window": 1_000_000},
 }
-# Haiku as Rocky itself, in the channels in LONG_CHAT_CHANNELS: the channel as its conversation, with tools to react
-# and remember (rocky_harness). Elsewhere it writes like haiku. cache_marks: mark where its log's cache ends — Claude
-# only caches what's marked, so without them every turn reads the whole log at full price.
+# Haiku as Rocky itself: the channel as its conversation, with tools to react and remember (rocky_harness). In a side
+# conversation it writes like haiku. cache_marks: mark where its log's cache ends — Claude only caches what's marked,
+# so without them every turn reads the whole log at full price.
 LLMS["rocky"] = LLMS["haiku"] | {"harness": True, "cache_marks": True}
 LLM_MAX_TOKENS = 60             # only to stop a runaway reply — Rocky decides how much to say
 LLM_TEMPERATURE = 1.0
@@ -1504,16 +1502,10 @@ async def attach_reactions(entry, m, prefix="reply_"):
     if not failed and (saved.get("counts") != counts or saved.get("reactors") != reactors):
         remember_reactors(m.id, counts, reactors)
 
-async def load_history(first):
-    ch = first.channel.id
-    known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
-    known |= side_of.keys()
-    scanned, found, replies = [], [], {}
-    try:
-        async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
-            scanned.append(m)
-    except Exception as e:  # no Read Message History permission — start empty, like before
-        log.warning(f"Loading history for {ch} failed: {e}")
+# Messages read from Discord, newest first, as history entries, oldest first, each with the side conversation it's
+# in (None for none) and jev's reply to it, which goes back under it. known: messages to leave out.
+def history_entries(scanned, known=()):
+    found, replies = [], {}
     for m in reversed(scanned):  # oldest first, so a side conversation's !nocontext comes before the replies under it
         if (root := m.id if no_context(m) else m.reference and side_of.get(m.reference.message_id)) is not None:
             side_of[m.id] = root
@@ -1521,11 +1513,25 @@ async def load_history(first):
             replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
         elif m.id not in known and (entry := history_entry(m)):
             found.append((entry, root))
-    talk, reacting = [], []
     for entry, root in found:
         if r := replies.get(entry["id"]):
             entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(r), r.id, r.created_at
             entry["reply_users"] = message_users(r)
+    return [(entry, root, replies.get(entry["id"])) for entry, root in found]
+
+async def load_history(first):
+    ch = first.channel.id
+    known = {e["id"] for e in channel_history[ch]}  # chatter already recorded live since startup
+    known |= side_of.keys()
+    scanned = []
+    try:
+        async for m in first.channel.history(limit=HISTORY_SCAN, before=first):
+            scanned.append(m)
+    except Exception as e:  # no Read Message History permission — start empty, like before
+        log.warning(f"Loading history for {ch} failed: {e}")
+    talk, reacting = [], []
+    for entry, root, r in history_entries(scanned, known):
+        if r:
             reacting.append(attach_reactions(entry, r))
         if root is None:
             talk.append(entry)
@@ -1685,8 +1691,9 @@ async def on_message(m):
         return  # a DM from anyone else, or jev's own — not even kept as history
     if m.guild and not m.author.bot:  # not jev's own posts, or each status would earn the next
         heard = True
-    # Rocky's log of the channel takes everything said in it, but not side conversations, which it never sees
-    if m.channel.id in LONG_CHAT_CHANNELS and not no_context(m) and not (m.reference and m.reference.message_id in side_of):
+    # Rocky's log of the channel, once it has one, takes everything said in it, but not side conversations, which it
+    # never sees
+    if rh.has_log(m.channel.id) and not no_context(m) and not (m.reference and m.reference.message_id in side_of):
         rh.observe(m)
     if cmd := command(m):
         if not stopping.is_set():
@@ -2399,11 +2406,13 @@ def action_lines(shown):
             lines.append(f"-# {'🧠 remembered' if kind == 'remember' else '🗑️ forgot'}: {about} {fact}")
     return lines
 
-# !model rocky, in LONG_CHAT_CHANNELS: Rocky takes its turn in the channel's log (rocky_harness) — its message,
-# its reactions on any message there, and what it remembers. entries: the channel's history, for what the log hasn't
-# seen (the first time, and after a restart).
+# !model rocky: Rocky takes its turn in the channel's log (rocky_harness) — its message, its reactions on any message
+# there, and what it remembers. entries: the channel's history, for what the log hasn't seen (the first time, and
+# after a restart).
 async def rocky_turn(m, entry, bot_name, entries):
     chat = rh.log_for(m.channel)
+    if not chat.seeded:
+        entries = await earlier_history(m.channel, entries) + entries
     rh.sync(chat, entries)
     waking = rh.observe(m)  # there already, unless it's one caught up on at startup
     async with gen_lock:  # no typing while it decides — it may only react (take_turn)
@@ -2460,6 +2469,25 @@ async def rocky_turn(m, entry, bot_name, entries):
     entry["reply_id"], entry["reply_at"] = sent.id, sent.created_at
     entry["reply_users"] = {k: v for x in [sent, *more] for k, v in message_users(x).items()}
 
+# A new log starts with as much of the channel as rocky_harness.FILL of it holds: history from before entries (the
+# channel's, oldest first), read back until it's that big, or FILL_SCAN messages. Not side conversations, or people's
+# reactions to jev's replies — a log only has what it sees from then on.
+async def earlier_history(channel, entries):
+    room = rh.fill_chars() - rh.entry_chars(entries)
+    first = min((e["id"] for e in entries if e.get("id")), default=None)
+    scanned = []
+    try:
+        async for m in channel.history(limit=FILL_SCAN, before=discord.Object(first) if first else None):
+            scanned.append(m)
+            room -= len(message_text(m)) + rh.EVENT_CHARS
+            if room <= 0:
+                break
+    except Exception as e:  # no Read Message History permission — the log starts with what there is
+        log.warning(f"Reading back {channel.id} for Rocky's log failed: {e}")
+    found = [entry for entry, root, _ in history_entries(scanned, side_of.keys()) if root is None]
+    log.info(f"[ROCKY] #{getattr(channel, 'name', channel.id)} log starts {len(found)} messages further back")
+    return found
+
 async def handle(m, c):
     if m.guild is None:
         dm_channels.add(m.channel.id)  # before its history loads, so a status made meanwhile can't show it
@@ -2499,7 +2527,7 @@ async def handle(m, c):
             log.info(f"[OUT] out of credit: {gif}")
             await m.reply(gif, mention_author=False)
             return
-        if root is None and model_name == "rocky" and m.channel.id in LONG_CHAT_CHANNELS:
+        if root is None and model_name == "rocky":
             await rocky_turn(m, entry, bot_name, channel_history[m.channel.id])
             return
         # Decided before typing() — a reaction sends no message, so the typing indicator would linger

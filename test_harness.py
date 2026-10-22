@@ -603,6 +603,8 @@ class KeepingTests(_Case):
         self.assertEqual([e["type"] for e in log.events], ["message", "rocky", "message", "rocky", "result", "message"])
         self.assertIs(log.events[-1], live)
         self.assertEqual(log.ids["901"], "you")
+        # its reaction as it would have called it, the emoji itself: not "\ud83d\ude02", which Haiku didn't read as one
+        self.assertEqual(log.events[3]["calls"][0]["arguments"], '{"emoji": "😂", "message": 3}')
         before = rh.render(log, "rocky")
         rh.sync(log, history + [{"role": "user", "name": "kettle", "content": "back", "at": T0 + timedelta(minutes=9), "id": 909},
                                 {"role": "user", "name": "kettle", "content": "old", "at": T0 - timedelta(days=1), "id": 899}])
