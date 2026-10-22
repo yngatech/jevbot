@@ -1,6 +1,6 @@
 """
 Rocky as an agent: an LLM is Rocky, the channel is its conversation, and what it writes is posted. !model rocky, in every
-channel. A side conversation gets a log of its own for each answer, never saved.
+channel. A !nocontext message opens a thread, a channel of its own with a log like any other, but without memories.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
@@ -29,6 +29,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image, UnidentifiedImageError
 
@@ -95,17 +96,24 @@ This is #{channel} on Discord, as it happens. People's messages come to you as <
 
 Your turn is what you write: it's posted in the channel as your reply to the first message that woke you. So write only {bot}'s message, in his voice — never notes about the chat or about what {bot} would say — and don't start it with @ their name. You can also use tools. Your response ends at your first call, so write your message first and then make your calls, in the same response — a call on its own, with no message, is only for what needs no answer. Don't wait to see what a tool did before you speak, except to look and at the bar (below):
 - react: put an emoji on a message. Most of what's said to you that isn't a question or a request — "lol", "welp", "bad rocky", news, moans, thanks, polls — a friend would just react to, not answer: react, and write nothing. But a question to you always gets an answer in words, yes-or-no ones too, and so does a request; write a message too when you truly have something to add. To react and speak, write the message, then react: a reaction first leaves your turn with nothing said.
-- remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
-- forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
-- note: write something down for yourself.
+{memory_tools}- note: write something down for yourself.
 - bar: see whether the bar is open, and what's on.
 - order: order a drink at the bar, for you or for someone here.
 - look: see the pictures in a message. A [photo], [gif] or [sticker], or a link, is all you know of a picture until you look — so when you're shown one, or asked about one, look and write nothing yet: you'll see it, and then answer. Never say what's in a picture you haven't looked at.
-What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message.
+{memories}
 
 The bar is {bar}, down the road. It keeps hours, and some days it doesn't open at all, or something's run out — so when you want a drink, or someone asks you to get one, call bar or order and write nothing yet: you'll see what the bar says, and then tell them in words what happened — open or not, ordered or not — not just a reaction.
 
 Nobody sees your notes or your thinking: only your message and your reactions are seen. So when you're asked to keep something to yourself — a number you've picked, the answer in a guessing game — note the actual number or answer, and leave it out of your message. It's a game, so play it fair: check each guess against your note and say whether they've got it (yes, or no), and say the answer once they've got it or give up. Your notes stay with your turns, so you'll still know it later."""
+
+# The parts of HARNESS for memories — a log without them (Log.space None) has neither, nor the tools
+MEMORY_TOOLS = """- remember: keep a fact for later chats in this server — whenever a message to you has one, as well as answering it. About a person — food, pets, jobs, where they live, teams, trips, plans, big news, or anything someone asks you to remember — only from what they or a friend said. About {bot} — what you say you like or are — so you answer the same next time. One short fact each, written to follow its name ("is vegetarian"). Not small talk, not a summary of the chat, nothing already in <memories>.
+- forget: drop a fact by its number, when someone says it's wrong, asks you to forget it, or it has changed — and then remember the new one in the same response.
+"""
+MEMORIES = "What you've remembered is in <memories>, and in your remember calls since. Never mention reacting, remembering, forgetting or noting in your message."
+NO_MEMORIES = ("This thread is apart from the rest of the server: you have no memories here, and nothing said here is "
+               "kept for later. Never mention reacting or noting in your message.")
+MEMORY_CALLS = {"remember", "forget"}
 
 TOOLS = [
     {"type": "function", "function": {
@@ -246,7 +254,7 @@ def memories_changed():
 @dataclass
 class Log:
     channel: str
-    space: str = "test"
+    space: str = "test"                        # whose memories it has: a server's, or a DM's — None for none
     channel_id: int = 0
     events: list = field(default_factory=list)
     next_n: int = 1
@@ -279,10 +287,14 @@ class Log:
     # <memories> as they are now: at a jump, or when someone wants a fact really gone. Everything after it in the
     # request is then read at full price once, so not for every remember — those are in the log as calls.
     def reorganise(self):
-        self.shown = [dict(f) for f in memory(self.space)["facts"]]
+        self.shown = [dict(f) for f in memory(self.space)["facts"]] if self.space else []
 
     def discord_id(self, n):
         return next((int(i) for i, v in self.ids.items() if v == n), None)
+
+    # The channel message n is in: the log's, but for a thread's first, the message it's on, in the channel
+    def channel_of(self, n):
+        return next((e.get("in") for e in self.events if e["type"] == "message" and e["n"] == n), None) or self.channel_id
 
     def rocky_text(self, discord_id):
         return next((e["text"] for e in reversed(self.events) if e["type"] == "rocky" and
@@ -336,14 +348,17 @@ def memories_text(log):
         return "<memories>\nNothing yet.\n</memories>"
     return "<memories>\n" + "\n".join(f"[{f['n']}] {f['about']}: {f['fact']}" for f in log.shown) + "\n</memories>"
 
-# The request: system (persona and how this works), <memories>, then the log as turns. Cache marks on the system
+# The request: system (persona and how this works), <memories> if it has them, then the log as turns. Cache marks on the system
 # prompt, the memories, and the end of the request — the next request starts with all of it.
 # until: the last event to show — a turn's requests see the log as it was when it began, and what it's done since
 def render(log, bot_name, cache=True, until=None):
-    system = j.rocky_prompt(bot_name) + HARNESS.format(channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name, bar=BAR)
+    system = j.rocky_prompt(bot_name) + HARNESS.format(
+        channel=log.channel, timezone=j.TIMEZONE.key, bot=bot_name, bar=BAR,
+        memory_tools=MEMORY_TOOLS.format(bot=bot_name) if log.space else "", memories=MEMORIES if log.space else NO_MEMORIES)
     mark = lambda text: [{"type": "text", "text": text, **({"cache_control": CACHE} if cache else {})}]
-    messages = [{"role": "system", "content": mark(system) if cache else system},
-                {"role": "user", "content": mark(memories_text(log)) if cache else memories_text(log)}]
+    messages = [{"role": "system", "content": mark(system) if cache else system}]
+    if log.space:
+        messages.append({"role": "user", "content": mark(memories_text(log)) if cache else memories_text(log)})
     pending, clock = [], {}
 
     def flush():
@@ -410,6 +425,8 @@ def use(log, call, waking):
     f = call.get("function") or {}
     try:
         args = json.loads(f.get("arguments") or "{}")
+        if f.get("name") in MEMORY_CALLS and not log.space:
+            return None, "No memories here."
         if f.get("name") == "react":
             return ("react", args.get("message") or waking["n"], args["emoji"]), "Reacted."
         if f.get("name") == "remember":
@@ -458,7 +475,8 @@ def use(log, call, waking):
 async def pictures(log, n):
     if not isinstance(n, int) or not (discord_id := log.discord_id(n)):
         return None
-    channel = j.bot.get_channel(log.channel_id) or await j.bot.fetch_channel(log.channel_id)
+    channel_id = log.channel_of(n)
+    channel = j.bot.get_channel(channel_id) or await j.bot.fetch_channel(channel_id)
     m = await channel.fetch_message(discord_id)
     urls = [a.url for a in m.attachments if (a.content_type or "").startswith("image/")]
     urls += [x.url for e in m.embeds for x in (e.image, e.thumbnail) if x and x.url]
@@ -525,6 +543,9 @@ def said(content, bot_name):
 # requests go through jev_bot.llm_message, which counts their cost on the trace.
 # typing: the channel's typing() — shown only for that second request. Discord shows "rocky is typing" for ~10s after
 # it's sent, and nothing stops it but a message, so shown while it decided, it lingered after a turn that only reacted.
+def tools_for(log):
+    return TOOLS if log.space else [t for t in TOOLS if t["function"]["name"] not in MEMORY_CALLS]
+
 async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
     turn = Turn()
     # Already in one of its turns' requests, before what it said: it's had its answer. Its messages from outside a turn
@@ -556,7 +577,7 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
                 # from outside a turn came after the one that woke it. Not a str, so the cache mark stays on people's turn
                 if messages[-1]["role"] == "assistant":
                     messages.append({"role": "user", "content": [{"type": "text", "text": "(Your turn.)"}]})
-                message = await j.llm_message(model, messages, MAX_TOKENS, tools=TOOLS, reasoning=REASONING)
+                message = await j.llm_message(model, messages, MAX_TOKENS, tools=tools_for(log), reasoning=REASONING)
             if message is None:
                 break
             turn.requests += 1
@@ -682,14 +703,18 @@ def flush():
         memories_save.cancel()
         save_memories()
 
-def log_for(channel):
+# memories: False for a !nocontext thread's, new — it has nothing from before, so it's seeded already
+def log_for(channel, memories=True):
     if (log := logs.get(channel.id)) is not None:
         return log
     space = str(channel.guild.id) if getattr(channel, "guild", None) else f"dm-{channel.id}"
-    log = Log(getattr(channel, "name", None) or "DM", space, channel.id)
+    log = Log(getattr(channel, "name", None) or "DM", space if memories else None, channel.id, seeded=not memories)
     try:
         saved = json.loads((LOG_DIR / f"{channel.id}.json").read_text())
         log.next_n, log.ids, log.shown, log.seeded = saved["next_n"], saved["ids"], saved["shown"], saved["seeded"]
+        log.space = saved.get("space", log.space)
+        if not getattr(channel, "name", None):  # only its id: a thread's log, found by its first message
+            log.channel = saved.get("channel", log.channel)
         log.asked = saved.get("asked") and datetime.fromisoformat(saved["asked"])
         log.events = [e | {"at": datetime.fromisoformat(e["at"])} if e.get("at") else e for e in saved["events"]]
         log.code = saved.get("code")
@@ -701,11 +726,40 @@ def log_for(channel):
     logs[channel.id] = log
     return log
 
-# A log for one answer, never saved: a side conversation's, which the channel's log doesn't have — sync seeds it
-# with the conversation
-def apart(channel):
-    space = str(channel.guild.id) if getattr(channel, "guild", None) else f"dm-{channel.id}"
-    return Log(getattr(channel, "name", None) or "DM", space, channel.id, seeded=True, keep=False)
+# A !nocontext thread: every message in it is to Rocky, and its log has no memories
+def no_memories(channel):
+    return isinstance(channel, j.discord.Thread) and memoryless(channel.id)
+
+# Read from its file once, for a log that isn't loaded: a log never gains or loses its memories
+saved_memoryless: dict[int, bool] = {}
+
+def memoryless(channel_id):
+    if (log := logs.get(channel_id)) is not None:
+        return log.space is None
+    if channel_id not in saved_memoryless:
+        try:
+            saved_memoryless[channel_id] = json.loads((LOG_DIR / f"{channel_id}.json").read_text()).get("space", "") is None
+        except FileNotFoundError:
+            return False  # not yet: it may be a thread about to open
+        except (OSError, ValueError):
+            saved_memoryless[channel_id] = False
+    return saved_memoryless[channel_id]
+
+# The log of the !nocontext thread opened on a message, which has the message's id, or None
+def thread_log(message_id):
+    return log_for(SimpleNamespace(id=message_id, name=None, guild=None)) if memoryless(message_id) else None
+
+# The logs a message is in: its channel's, and the !nocontext thread opened on it, which it starts
+def logs_with(channel_id, message_id):
+    found = [logs[channel_id]] if channel_id in logs else []
+    if message_id != channel_id and (log := thread_log(message_id)):
+        found.append(log)
+    return found
+
+# A log for one answer, with nothing before it and no memories, never saved: a !nocontext message where there's no
+# thread for it — in a DM, or when one couldn't be opened
+def apart(name, channel_id):
+    return Log(name, None, channel_id, seeded=True, keep=False)
 
 # Updates: commits to UPDATES_FROM since a log's last, as <update>s at its end — appended, so the cache keeps all
 # before them. Only the subject, without its scope or PR number ("give Rocky a bar to order drinks from"): the repo is
@@ -762,7 +816,8 @@ def replied_outside(m):
     return {"author": "you" if r.author.id == j.bot.user.id else r.author.display_name, "text": snippet(text, 200)}
 
 # A message in the channel, as it arrives: people's and other apps' — not Rocky's own (its turns add those), commands,
-# or side conversations (jev_bot keeps those out). Returns its event, or None. log: m's channel's, unless it's given.
+# or !nocontext messages (jev_bot keeps those out of the channel's). Returns its event, or None. log: m's channel's,
+# unless it's another's — a !nocontext message starts its thread's.
 def observe(m, log=None):
     log = log or log_for(m.channel)
     if (n := log.ids.get(str(m.id))) is not None:
@@ -774,45 +829,48 @@ def observe(m, log=None):
         reply_to = log.ids.get(str(m.reference.message_id))
         if reply_to == "you":
             you_said = log.rocky_text(m.reference.message_id)
-        elif reply_to is None:
+        elif reply_to is None and log.space:  # a !nocontext one shows nothing from outside it
             older = replied_outside(m)
     e = log.message(m.author.display_name, text, m.created_at, to_bot=j.should_respond(m), reply_to=reply_to,
                     uid=m.author.id, discord_id=m.id, you_said=you_said, older=older)
+    if m.channel.id != log.channel_id:
+        e["in"] = m.channel.id
     changed(log)
     return e
 
 # Someone's reaction on a message in a log, added or taken off
 def reacted(channel_id, message_id, emoji, author, added=True):
-    if (log := logs.get(channel_id)) is None or (on := log.ids.get(str(message_id))) is None:
-        return
-    log.add("reaction", on=on, you_said=log.rocky_text(message_id) if on == "you" else None, emoji=emoji,
-            author=author or "someone", removed=not added)
-    changed(log)
+    for log in logs_with(channel_id, message_id):
+        if (on := log.ids.get(str(message_id))) is not None:
+            log.add("reaction", on=on, you_said=log.rocky_text(message_id) if on == "you" else None, emoji=emoji,
+                    author=author or "someone", removed=not added)
+            changed(log)
 
 def edited(m):
-    log = logs.get(m.channel.id)
-    if log is None or not isinstance(n := log.ids.get(str(m.id)), int):
-        return
-    text = j.message_text(m)
-    last = next((e["text"] for e in reversed(log.events)
-                 if e["type"] == "message" and e["n"] == n or e["type"] == "edit" and e["on"] == n), None)
-    if text and text != last:
-        log.add("edit", on=n, text=text)
-        changed(log)
+    for log in logs_with(m.channel.id, m.id):
+        if not isinstance(n := log.ids.get(str(m.id)), int):
+            continue
+        text = j.message_text(m)
+        last = next((e["text"] for e in reversed(log.events)
+                     if e["type"] == "message" and e["n"] == n or e["type"] == "edit" and e["on"] == n), None)
+        if text and text != last:
+            log.add("edit", on=n, text=text)
+            changed(log)
 
 # A message deleted: marked now, and blanked at the next tidy
 def deleted(channel_id, message_id):
-    if (log := logs.get(channel_id)) is None or (on := log.ids.get(str(message_id))) is None:
-        return
-    if on == "you":
-        log.add("deleted", on="you", you_said=log.rocky_text(message_id))
-    else:
-        message = next((e for e in log.events if e["type"] == "message" and e["n"] == on), None)
-        if message is None or message.get("deleted"):
-            return
-        message["deleted"] = True  # not shown until tidy, so nothing earlier in the request changes yet
-        log.add("deleted", on=on)
-    changed(log)
+    for log in logs_with(channel_id, message_id):
+        if (on := log.ids.get(str(message_id))) is None:
+            continue
+        if on == "you":
+            log.add("deleted", on="you", you_said=log.rocky_text(message_id))
+        else:
+            message = next((e for e in log.events if e["type"] == "message" and e["n"] == on), None)
+            if message is None or message.get("deleted"):
+                continue
+            message["deleted"] = True  # not shown until tidy, so nothing earlier in the request changes yet
+            log.add("deleted", on=on)
+        changed(log)
 
 # One of Rocky's messages from outside a turn (written while another !model was chosen, or a status posted in
 # STATUS_CHANNEL), so the log has it — loaded if nothing's been said there since a restart
