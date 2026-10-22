@@ -730,21 +730,40 @@ def log_for(channel, memories=True):
 def no_memories(channel):
     return isinstance(channel, j.discord.Thread) and memoryless(channel.id)
 
+# Read from its file once, for a log that isn't loaded: a log never gains or loses its memories
+saved_memoryless: dict[int, bool] = {}
+
 def memoryless(channel_id):
     if (log := logs.get(channel_id)) is not None:
         return log.space is None
-    try:
-        return json.loads((LOG_DIR / f"{channel_id}.json").read_text()).get("space", "") is None
-    except (OSError, ValueError):
-        return False
+    if channel_id not in saved_memoryless:
+        try:
+            saved_memoryless[channel_id] = json.loads((LOG_DIR / f"{channel_id}.json").read_text()).get("space", "") is None
+        except FileNotFoundError:
+            return False  # not yet: it may be a thread about to open
+        except (OSError, ValueError):
+            saved_memoryless[channel_id] = False
+    return saved_memoryless[channel_id]
 
-# The logs a message is in: its channel's, and the !nocontext thread opened on it, which it starts — the thread has
-# the message's id
+# The log of the !nocontext thread opened on a message, which has the message's id, or None
+def thread_log(message_id):
+    return log_for(SimpleNamespace(id=message_id, name=None, guild=None)) if memoryless(message_id) else None
+
+# The logs a message is in: its channel's, and the !nocontext thread opened on it, which it starts
 def logs_with(channel_id, message_id):
     found = [logs[channel_id]] if channel_id in logs else []
-    if message_id != channel_id and memoryless(message_id):
-        found.append(log_for(SimpleNamespace(id=message_id, name=None, guild=None)))
+    if message_id != channel_id and (log := thread_log(message_id)):
+        found.append(log)
     return found
+
+# The Discord id of Rocky's answer to a thread's first message: its turn right after it, before anyone else spoke
+def first_answer(log):
+    for e in log.events[1:]:
+        if e["type"] == "message":
+            return None
+        if e["type"] == "rocky" and e.get("text") and e.get("id"):
+            return e["id"]
+    return None
 
 # A log for one answer, with nothing before it and no memories, never saved: a !nocontext message where there's no
 # thread for it — in a DM, or when one couldn't be opened

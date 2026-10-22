@@ -31,7 +31,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.reactors_dir.cleanup)
         self.user = SimpleNamespace(id=100000000000000001, bot=True, display_name="Testbot")
         self.role = SimpleNamespace(id=200000000000000001, mention="<@&200000000000000001>", name="Testbot")
-        self.guild = SimpleNamespace(id=400, self_role=self.role, me=self.user, threads=[],
+        self.guild = SimpleNamespace(id=400, self_role=self.role, me=self.user, threads=[], get_thread=lambda _: None,
                                      get_member=lambda _: None, get_role=lambda _: None,
                                      _resolve_channel=lambda _: None)
         self.channel = Mock(id=300)
@@ -46,6 +46,7 @@ class _Discord(unittest.IsolatedAsyncioTestCase):
             (j, "DM_USERS", {500}),
             (j, "channel_history", defaultdict(list)),
             (j, "heard", False),
+            (j, "taken", {}),
             (j, "reactor_names", {}),
             (j, "reactor_cache", {}),
             (j, "reactors_save", None),
@@ -482,7 +483,7 @@ class _Handling(_Discord):
 
     def discord_reply(self, m, content):
         users = {u.id: u for message in self.by_id.values() for u in [message.author, *message.mentions]}
-        self.sent = self.said(content, to=m, bot=True)
+        self.sent = self.said(content, to=m, bot=True, channel=m.channel)
         self.sent.mentions = [users[uid] for uid in self.sent.raw_mentions if uid in users]
         self.sent.clean_content = discord.Message.clean_content.function(self.sent)
         return self.sent
@@ -803,10 +804,9 @@ class NoContextThreadTests(_Handling):
             q.reply.assert_not_awaited()
             thread.send.assert_awaited_once()
             self.assertEqual(thread.send.call_args.args[0], "Granite.")
-            self.assertEqual((self.trace["no_context"], self.trace["thread_id"]), (True, thread.id))
+            self.assertEqual((self.trace["no_context"], self.trace["channel_id"]), (True, thread.id))
             # !why finds it from the message or in the thread
-            t = {**self.trace, "channel_id": self.channel.id}  # as respond_traced has it
-            self.assertTrue(j.in_channel(t, self.channel.id) and j.in_channel(t, thread.id))
+            self.assertTrue(j.in_channel(self.trace, self.channel.id) and j.in_channel(self.trace, thread.id))
             # in the thread, nobody needs to tag jev, and it has the thread so far
             follow = self.said("why granite", ping=False, channel=thread)
             self.assertTrue(j.should_respond(follow))
@@ -842,6 +842,52 @@ class NoContextThreadTests(_Handling):
         with patch.object(j, "DM_USERS", set()), patch.object(j, "respond", new_callable=AsyncMock) as respond:
             await j.catch_up()
         respond.assert_not_awaited()
+
+    async def test_catch_up_answers_a_thread_opened_but_not_answered(self):
+        q = self.asked("!nocontext favourite rock?")
+        thread = await j.open_thread(q)  # and then a restart, before it answered
+        rh.flush()
+        rh.logs.clear()
+
+        def history(**kwargs):
+            async def page():
+                yield q
+            return page()
+        self.channel.history = history
+        with patch.object(j, "DM_USERS", set()), patch.object(j, "model_name", "haiku"), \
+                patch.object(j.bot, "fetch_channel", AsyncMock(return_value=thread)), \
+                patch.object(j, "generate_reply", AsyncMock(return_value="Granite.")):
+            await j.catch_up()
+        q.create_thread.assert_awaited_once()  # the thread it opened, not another
+        self.assertEqual(thread.send.call_args.args[0], "Granite.")
+
+    async def test_editing_the_question_is_seen_in_its_thread(self):
+        q = self.asked("!nocontext favourite rock?")
+        with patch.object(j, "model_name", "haiku"):
+            await self.answer(q, "Granite.")
+            q.content = f"<@{self.user.id}> !nocontext favourite colour?"
+            q.clean_content = discord.Message.clean_content.function(q)
+            await j.on_message_edit(q, q)
+            follow = self.said("why", ping=False, channel=self.threads[q.id])
+            self.assertEqual(await self.answer(follow), [("pip", "@Testbot favourite colour?", "Granite.")])
+
+    async def test_after_a_restart_a_reaction_only_start_has_no_answer(self):
+        q = self.asked("!nocontext favourite rock?")
+        with patch.object(j, "model_name", "rocky"), \
+                patch.object(j, "llm_message", AsyncMock(return_value=answer(calls=[("react", {"emoji": "🪨"})]))):
+            await j.handle(q, j.message_text(q))
+        thread = self.threads[q.id]
+        later = self.said("and you?", ping=False, channel=thread)
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", AsyncMock(return_value=answer("Basalt."))):
+            await j.on_message(later)
+        self.sent.reference = None  # as a second part would be: not a reply
+        j.channel_history.clear()
+        j.history_loaded.clear()
+        rh.flush()
+        rh.logs.clear()
+        with patch.object(j, "model_name", "haiku"), patch.object(j, "load_history", self.load_history):
+            seen = await self.answer(self.said("so?", ping=False, channel=thread))
+        self.assertEqual(seen[0], ("pip", "@Testbot favourite rock?", None))  # not "Basalt.", which answered later
 
     async def test_nocontext_in_its_thread_carries_it_on(self):
         q = self.asked("!nocontext favourite rock?")

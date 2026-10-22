@@ -1440,7 +1440,7 @@ def history_entries(scanned, known=()):
     return [(entry, replies.get(entry["id"])) for entry in found]
 
 # A !nocontext thread's question and jev's answer, which history_entries doesn't find: the question is in the channel
-# the thread is on, and the answer isn't a reply to it. As history entries, with the answer.
+# the thread is on, and the answer isn't a reply to it — it's the one the thread's log has. As a history entry.
 async def thread_start(thread, scanned, known):
     if not rh.no_memories(thread) or thread.id in known:
         return []
@@ -1451,7 +1451,8 @@ async def thread_start(thread, scanned, known):
         return []
     if not (entry := history_entry(starter)):
         return []
-    answer = next((x for x in reversed(scanned) if x.author.id == bot.user.id and not x.reference and x.content), None)
+    answer_id = rh.first_answer(rh.logs.get(thread.id) or rh.thread_log(thread.id))
+    answer = next((x for x in scanned if x.id == answer_id and x.content not in NO_MONEY), None)
     if answer:
         entry["reply"], entry["reply_id"], entry["reply_at"] = message_text(answer), answer.id, answer.created_at
         entry["reply_users"] = message_users(answer)
@@ -1606,9 +1607,9 @@ async def catch_up():
         # Only what came after jev last replied or reacted here — anything older was left behind, not missed,
         # and answering it would walk back one more old message on every reconnect
         last = max((m.created_at for m in mine + handled), default=since)
-        # and not a !nocontext message whose thread is open: it was answered there
+        # and not a !nocontext message answered in its thread
         unanswered = [m for m in found if m.created_at > last and should_respond(m) and not command(m)
-                      and not (no_context(m) and rh.has_log(m.id))]
+                      and not (no_context(m) and (t := rh.thread_log(m.id)) and any(e["type"] == "rocky" for e in t.events))]
         if unanswered:
             log.info(f"[CATCH UP] #{ch} missed {len(unanswered)} message(s) to jev, answering the latest")
             missed.append(max(unanswered, key=lambda m: m.created_at))
@@ -1656,7 +1657,9 @@ async def on_raw_bulk_message_delete(p):
 @bot.event
 async def on_message_edit(before, after):
     rh.edited(after)
-    entry = next((e for e in channel_history.get(after.channel.id, []) if e.get("id") == after.id), None)
+    # a !nocontext message's is in its thread's
+    entry = next((e for e in channel_history.get(after.channel.id, []) + channel_history.get(after.id, [])
+                  if e.get("id") == after.id), None)
     if entry and (content := message_text(after)):
         entry["content"] = content
         entry["users"] = message_users(after, author_name=entry["name"])
@@ -1712,7 +1715,7 @@ async def emoji_image(session, e, guild):
 # Whether a log entry is for something jev did in the channel: an answer there, or in STATUS_CHANNEL a status
 def in_channel(t, channel_id):
     if "channel_id" in t:
-        return channel_id in (t["channel_id"], t.get("thread_id"))
+        return channel_id in (t["channel_id"], t.get("from_channel_id"))
     return bool(t.get("status")) and channel_id == STATUS_CHANNEL
 
 # The latest log entry in the channel that has(), or the one for `target` if given — by default an answer or status
@@ -2418,7 +2421,10 @@ async def open_thread(m):
         return None
     name = " ".join(message_text(m).replace(f"@{m.guild.me.display_name}", "").split()) or "nocontext"
     try:
-        thread = await m.create_thread(name=name if len(name) <= 100 else name[:99] + "…", auto_archive_duration=1440)
+        if rh.thread_log(m.id):  # opened before a restart, and not answered: caught up on
+            thread = m.guild.get_thread(m.id) or await bot.fetch_channel(m.id)
+        else:
+            thread = await m.create_thread(name=name if len(name) <= 100 else name[:99] + "…", auto_archive_duration=1440)
     except discord.HTTPException as e:  # no Create Public Threads permission, say
         log.warning(f"Opening a thread on {m.id} failed: {e}")
         return None
@@ -2457,7 +2463,8 @@ async def handle(m, c):
         note(no_context=True)
         if thread:
             channel_history[thread.id].append(entry)
-            note(thread_id=thread.id)  # so !why in it finds it too
+            # answered in the thread, so it's its; !why on the message, in the channel, finds it too
+            note(channel=thread.name, channel_id=thread.id, from_channel_id=m.channel.id)
     else:
         thread, where = None, m.channel
         if m.channel.id not in history_loaded:

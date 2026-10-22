@@ -35,7 +35,8 @@ def isolate_rocky(case, here):
     # Rocky's logs and memories, empty and kept in `here`; and none of the checkout's own commits
     patch_all(case, [(rh, "LOG_DIR", Path(here) / "rocky_logs"), (rh, "MEMORY_PATH", Path(here) / "rocky_memories.json"),
                      (rh, "logs", {}), (rh, "log_saves", {}), (rh, "memories", {}), (rh, "memories_loaded", True),
-                     (rh, "memories_save", None), (rh, "head", lambda: None)])
+                     (rh, "memories_save", None), (rh, "head", lambda: None),
+                     (rh, "saved_memoryless", {})])
 
 
 def answer(text="", calls=(), reasoning=None):
