@@ -70,6 +70,11 @@ class ReactionContextTests(_Discord):
     def transcript(self, **kwargs):
         return j.transcript("how are you?", "Speaker", "Testbot", [self.entry], [], **kwargs)
 
+    # Who reacted to jev's reply, as Rocky's pings find them (mention_targets)
+    def names(self, entry=None, prefix="reply_"):
+        entry = entry or self.entry
+        return "Hello" + j.reacted(entry.get(f"{prefix}reactions"), entry.get(f"{prefix}reactors"))
+
     def reaction(self, emoji="😂", fail=False):
         async def users():
             if fail:
@@ -83,11 +88,12 @@ class ReactionContextTests(_Discord):
         await j.on_raw_reaction_add(self.payload())
         await j.on_raw_reaction_add(self.payload(502, "Pip"))
         await j.on_raw_reaction_add(self.payload(self.user.id, "Testbot"))
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
         self.assertNotIn("😂", self.transcript(reactions=False, marked=True))
-        self.assertNotIn("@Moss", self.transcript(their_reactions=False))
+        self.assertIn("Hello (😂×2)", self.transcript())  # Jev gets the count
+        self.assertNotIn("😂", self.transcript(their_reactions=False))
         await j.on_raw_reaction_remove(self.payload())
-        self.assertIn("Hello (😂 by @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Pip)", self.names())
         await j.on_raw_reaction_remove(self.payload(502, "Pip"))
         self.assertNotIn("😂", self.transcript())
 
@@ -95,8 +101,8 @@ class ReactionContextTests(_Discord):
         await j.on_raw_reaction_add(self.payload())
         await j.on_raw_reaction_add(self.payload(502, "Pip", "💀"))
         await j.on_raw_reaction_clear_emoji(self.payload())
-        self.assertNotIn("@Moss", self.transcript())
-        self.assertIn("💀 by @Pip", self.transcript())
+        self.assertNotIn("@Moss", self.names())
+        self.assertIn("💀 by @Pip", self.names())
         await j.on_raw_reaction_clear(self.payload())
         self.assertNotIn("reply_reactors", self.entry)
         self.assertNotIn("💀", self.transcript())
@@ -114,7 +120,7 @@ class ReactionContextTests(_Discord):
         j.channel_history[self.channel.id] = []
         await j.load_history(SimpleNamespace(channel=self.channel))
         self.entry = j.channel_history[self.channel.id][0]
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
 
     async def test_side_chain_and_standalone_reply_names(self):
         question = MentionTests.message(self)
@@ -125,8 +131,7 @@ class ReactionContextTests(_Discord):
         self.assertEqual(entries[0]["reply_reactors"]["😂"], {"501": "Moss", "502": "Pip"})
         standalone = {"role": "assistant", "content": "Hello"}
         await j.attach_reactions(standalone, reply, prefix="")
-        self.assertIn("Hello (😂 by @Moss, @Pip)",
-                      j.transcript("hi", "Speaker", "Testbot", [standalone], []))
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names(standalone, prefix=""))
 
     async def test_http_failure_keeps_counts_and_old_logs_render(self):
         reply = SimpleNamespace(id=700, reactions=[self.reaction(fail=True)])
@@ -140,13 +145,13 @@ class ReactionContextTests(_Discord):
             j.bot, "fetch_user", new_callable=AsyncMock, return_value=SimpleNamespace(display_name="Moss")
         ):
             await j.on_raw_reaction_add(p)
-        self.assertIn("😂×3 by @Moss", self.transcript())
+        self.assertIn("😂×3 by @Moss", self.names())
 
     async def test_a_rebuild_reuses_saved_names_without_asking_discord(self):
         j.reactor_cache["700"] = {"counts": {"😂": 2}, "reactors": {"😂": {"501": "Moss", "502": "Pip"}}}
         unasked = SimpleNamespace(emoji="😂", count=3, me=True, users=Mock(side_effect=AssertionError("asked Discord")))
         await j.attach_reactions(self.entry, SimpleNamespace(id=700, reactions=[unasked]))
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.transcript())
+        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
 
     async def test_only_an_emoji_whose_count_changed_is_asked_about(self):
         j.reactor_cache["700"] = {"counts": {"😂": 2, "💀": 1}, "reactors": {"😂": {"501": "Moss", "502": "Pip"},
@@ -179,20 +184,16 @@ class ReactionContextTests(_Discord):
         self.assertEqual(entries[1]["reply_reactors"]["😂"], {"501": "Mossy", "502": "Pipsqueak"})
         self.assertEqual(fetch.await_count, 2)
 
-    async def test_jev_gets_counts_and_llms_get_names(self):
+    async def test_jev_gets_counts(self):
         self.entry.update(reply_reactions={"😂": 2}, reply_reactors={"😂": {"501": "Moss", "502": "Pip"}})
         seen = []
         async def loom(state, *args, **kwargs):
             seen.append(state([]))
             return ["Hi"]
-        async def llm(name, message, author, bot_name, history, *args):
-            return j.transcript(message, author, bot_name, history, [])
         with patch.object(j, "model_name", "jev"), patch.object(j, "loom", loom):
             await j.generate_reply("how are you?", "Speaker", "Testbot", [self.entry])
         self.assertIn("Hello (😂×2)", seen[0])
-        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm_reply", llm):
-            text = await j.generate_reply("how are you?", "Speaker", "Testbot", [self.entry])
-        self.assertIn("Hello (😂 by @Moss, @Pip)", text)
+        self.assertNotIn("Moss", seen[0])
 
     def test_count_shown_only_when_names_are_missing(self):
         self.assertEqual(j.reacted({"😂": 2, "💀": 3}, {"😂": {"1": "Moss", "2": "Pip"}, "💀": {"3": "Fern"}}),
@@ -574,8 +575,8 @@ class RockyHarnessTests(_Handling):
         self.partials[m.id].add_reaction.assert_awaited_once_with("😂")
         self.assertEqual(j.channel_history[self.channel.id][-1]["reaction"], "😂")
 
-    async def test_other_models_keep_their_way(self):
-        with patch.object(j, "model_name", "haiku"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
+    async def test_jev_keeps_its_way(self):
+        with patch.object(j, "model_name", "jev"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
             rh.observe(m := self.said("hello?"))
             await j.handle(m, j.message_text(m))
         self.assertNotIn("error", self.trace)
@@ -585,14 +586,14 @@ class RockyHarnessTests(_Handling):
 
     async def test_a_channel_has_no_log_until_rocky_is_woken_there(self):
         rh.logs.clear()
-        with patch.object(j, "model_name", "haiku"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
+        with patch.object(j, "model_name", "jev"), patch.object(j, "generate_reply", AsyncMock(return_value="Hello.")):
             await j.on_message(self.said("anyone seen my keys", name="kettle", ping=False))
             await j.handle(m := self.said("hello?"), j.message_text(m))
         self.assertEqual((rh.logs, list(Path(rh.LOG_DIR).glob("*"))), ({}, []))
         with patch.object(j, "llm_message", AsyncMock(return_value=answer("Hello again."))):
             await j.handle(m := self.said("still there?"), j.message_text(m))
         log = rh.logs[self.channel.id]
-        # the first log has what came before, haiku's reply too
+        # the first log has what came before, Jev's reply too
         self.assertEqual([(e["type"], e.get("text")) for e in log.events][-5:],
                          [("message", "anyone seen my keys"), ("message", "@Testbot hello?"), ("rocky", "Hello."),
                           ("message", "@Testbot still there?"), ("rocky", "Hello again.")])
@@ -650,10 +651,23 @@ class RockyHarnessTests(_Handling):
         await j.on_raw_message_delete(SimpleNamespace(channel_id=self.channel.id, message_id=m.id))
         self.assertEqual(rh.logs[self.channel.id].events[-1]["type"], "deleted")
         side = self.said("!nocontext secret soup")
-        with patch.object(j, "llm_message") as llm, patch.object(j, "generate_reply", AsyncMock(return_value="Ok.")):
+        llm = AsyncMock(return_value=answer("Soup good."))
+        with patch.object(j, "llm_message", llm):
             await j.on_message(side)
-        llm.assert_not_called()  # a side conversation is answered the old way, and never in the log
+        # a side conversation is answered from a log of its own, which isn't kept, and never in the channel's
+        self.assertEqual(side.reply.call_args.args[0], "Soup good.")
+        request = str(llm.await_args.args[1])
+        self.assertIn("secret soup", request)
+        self.assertNotIn("soup or s", request)
         self.assertNotIn(str(side.id), rh.logs[self.channel.id].ids)
+        rh.flush()
+        self.assertEqual([p.name for p in Path(rh.LOG_DIR).glob("*")], [f"{self.channel.id}.json"])
+        # and a reply to its answer carries it on, with what was said so far
+        llm = AsyncMock(return_value=answer("Still soup."))
+        with patch.object(j, "llm_message", llm):
+            await j.on_message(self.said("why soup", to=self.sent))
+        self.assertIn("Soup good.", str(llm.await_args.args[1]))
+        self.assertNotIn("soup or s", str(llm.await_args.args[1]))
 
 
 class OutgoingMentionTests(_Handling):
@@ -671,15 +685,16 @@ class OutgoingMentionTests(_Handling):
                 self.assertEqual(content, expected or text)
                 self.assertEqual(allowed.to_dict(), {"parse": [], "users": ids})
 
-    async def test_only_llm_replies_can_ping(self):
+    async def test_only_rocky_can_ping(self):
         uid = 100000000000000002
-        for model, expected, ids in [("jev", "@Moss!", []), ("haiku", f"<@{uid}>!", [uid])]:
+        self.channel.name, self.channel.guild = "bot-spam", self.guild
+        for model, expected, ids in [("jev", "@Moss!", []), ("rocky", f"<@{uid}>!", [uid])]:
             m = self.said(f"ask <@{uid}>")
             m.mentions.append(SimpleNamespace(id=uid, display_name="Moss"))
             m.clean_content = discord.Message.clean_content.function(m)
             with self.subTest(model=model), patch.object(j, "model_name", model), \
                     patch.object(j, "loom", new_callable=AsyncMock, return_value=["@Moss!"]), \
-                    patch.object(j, "llm", new_callable=AsyncMock, return_value="@Moss!"):
+                    patch.object(j, "llm_message", AsyncMock(return_value=answer("@Moss!"))):
                 await j.handle(m, j.message_text(m))
                 self.assertEqual(m.reply.call_args.args[0], expected)
                 allowed = m.reply.call_args.kwargs["allowed_mentions"].to_dict()
@@ -687,18 +702,28 @@ class OutgoingMentionTests(_Handling):
                 self.assertEqual(allowed["parse"], [])
                 self.assertFalse(m.reply.call_args.kwargs["mention_author"])
 
-    async def test_mentions_survive_channel_and_side_thread_restarts(self):
+    async def test_mentions_survive_channel_and_side_conversation_restarts(self):
         uid = 100000000000000002
+        self.channel.name, self.channel.guild = "bot-spam", self.guild
+
+        async def turn(m, says):
+            if m.reference:
+                m.reference.resolved = self.by_id[m.reference.message_id]
+            with patch.object(j, "llm_message", AsyncMock(return_value=answer(says))):
+                await j.handle(m, j.message_text(m))
+
         for side in (False, True):
-            with self.subTest(side=side), patch.object(j, "model_name", "haiku"):
+            with self.subTest(side=side), patch.object(j, "model_name", "rocky"):
                 j.channel_history[self.channel.id], j.side_talk, j.side_of = [], {}, {}
+                rh.logs.clear()
                 root = self.said(("!nocontext " if side else "") + f"ask <@{uid}>")
                 root.mentions.append(SimpleNamespace(id=uid, display_name="Moss"))
                 root.clean_content = discord.Message.clean_content.function(root)
-                await self.answer(root, "@moss!")
+                await turn(root, "@moss!")
                 live = j.entries_with(self.channel.id, root.id)[0].copy()
                 reply = self.sent
                 j.channel_history[self.channel.id], j.side_talk, j.side_of = [], {}, {}
+                rh.logs.clear()
                 if not side:
                     async def history(**kwargs):
                         for message in (reply, root):
@@ -706,12 +731,11 @@ class OutgoingMentionTests(_Handling):
                     self.channel.history = history
                     await self.load_history(SimpleNamespace(channel=self.channel))
                 question = self.said("again", to=reply)
-                await self.answer(question, "@Moss!")
+                await turn(question, "@Moss!")
                 rebuilt = j.entries_with(self.channel.id, root.id)[0]
                 self.assertEqual(live["reply"], rebuilt["reply"])
                 self.assertEqual(live["reply_users"], rebuilt["reply_users"])
-                marker = f" [↳](https://discord.com/channels/{self.guild.id}/{self.channel.id}/{root.id})" if side else ""
-                self.assertEqual(question.reply.call_args.args[0], f"<@{uid}>!" + marker)
+                self.assertEqual(question.reply.call_args.args[0], f"<@{uid}>!")
 
 
 class AppHistoryTests(_Handling):
@@ -727,12 +751,13 @@ class AppHistoryTests(_Handling):
             await j.on_message(app)
         respond.assert_not_awaited()
         question = self.said("say congrats")
-        question.reply = AsyncMock(return_value=self.said("Congrats, synthetic-user!", to=question, bot=True))
-        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", new_callable=AsyncMock,
-                                                              return_value="Congrats, synthetic-user!") as llm:
+        self.channel.name, self.channel.guild = "bot-spam", self.guild
+        llm = AsyncMock(return_value=answer("Congrats, synthetic-user!"))
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", llm):
             await j.handle(question, j.message_text(question))
-        chat = llm.call_args.args[1][1]["content"]
-        self.assertIn("Milestone App: [embed: Contribution milestone synthetic-user passed 1,000 contributions.]", chat)
+        chat = j.text_of(llm.await_args.args[1][-1]["content"])
+        self.assertIn('from="Milestone App"', chat)
+        self.assertIn(">[embed: Contribution milestone synthetic-user passed 1,000 contributions.]</message>", chat)
         self.assertIn("say congrats", chat)
         self.assertIn("[embed: Contribution milestone synthetic-user passed 1,000 contributions.]", self.trace["transcript"])
         self.assertEqual(question.reply.call_args.args[0], "Congrats, synthetic-user!")
@@ -899,8 +924,7 @@ class NoContextChainTests(_Handling):
 
 
 class LongHistoryTests(_Handling):
-    """An LLM writing gets the last LLM_HISTORY messages; Jev and the question check keep their short window. The
-    store keeps HISTORY_SCAN, for Rocky's log."""
+    """Jev and the question check keep their short window; the store keeps HISTORY_SCAN, for Rocky's log."""
 
     def setUp(self):
         super().setUp()
@@ -928,24 +952,6 @@ class LongHistoryTests(_Handling):
         to_bot = [e for e in j.channel_history[self.channel.id] if e["to_bot"]]
         self.assertEqual(len(to_bot), j.HISTORY_TO_BOT + 1)
 
-    async def test_llm_sees_the_long_history_and_jev_the_short(self):
-        asked = []
-
-        async def llm(name, messages, **kwargs):
-            asked.append(messages[1]["content"])
-            return "Is good."
-
-        with patch.object(j, "model_name", "haiku"), patch.object(j, "llm", side_effect=llm):
-            await j.handle(m := self.said("what now?"), j.message_text(m))
-        chat = asked[0]
-        self.assertIn("message 100", chat)  # 200 back
-        self.assertNotIn("message 99\n", chat)
-        self.assertIn("rocky: answer 290", chat.replace(self.user.display_name, "rocky"))
-        self.assertEqual(len(self.trace["history"]), j.LLM_HISTORY)  # logged: what the LLM saw
-        question_check = j.choose_reaction.call_args.kwargs["history"]
-        self.assertEqual(sum(e["to_bot"] for e in question_check), j.HISTORY_TO_BOT)
-        self.assertEqual(sum(not e["to_bot"] for e in question_check), j.HISTORY_CHATTER)
-
     async def test_jev_keeps_its_short_window(self):
         with patch.object(j, "loom", new_callable=AsyncMock, return_value=["Dunno"]) as loom:
             await j.handle(m := self.said("what now?"), j.message_text(m))
@@ -955,42 +961,18 @@ class LongHistoryTests(_Handling):
         self.assertNotIn("message 291\n", state)
         self.assertIn("message 240\n", state)
         self.assertNotIn("message 230\n", state)
+        question_check = j.choose_reaction.call_args.kwargs["history"]
+        self.assertEqual(sum(e["to_bot"] for e in question_check), j.HISTORY_TO_BOT)
+        self.assertEqual(sum(not e["to_bot"] for e in question_check), j.HISTORY_CHATTER)
 
 
 class HistoryForRockyTests(_Handling):
-    """Another LLM sees the last LLM_HISTORY messages, though the channel's history keeps everything a rebuild read,
-    for Rocky's log."""
+    """The channel's history keeps everything a rebuild read, for Rocky's log."""
 
     def setUp(self):
         super().setUp()
         self.start = datetime.now(timezone.utc) - timedelta(hours=1)
         j.channel_history[self.channel.id] = []
-
-    async def ask(self, model="haiku"):
-        asked = []
-
-        async def llm(name, messages, **kwargs):
-            asked.append(messages)
-            return "Is good."
-
-        m = self.said("what now?")
-        m.reply = AsyncMock(return_value=self.said("Is good.", to=m, bot=True))
-        with patch.object(j, "model_name", model), patch.object(j, "llm", side_effect=llm):
-            await j.handle(m, j.message_text(m))
-        return asked[0]
-
-    async def test_another_llm_sees_the_last_llm_history_messages_in_one_string(self):
-        for i in range(300):
-            j.add_history(self.channel.id, {"role": "user", "name": "kettle", "content": f"message {i}", "id": i + 1,
-                                            "at": self.start + timedelta(seconds=i), "to_bot": False})
-        with patch.object(j, "rocky_prompt", wraps=j.rocky_prompt) as prompt:
-            system, user = await self.ask()
-        prompt.assert_called_with("Testbot", True)  # Haiku's lines shuffled, like anywhere else
-        self.assertIsInstance(system["content"], str)
-        self.assertTrue(user["content"].startswith("The chat so far"))
-        self.assertNotIn(f"message {299 - j.LLM_HISTORY}\n", user["content"])
-        self.assertIn(f"message {300 - j.LLM_HISTORY}\n", user["content"])
-        self.assertEqual(self.trace["llm_messages"], j.LLM_HISTORY + 1)
 
     async def test_a_rebuild_keeps_everything_it_read(self):
         scanned = []
@@ -1006,7 +988,7 @@ class HistoryForRockyTests(_Handling):
         self.channel.history = history
         await self.load_history(SimpleNamespace(channel=self.channel))
         self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]],
-                         [f"old {i}" for i in range(j.HISTORY_SCAN)])  # not just the latest LLM_HISTORY
+                         [f"old {i}" for i in range(j.HISTORY_SCAN)])
 
 if __name__ == "__main__":
     unittest.main()

@@ -81,7 +81,7 @@ class SettingsCommandTests(_Case):
                                  ["25K tokens", "50K tokens", "90K tokens"])
 
     async def test_the_same_whichever_model_is_writing(self):
-        for model in ("jev", "haiku", "rocky"):
+        for model in ("jev", "rocky"):
             with self.subTest(model=model), patch.object(j, "model_name", model):
                 view = (await self.open_settings())["view"]
                 self.assertEqual([m.key for m in self.menus(view)], ["STATUS_EVERY", "LOG_TOKENS"])

@@ -1,6 +1,6 @@
 """
 Rocky as an agent: an LLM is Rocky, the channel is its conversation, and what it writes is posted. !model rocky, in every
-channel but side conversations.
+channel. A side conversation gets a log of its own for each answer, never saved.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
@@ -10,8 +10,8 @@ events. A <memories> block before the log is a snapshot, rebuilt — and deleted
 would be rebuilt anyway (tidy): at a jump, when the log outgrows LOG_TOKENS and its oldest half goes, or after
 CACHE_HOURS without a request.
 
-The way !model's LLMs work elsewhere is a ghostwriter's: the chat as one transcript, then "Write rocky's reply to pip's
-last message". That framing had Haiku sometimes describe a reply instead of writing it ("Rocky suggests something
+Before it, Haiku wrote Rocky's replies as a ghostwriter: the chat as one transcript, then "Write rocky's reply to pip's
+last message". That framing had it sometimes describe a reply instead of writing it ("Rocky suggests something
 concrete"), and talk about its tools. Here it doesn't write for Rocky; it is Rocky.
 
 jev_bot hands itself over with bind() — run as a script it's __main__, so importing it here would load a second bot.
@@ -255,6 +255,7 @@ class Log:
     seeded: bool = False                       # filled from the channel's history, the first time it was needed
     asked: datetime = None                     # the last request, to know when the cache has gone
     code: str = None                           # the last commit it was told about (updates)
+    keep: bool = True                          # saved in LOG_DIR — not one for a single answer (apart)
 
     def message(self, author, text, at, to_bot=False, reply_to=None, uid=None, discord_id=None, you_said=None,
                 older=None):
@@ -665,7 +666,7 @@ def save_log(log):
         j.log.warning(f"Writing the log for #{log.channel} failed: {e}")
 
 def changed(log):
-    if log.channel_id not in log_saves:
+    if log.keep and log.channel_id not in log_saves:
         try:
             log_saves[log.channel_id] = asyncio.get_running_loop().call_later(SAVE_AFTER, save_log, log)
         except RuntimeError:
@@ -699,6 +700,12 @@ def log_for(channel):
         j.log.warning(f"Loading the log for #{log.channel} failed: {e}")
     logs[channel.id] = log
     return log
+
+# A log for one answer, never saved: a side conversation's, which the channel's log doesn't have — sync seeds it
+# with the conversation
+def apart(channel):
+    space = str(channel.guild.id) if getattr(channel, "guild", None) else f"dm-{channel.id}"
+    return Log(getattr(channel, "name", None) or "DM", space, channel.id, seeded=True, keep=False)
 
 # Updates: commits to UPDATES_FROM since a log's last, as <update>s at its end — appended, so the cache keeps all
 # before them. Only the subject, without its scope or PR number ("give Rocky a bar to order drinks from"): the repo is
@@ -755,9 +762,9 @@ def replied_outside(m):
     return {"author": "you" if r.author.id == j.bot.user.id else r.author.display_name, "text": snippet(text, 200)}
 
 # A message in the channel, as it arrives: people's and other apps' — not Rocky's own (its turns add those), commands,
-# or side conversations (jev_bot keeps those out). Returns its event, or None.
-def observe(m):
-    log = log_for(m.channel)
+# or side conversations (jev_bot keeps those out). Returns its event, or None. log: m's channel's, unless it's given.
+def observe(m, log=None):
+    log = log or log_for(m.channel)
     if (n := log.ids.get(str(m.id))) is not None:
         return next((e for e in log.events if e.get("n") == n), None)
     if m.author.id == j.bot.user.id or j.command(m) or not (text := j.message_text(m)):

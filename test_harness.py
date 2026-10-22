@@ -448,7 +448,7 @@ class LongMessageTests(_Case):
 
         entry = {"name": "pip", "content": "rocky tell me", "users": {}}
         with patch.object(rh, "log_for", lambda c: self.log), patch.object(rh, "sync", lambda *a: None), \
-                patch.object(rh, "observe", lambda m: q), patch.object(rh, "take_turn", take_turn), \
+                patch.object(rh, "observe", lambda m, log=None: q), patch.object(rh, "take_turn", take_turn), \
                 patch.object(j, "emoji_vocabulary", lambda g: {}), patch.object(j, "mention_targets", lambda *a, **k: {}), \
                 patch.object(j, "message_users", lambda x: {str(x.id): "pip"}), \
                 patch.object(j, "message_text", lambda x: j.ACTION_LINES.sub("", x.content).strip()):
