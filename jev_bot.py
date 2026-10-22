@@ -415,16 +415,9 @@ async def next_word(session, state, vocab, rng, instructions, done_state=None):
     return probs, complete_noul
 
 
-# People's reactions to one of jev's replies, with readable mentions of the reactors: " (😂 by @Moss, @Pip; 💀×3)".
-# The count is left out when every reactor is named, and kept when some names are missing.
-def reacted(counts, reactors=None):
-    parts, named = [], False
-    for e, n in (counts or {}).items():
-        names = [f"@{name}" for name in (reactors or {}).get(e, {}).values() if name]
-        text = e if n == 1 or len(names) >= n else f"{e}×{n}"
-        parts.append(text + (" by " + ", ".join(names) if names else ""))
-        named = named or bool(names)
-    return " (" + ("; " if named else " ").join(parts) + ")" if parts else ""  # "; " only to keep names apart
+# People's reactions to one of jev's replies, as emoji and counts: " (😂×2 💀)"
+def reacted(counts):
+    return " (" + " ".join(e if n == 1 else f"{e}×{n}" for e, n in counts.items()) + ")" if counts else ""
 
 # marked: mark messages addressed to jev for the question check, including pinged replies without a textual
 # mention. Keep existing mentions in place rather than adding a second one.
@@ -1365,11 +1358,13 @@ async def attach_reactions(entry, m, prefix="reply_"):
         remember_reactors(m.id, counts, reactors)
 
 # Messages read from Discord, newest first, as history entries, oldest first, each with jev's reply to it, which goes
-# back under it. Not !nocontext messages, which have their own threads. known: messages to leave out.
+# back under it. Not !nocontext messages, which have their own threads, or replies under one from before threads —
+# a side conversation, then, and kept apart. known: messages to leave out.
 def history_entries(scanned, known=()):
-    found, replies = [], {}
+    found, replies, apart = [], {}, set()
     for m in reversed(scanned):
-        if no_context(m):
+        if no_context(m) or (m.reference and m.reference.message_id in apart):
+            apart.add(m.id)
             continue
         if m.author.id == bot.user.id and m.reference and m.content and m.content not in NO_MONEY:
             replies[m.reference.message_id] = m  # jev's reply, to go back under the message it answered
@@ -2333,9 +2328,12 @@ async def rocky_turn(m, entry, bot_name, entries, where=None, chat=None):
 
 # Jev's answer to m: a Discord reply, or in the thread m opened, the next message there
 async def post_answer(m, where, content, allowed=None):
-    if where is m.channel:
-        return await m.reply(content, mention_author=False, allowed_mentions=allowed)
-    return await where.send(content, allowed_mentions=allowed)
+    if where is not m.channel:
+        try:
+            return await where.send(content, allowed_mentions=allowed)
+        except discord.Forbidden as e:  # a thread it could open but not post in: answered where it was asked
+            log.warning(f"Posting in thread {where.id} failed, replying instead: {e}")
+    return await m.reply(content, mention_author=False, allowed_mentions=allowed)
 
 # A !nocontext thread's name, and its log's: the question, without the tag to jev. Rocky's log of a fallback answer
 # has it too — named "DM" or the channel's, with nothing else in it, Rocky wrote notes on what to say in 2 of 6

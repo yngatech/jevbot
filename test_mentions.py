@@ -69,10 +69,11 @@ class ReactionContextTests(_Discord):
     def transcript(self, **kwargs):
         return j.transcript("how are you?", "Speaker", "Testbot", [self.entry], [], **kwargs)
 
-    # Who reacted to jev's reply, as Rocky's pings find them (mention_targets)
-    def names(self, entry=None, prefix="reply_"):
-        entry = entry or self.entry
-        return "Hello" + j.reacted(entry.get(f"{prefix}reactions"), entry.get(f"{prefix}reactors"))
+    # Who reacted to jev's reply, as people Rocky can ping (mention_targets)
+    def names(self, entry=None):
+        entry = {"name": "Speaker", **(entry or self.entry)}
+        return {name for name, uid in j.mention_targets([entry], "Testbot", reactors=True).items()
+                if uid and name != entry["name"]}  # not whoever asked
 
     def reaction(self, emoji="😂", fail=False):
         async def users():
@@ -87,12 +88,12 @@ class ReactionContextTests(_Discord):
         await j.on_raw_reaction_add(self.payload())
         await j.on_raw_reaction_add(self.payload(502, "Pip"))
         await j.on_raw_reaction_add(self.payload(self.user.id, "Testbot"))
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
+        self.assertEqual(self.names(), {"Moss", "Pip"})
         self.assertNotIn("😂", self.transcript(reactions=False, marked=True))
         self.assertIn("Hello (😂×2)", self.transcript())  # Jev gets the count
         self.assertNotIn("😂", self.transcript(their_reactions=False))
         await j.on_raw_reaction_remove(self.payload())
-        self.assertIn("Hello (😂 by @Pip)", self.names())
+        self.assertEqual(self.names(), {"Pip"})
         await j.on_raw_reaction_remove(self.payload(502, "Pip"))
         self.assertNotIn("😂", self.transcript())
 
@@ -100,8 +101,7 @@ class ReactionContextTests(_Discord):
         await j.on_raw_reaction_add(self.payload())
         await j.on_raw_reaction_add(self.payload(502, "Pip", "💀"))
         await j.on_raw_reaction_clear_emoji(self.payload())
-        self.assertNotIn("@Moss", self.names())
-        self.assertIn("💀 by @Pip", self.names())
+        self.assertEqual(self.names(), {"Pip"})  # only on 💀 now
         await j.on_raw_reaction_clear(self.payload())
         self.assertNotIn("reply_reactors", self.entry)
         self.assertNotIn("💀", self.transcript())
@@ -119,7 +119,7 @@ class ReactionContextTests(_Discord):
         j.channel_history[self.channel.id] = []
         await j.load_history(SimpleNamespace(channel=self.channel))
         self.entry = j.channel_history[self.channel.id][0]
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
+        self.assertEqual(self.names(), {"Moss", "Pip"})
 
     async def test_standalone_reply_names(self):
         question = MentionTests.message(self)
@@ -128,7 +128,7 @@ class ReactionContextTests(_Discord):
                          mentions=[], role_mentions=[], embeds=[], attachments=[], stickers=[])
         standalone = {"role": "assistant", "content": "Hello"}
         await j.attach_reactions(standalone, reply, prefix="")
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names(standalone, prefix=""))
+        self.assertEqual(self.names(standalone), {"Moss", "Pip"})
 
     async def test_http_failure_keeps_counts_and_old_logs_render(self):
         reply = SimpleNamespace(id=700, reactions=[self.reaction(fail=True)])
@@ -142,13 +142,13 @@ class ReactionContextTests(_Discord):
             j.bot, "fetch_user", new_callable=AsyncMock, return_value=SimpleNamespace(display_name="Moss")
         ):
             await j.on_raw_reaction_add(p)
-        self.assertIn("😂×3 by @Moss", self.names())
+        self.assertEqual(self.names(), {"Moss"})
 
     async def test_a_rebuild_reuses_saved_names_without_asking_discord(self):
         j.reactor_cache["700"] = {"counts": {"😂": 2}, "reactors": {"😂": {"501": "Moss", "502": "Pip"}}}
         unasked = SimpleNamespace(emoji="😂", count=3, me=True, users=Mock(side_effect=AssertionError("asked Discord")))
         await j.attach_reactions(self.entry, SimpleNamespace(id=700, reactions=[unasked]))
-        self.assertIn("Hello (😂 by @Moss, @Pip)", self.names())
+        self.assertEqual(self.names(), {"Moss", "Pip"})
 
     async def test_only_an_emoji_whose_count_changed_is_asked_about(self):
         j.reactor_cache["700"] = {"counts": {"😂": 2, "💀": 1}, "reactors": {"😂": {"501": "Moss", "502": "Pip"},
@@ -192,10 +192,9 @@ class ReactionContextTests(_Discord):
         self.assertIn("Hello (😂×2)", seen[0])
         self.assertNotIn("Moss", seen[0])
 
-    def test_count_shown_only_when_names_are_missing(self):
-        self.assertEqual(j.reacted({"😂": 2, "💀": 3}, {"😂": {"1": "Moss", "2": "Pip"}, "💀": {"3": "Fern"}}),
-                         " (😂 by @Moss, @Pip; 💀×3 by @Fern)")
-        self.assertEqual(j.reacted({"😂": 3, "💀": 1}), " (😂×3 💀)")  # what Jev gets, as before names
+    def test_reactions_are_emoji_and_counts(self):
+        self.assertEqual(j.reacted({"😂": 3, "💀": 1}), " (😂×3 💀)")
+        self.assertEqual(j.reacted({}), "")
 
 
 class MentionTests(_Discord):
@@ -872,6 +871,34 @@ class NoContextThreadTests(_Handling):
             await j.on_message_edit(q, q)
             follow = self.said("why", ping=False, channel=self.threads[q.id])
             self.assertEqual(await self.answer(follow), [("pip", "@Testbot favourite colour?", "Granite.")])
+
+    async def test_replies_under_an_old_side_conversation_stay_out_of_history(self):
+        q = self.said("!nocontext favourite rock?")
+        a = self.said("Granite. [↳](https://discord.com/channels/400/300/800)", to=q, bot=True)
+        b = self.said("why granite", to=a, name="mossy", ping=False)
+        c = self.said("Hard.", to=b, bot=True)
+        chatter = self.said("anyone seen my keys", name="kettle", ping=False)
+
+        async def history(**kwargs):
+            for m in (chatter, c, b, a, q):  # newest first, like Discord
+                yield m
+        self.channel.history = history
+        j.channel_history[self.channel.id] = []
+        await self.load_history(SimpleNamespace(channel=self.channel))
+        self.assertEqual([e["content"] for e in j.channel_history[self.channel.id]], ["anyone seen my keys"])
+
+    async def test_a_thread_it_cant_post_in_is_answered_in_the_channel(self):
+        q = self.asked("!nocontext favourite rock?")
+        opened = q.create_thread.side_effect
+
+        async def create_thread(**kwargs):
+            t = await opened(**kwargs)
+            t.send = AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "no sending in threads"))
+            return t
+        q.create_thread.side_effect = create_thread
+        with patch.object(j, "model_name", "rocky"), patch.object(j, "llm_message", AsyncMock(return_value=answer("Granite."))):
+            await j.handle(q, j.message_text(q))
+        self.assertEqual(q.reply.call_args.args[0], "Granite.")
 
     async def test_nocontext_in_its_thread_carries_it_on(self):
         q = self.asked("!nocontext favourite rock?")
