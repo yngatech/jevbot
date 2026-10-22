@@ -97,7 +97,7 @@ async def main():
     ap.add_argument("-n", "--runs", type=int, default=1, help="runs of each message (default 1)")
     ap.add_argument("--at", type=datetime.fromisoformat, help="when it's said, on TIMEZONE (default 2 minutes after the log ends)")
     ap.add_argument("--author", default=AUTHOR, help=f"who says it (default {AUTHOR})")
-    ap.add_argument("--channel", type=int, help="the channel's log (default the first LONG_CONTEXT_CHANNEL_IDS)")
+    ap.add_argument("--channel", type=int, help="the channel's log (default the busiest)")
     ap.add_argument("--fresh", action="store_true", help="a short synthetic chat instead of the live log")
     ap.add_argument("--image", help="a picture sent with each message, for look — a synthetic one, not from the chat")
     ap.add_argument("--with", dest="also", action="append", default=[], metavar="AUTHOR: TEXT",
@@ -119,9 +119,10 @@ async def main():
     if not eval_key:
         ap.error("set OPENROUTER_API_KEY_EVAL in .env — replays don't use the bot's OPENROUTER_API_KEY")
     j.HEADERS = {**j.HEADERS, "Authorization": f"Bearer {eval_key}"}
-    channel = args.channel or next(iter(sorted(j.LONG_CHAT_CHANNELS)), None)
+    logs = sorted((live_dir() / "rocky_logs").glob("*.json"), key=lambda p: p.stat().st_size)
+    channel = args.channel or (int(logs[-1].stem) if logs else None)
     if not args.fresh and not channel:
-        ap.error("set --channel or LONG_CONTEXT_CHANNEL_IDS, or use --fresh")
+        ap.error("no Rocky logs yet: use --fresh")
     at = args.at and (args.at if args.at.tzinfo else args.at.replace(tzinfo=j.TIMEZONE))
     logging.getLogger("jev").setLevel(logging.WARNING)
     picture = args.image and rh.shrunk(Path(args.image).read_bytes())

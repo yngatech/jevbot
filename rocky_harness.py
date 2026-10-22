@@ -1,6 +1,6 @@
 """
-Rocky as an agent: an LLM is Rocky, the channel is its conversation, and what it writes is posted. !model rocky, in the
-channels in LONG_CONTEXT_CHANNEL_IDS.
+Rocky as an agent: an LLM is Rocky, the channel is its conversation, and what it writes is posted. !model rocky, in every
+channel but side conversations.
 
 Each channel is an append-only log of events. People's messages, reactions and edits come in as user turns, written as
 XML with who, when and what they reply to. Rocky's turns are the assistant's: it thinks, then its text is its message,
@@ -41,6 +41,8 @@ def bind(bot_module):
 LOG_TOKENS = 90_000         # a log's size before its oldest half goes — under Haiku's 100K price step; set in /settings
 MAX_LOG_TOKENS = 90_000     # the most /settings allows: past 100K, Haiku charges 5× for the whole prompt
 CHARS_PER_TOKEN = 2.2       # Haiku's, in our chat — a log is measured in characters, LOG_TOKENS turned into them
+EVENT_CHARS = 60            # what an event's tags and attributes add to its text, counting a log's characters
+FILL = 0.5                  # a new log, filled from the channel's history up to this share of LOG_TOKENS
 MAX_TOKENS = 8000           # its thinking, its message and its tool calls, only to stop a runaway: live, ≤300 a request
 FOLLOW_UPS = 4              # requests after one with nothing to say yet, for what it then says — at the bar it has
                             # gone bar, react, bar, and at 2 ended its turn before speaking
@@ -599,8 +601,17 @@ async def take_turn(log, waking, model="rocky", bot_name="rocky", typing=None):
 # The log's oldest half goes once it's over LOG_TOKENS: everything before a message, so no turn loses its results.
 # <memories> is rebuilt then, so what was remembered in the dropped half isn't lost with it.
 def chars(log):
-    return sum(len(e.get("text") or "") + 60 + sum(len(c["arguments"]) for c in e.get("calls", []))
+    return sum(len(e.get("text") or "") + EVENT_CHARS + sum(len(c["arguments"]) for c in e.get("calls", []))
                + PICTURE_CHARS * len(e.get("pictures") or []) for e in log.events)
+
+# A new log's size, read back from the channel's history: what a jump leaves, so it isn't cut on its first turn
+def fill_chars():
+    return LOG_TOKENS * CHARS_PER_TOKEN * FILL
+
+# jev_bot's history entries as they'd count in a log: each message, and Rocky's reply or reaction under it
+def entry_chars(entries):
+    return sum(len(h.get("content") or "") + EVENT_CHARS
+               + (len(h.get("reply") or "") + EVENT_CHARS if "reply" in h or "reaction" in h else 0) for h in entries)
 
 def jump(log):
     if chars(log) <= LOG_TOKENS * CHARS_PER_TOKEN:
@@ -630,8 +641,11 @@ def tidy(log):
     changed(log)
 
 
-# Live logs, one for each channel in LONG_CHAT_CHANNELS, kept in LOG_DIR
+# Live logs, one for each channel Rocky has taken a turn in, kept in LOG_DIR
 logs: dict[int, Log] = {}
+
+def has_log(channel_id):
+    return channel_id in logs or (LOG_DIR / f"{channel_id}.json").exists()
 log_saves: dict[int, object] = {}
 
 def plain(v):
@@ -796,7 +810,7 @@ def deleted(channel_id, message_id):
 # One of Rocky's messages from outside a turn (written while another !model was chosen, or a status posted in
 # STATUS_CHANNEL), so the log has it — loaded if nothing's been said there since a restart
 def spoke_elsewhere(channel, text, sent):
-    if channel.id not in j.LONG_CHAT_CHANNELS:
+    if not has_log(channel.id):
         return
     log = log_for(channel)
     log.add("rocky", text=text, calls=[], id=sent.id, at=sent.created_at, elsewhere=True)
@@ -825,7 +839,8 @@ def sync(log, entries):
             elif "reaction" in h:
                 call = f"seed_{e['n']}"
                 seed.add("rocky", text="", calls=[{"id": call, "name": "react",
-                                                   "arguments": json.dumps({"emoji": h["reaction"], "message": e["n"]})}],
+                                                   "arguments": json.dumps({"emoji": h["reaction"], "message": e["n"]},
+                                                                         ensure_ascii=False)}],
                          at=h["at"])
                 seed.add("result", id=call, content="Reacted.", at=h["at"])
         log.next_n = seed.next_n
